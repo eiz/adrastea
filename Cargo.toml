@@ -1,0 +1,10 @@
+[package]
+name = "adrastea"
+version = "0.1.0"
+edition = "2021"
+authors = ["Adrastea Authors <adrastea@str.rs>"]
+description = "Software 3.11 for Workgroups"
+license = "AGPL-3.0-only"
+
+
+[dependencies]
