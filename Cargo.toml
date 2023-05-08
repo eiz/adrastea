@@ -11,8 +11,3 @@ ash = { version = "0.37.2", features = ["loaded"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"
-
-[profile.dev]
-panic = "abort"
-[profile.release]
-panic = "abort"
