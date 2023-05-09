@@ -110,9 +110,8 @@ unsafe fn main_unsafe() {
     };
     let instance = entry
         .create_instance(
-            &vk::InstanceCreateInfo::builder()
-                .application_info(&app_info)
-                .enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8]),
+            &vk::InstanceCreateInfo::builder().application_info(&app_info),
+            //.enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8]),
             None,
         )
         .expect("derp");
