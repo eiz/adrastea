@@ -1,11 +1,11 @@
 #version 450
-layout (binding = 0) readonly buffer InputBuffer {
-    float in_buf[];
+#extension GL_EXT_buffer_reference: enable
+layout (buffer_reference) buffer PFloat32 {
+    float data[];
 };
-layout (binding = 1) writeonly buffer OutputBuffer {
-    float out_buf[];
-};
-layout (push_constant) uniform WidthHeight {
+layout (push_constant) uniform SquareArgs {
+    PFloat32 in_buf;
+    PFloat32 out_buf;
     uint height;
     uint width;
 };
@@ -15,6 +15,6 @@ void main() {
     uint y = gl_GlobalInvocationID.y;
     uint index = y * width + x;
     if (x < width && y < height) {
-        out_buf[index] = in_buf[index] * in_buf[index];
+        out_buf.data[index] = in_buf.data[index] * in_buf.data[index];
     }
 }

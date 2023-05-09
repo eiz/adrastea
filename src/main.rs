@@ -67,6 +67,7 @@ unsafe fn find_compute_queue_family(instance: &ash::Instance, phys_dev: vk::Phys
     for (i, fam) in props.iter().enumerate() {
         if fam.queue_flags.contains(vk::QueueFlags::COMPUTE)
             && fam.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            && fam.queue_flags.contains(vk::QueueFlags::GRAPHICS)
         {
             return i as u32;
         }
@@ -91,7 +92,9 @@ unsafe fn find_memory_type(
 }
 
 #[repr(C)]
-struct WidthHeight {
+struct SquareArgs {
+    in_buf: u64,
+    out_buf: u64,
     height: u32,
     width: u32,
 }
@@ -117,22 +120,41 @@ unsafe fn main_unsafe() {
     let phys_devs = instance.enumerate_physical_devices().expect("derp");
     dbg!(&phys_devs);
     let queue_family_index = find_compute_queue_family(&instance, phys_devs[0]);
-    let queue_infos = [vk::DeviceQueueCreateInfo {
-        queue_count: 1,
-        queue_family_index,
-        ..Default::default()
-    }];
+    let queue_infos = [vk::DeviceQueueCreateInfo::builder()
+        .queue_family_index(queue_family_index)
+        .queue_priorities(&[1.0])
+        .build()];
     let mut create_info = vk::DeviceCreateInfo {
         queue_create_info_count: 1,
         p_queue_create_infos: queue_infos.as_ptr(),
         ..Default::default()
     };
-    let mut features_13: vk::PhysicalDeviceVulkan13Features = Default::default();
-    let mut features = vk::PhysicalDeviceFeatures2::builder()
-        .push_next(&mut features_13)
+    let mut phys_features_13: vk::PhysicalDeviceVulkan13Features = Default::default();
+    let mut phys_features_12: vk::PhysicalDeviceVulkan12Features = Default::default();
+    let mut phys_features = vk::PhysicalDeviceFeatures2::builder()
+        .push_next(&mut phys_features_13)
+        .push_next(&mut phys_features_12)
         .build();
-    instance.get_physical_device_features2(phys_devs[0], &mut features);
-    create_info.p_next = &features as *const _ as *mut _;
+    instance.get_physical_device_features2(phys_devs[0], &mut phys_features);
+    if phys_features_13.synchronization2 == 0 {
+        panic!("synchronization2 missing");
+    }
+    if phys_features_12.buffer_device_address == 0 {
+        panic!("buffer_device_address missing");
+    }
+    let mut enabled_features_13 = vk::PhysicalDeviceVulkan13Features::builder()
+        .synchronization2(true)
+        .build();
+    let mut enabled_features_12 = vk::PhysicalDeviceVulkan12Features::builder()
+        .buffer_device_address(true)
+        .build();
+    let enabled_features = vk::PhysicalDeviceFeatures2::builder()
+        .push_next(&mut enabled_features_13)
+        .push_next(&mut enabled_features_12)
+        .build();
+    create_info.p_next = &enabled_features as *const _ as *mut _;
+    println!("features_12: {:?}", phys_features_12);
+    println!("features_13: {:?}", phys_features_13);
     let dev = instance
         .create_device(phys_devs[0], &create_info, None)
         .expect("derp");
@@ -171,31 +193,11 @@ unsafe fn main_unsafe() {
         )
         .expect("derp");
     dbg!(&shader);
-    let dset_create_info = vk::DescriptorSetLayoutCreateInfo::builder()
-        .bindings(&[
-            vk::DescriptorSetLayoutBinding::builder()
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .binding(0)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .build(),
-            vk::DescriptorSetLayoutBinding::builder()
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(1)
-                .binding(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                .build(),
-        ])
-        .build();
-    let d_set_layout = dev
-        .create_descriptor_set_layout(&dset_create_info, None)
-        .expect("derp");
     let p_create_info = vk::PipelineLayoutCreateInfo::builder()
-        .set_layouts(&[d_set_layout])
         .push_constant_ranges(&[vk::PushConstantRange::builder()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(8)
+            .size(24)
             .build()])
         .build();
     let p_layout = dev
@@ -228,7 +230,8 @@ unsafe fn main_unsafe() {
                 .usage(
                     vk::BufferUsageFlags::STORAGE_BUFFER
                         | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::TRANSFER_SRC,
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 )
                 .size(ROWS * COLS * 4),
             None,
@@ -257,7 +260,11 @@ unsafe fn main_unsafe() {
         .allocate_memory(
             &vk::MemoryAllocateInfo::builder()
                 .memory_type_index(find_memory_type(&buf_reqs, &mem_props, default_flags))
-                .allocation_size(buf_reqs.size),
+                .allocation_size(buf_reqs.size)
+                .push_next(
+                    &mut vk::MemoryAllocateFlagsInfo::builder()
+                        .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS),
+                ),
             None,
         )
         .expect("derp");
@@ -286,51 +293,6 @@ unsafe fn main_unsafe() {
             }
         }
     }
-    let descriptor_pool = dev
-        .create_descriptor_pool(
-            &vk::DescriptorPoolCreateInfo::builder()
-                .max_sets(1)
-                .pool_sizes(&[vk::DescriptorPoolSize::builder()
-                    .ty(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(2)
-                    .build()]),
-            None,
-        )
-        .expect("derp");
-    let descriptor_sets = dev
-        .allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::builder()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(&[d_set_layout]),
-        )
-        .expect("derp");
-    dev.update_descriptor_sets(
-        &[
-            vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_sets[0])
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&[vk::DescriptorBufferInfo::builder()
-                    .buffer(buf)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)
-                    .build()])
-                .build(),
-            vk::WriteDescriptorSet::builder()
-                .dst_set(descriptor_sets[0])
-                .dst_binding(1)
-                .dst_array_element(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&[vk::DescriptorBufferInfo::builder()
-                    .buffer(buf)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)
-                    .build()])
-                .build(),
-        ],
-        &[],
-    );
 
     // oh my god fucking do the thing already
     let cmd = bufs[0];
@@ -361,15 +323,9 @@ unsafe fn main_unsafe() {
         ]),
     );
     dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipelines[0]);
-    dev.cmd_bind_descriptor_sets(
-        cmd,
-        vk::PipelineBindPoint::COMPUTE,
-        p_layout,
-        0,
-        &[descriptor_sets[0]],
-        &[],
-    );
-    let args = WidthHeight {
+    let args = SquareArgs {
+        in_buf: dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::builder().buffer(buf)),
+        out_buf: dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::builder().buffer(buf)),
         height: ROWS as u32,
         width: COLS as u32,
     };
@@ -381,7 +337,7 @@ unsafe fn main_unsafe() {
         // lord forgive me lmao
         std::slice::from_raw_parts(
             &args as *const _ as *const _,
-            std::mem::size_of::<WidthHeight>(),
+            std::mem::size_of::<SquareArgs>(),
         ),
     );
     dev.cmd_dispatch(cmd, ceil_div(COLS, 16) as u32, ceil_div(ROWS, 16) as u32, 1);
