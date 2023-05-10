@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mack Straight <eizneckam@gmail.com>
+Date: Wed, 10 May 2023 07:31:59 -0700
+Subject: [PATCH] split compilation from module loading
+
+---
+ python/triton/compiler/__init__.py | 2 +-
+ python/triton/compiler/compiler.py | 9 +++++++--
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/python/triton/compiler/__init__.py b/python/triton/compiler/__init__.py
+index 4d62eeec4..8e439b797 100644
+--- a/python/triton/compiler/__init__.py
++++ b/python/triton/compiler/__init__.py
+@@ -1,4 +1,4 @@
+-from .compiler import CompiledKernel, compile
++from .compiler import CompiledKernel, compile, compile_artifacts
+ from .errors import CompilationError
+ 
+ __all__ = ["compile", "CompiledKernel", "CompilationError"]
+diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
+index 8c1dacbe1..7c8ba052e 100644
+--- a/python/triton/compiler/compiler.py
++++ b/python/triton/compiler/compiler.py
+@@ -361,7 +361,7 @@ def add_cuda_stages(arch, extern_libs, stages):
+                        lambda src: ptx_to_cubin(src, arch))
+ 
+ 
+-def compile(fn, **kwargs):
++def compile_artifacts(fn, **kwargs):
+     arch = get_architecture_descriptor(kwargs.get("cc", None))
+     is_cuda = _is_cuda(arch)
+     context = _triton.ir.context()
+@@ -498,7 +498,12 @@ def compile(fn, **kwargs):
+         metadata_group[metadata_filename] = fn_cache_manager.put(json.dumps(metadata), metadata_filename, binary=False)
+         fn_cache_manager.put_group(metadata_filename, metadata_group)
+ 
+-    # return handle to compiled kernel
++    # return the compilation artifacts
++    return (fn, so_path, metadata, asm)
++
++def compile(fn, **kwargs):
++    fn, so_path, metadata, asm = compile_artifacts(fn, **kwargs)
++    # load the kernel and return a handle
+     return CompiledKernel(fn, so_path, metadata, asm)
+ 
+ 
+-- 
+2.34.1
+

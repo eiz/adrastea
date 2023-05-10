@@ -1,0 +1,11 @@
+{
+  "num_warps": 8,
+  "num_stages": 3,
+  "constants": {
+    "BLOCK_SIZE_X": 16,
+    "BLOCK_SIZE_Y": 16
+  },
+  "debug": false,
+  "shared": 0,
+  "name": "square_0123"
+}
