@@ -13,11 +13,19 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::ffi::CStr;
+use std::{
+    collections::HashMap,
+    ffi::{c_void, CStr, CString},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use anyhow::bail;
 use ash::{vk, Entry};
+use serde::{Deserialize, Serialize};
 
 const THEM_SHADERS: &[u8] = include_bytes!("../shaders/square.comp.spv");
+const CUBIN_SHADER: &[u8] = include_bytes!("../triton/arch/cuda/80/square_fp32_16x16.cubin");
 
 /*
 mod simt {
@@ -99,9 +107,10 @@ struct SquareArgs {
     width: u32,
 }
 
-unsafe fn main_unsafe() {
-    const ROWS: vk::DeviceSize = 8;
-    const COLS: vk::DeviceSize = 8;
+const ROWS: vk::DeviceSize = 8;
+const COLS: vk::DeviceSize = 8;
+
+unsafe fn vulkan_square() {
     println!("The endless sea.");
     let entry = Entry::load().expect("failed to load vulkan");
     let app_info = vk::ApplicationInfo {
@@ -388,6 +397,219 @@ unsafe fn main_unsafe() {
     // foo⟪1024, 256, 0, stream⟫(0);
 }
 
-fn main() {
-    unsafe { main_unsafe() }
+unsafe fn cuda_call<F: FnOnce() -> simt_cuda_sys::CUresult>(
+    cb: F,
+) -> Result<(), simt_cuda_sys::CUresult> {
+    let res = cb();
+    if res == simt_cuda_sys::CUresult::CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(res)
+    }
+}
+
+unsafe fn cuda_result_call<T, F: FnOnce(*mut T) -> simt_cuda_sys::CUresult>(
+    cb: F,
+) -> Result<T, simt_cuda_sys::CUresult> {
+    let mut out = std::mem::MaybeUninit::uninit();
+    let res = cb(out.as_mut_ptr());
+    if res == simt_cuda_sys::CUresult::CUDA_SUCCESS {
+        Ok(out.assume_init())
+    } else {
+        Err(res)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TritonKernelMetadata {
+    num_warps: u32,
+    num_stages: u32,
+    constants: HashMap<String, u32>,
+    debug: bool,
+    shared: u32,
+    name: String,
+}
+
+struct CudaKernelLoader {
+    capability: i32,
+    supported_capabilities: Vec<i32>,
+    kernels_path: PathBuf,
+}
+
+impl CudaKernelLoader {
+    pub unsafe fn new<P: AsRef<Path>>(
+        cuda: Arc<simt_cuda_sys::cuda>,
+        kernels_path: P,
+        device: simt_cuda_sys::CUdevice,
+    ) -> anyhow::Result<Self> {
+        Self::new_path(cuda, kernels_path.as_ref(), device)
+    }
+
+    unsafe fn new_path(
+        cuda: Arc<simt_cuda_sys::cuda>,
+        kernels_path: &Path,
+        device: simt_cuda_sys::CUdevice,
+    ) -> anyhow::Result<Self> {
+        let major = cuda_result_call(|x| {
+            cuda.cuDeviceGetAttribute(
+                x,
+                simt_cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                device,
+            )
+        })?;
+        let minor = cuda_result_call(|x| {
+            cuda.cuDeviceGetAttribute(
+                x,
+                simt_cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                device,
+            )
+        })?;
+        let capability = major * 10 + minor;
+        let mut supported_capabilities = vec![];
+        for arch in std::fs::read_dir(kernels_path.join("arch/cuda"))? {
+            let arch = arch?;
+            let metadata = arch.metadata()?;
+
+            if metadata.is_dir() {
+                let dir_name = arch.file_name();
+                let dir_name = dir_name.to_str().unwrap();
+                if let Ok(cap) = dir_name.parse::<i32>() {
+                    supported_capabilities.push(cap);
+                }
+            }
+        }
+        supported_capabilities.sort();
+        println!("supported caps {:?}", supported_capabilities);
+        Ok(Self {
+            capability,
+            supported_capabilities,
+            kernels_path: kernels_path.to_path_buf(),
+        })
+    }
+
+    pub fn find_kernel(&self, name: &str) -> anyhow::Result<(TritonKernelMetadata, PathBuf)> {
+        for cap in self.supported_capabilities.iter().rev() {
+            if *cap <= self.capability {
+                let json_path = self
+                    .kernels_path
+                    .join(format!("arch/cuda/{}/{}.json", cap, "square_fp32_16x16"));
+                let cubin_path = self
+                    .kernels_path
+                    .join(format!("arch/cuda/{}/{}.cubin", cap, "square_fp32_16x16"));
+                if !std::path::Path::new(&json_path).exists()
+                    || !std::path::Path::new(&cubin_path).exists()
+                {
+                    continue;
+                }
+                let metadata: TritonKernelMetadata =
+                    serde_json::from_str(&std::fs::read_to_string(json_path)?)?;
+                return Ok((metadata, cubin_path));
+            }
+        }
+
+        bail!["couldn't find a compatible implementation of {}", name];
+    }
+}
+
+unsafe fn cuda_square() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    const LIB: &str = "libcuda.so";
+    #[cfg(windows)]
+    const LIB: &str = "nvcuda.dll";
+    let cuda = Arc::new(simt_cuda_sys::cuda::new(LIB).expect("bad end"));
+    cuda_call(|| cuda.cuInit(0))?;
+    let device_count = cuda_result_call(|x| cuda.cuDeviceGetCount(x))?;
+    println!("{} device(s)", device_count);
+    for i in 0..device_count {
+        let mut name = [0u8; 256];
+        cuda_call(|| cuda.cuDeviceGetName(name.as_mut_ptr() as *mut _, 256, i))?;
+        let c_name = CStr::from_ptr(name.as_ptr() as *const _);
+        println!("Device {}: {}", i, c_name.to_str()?);
+    }
+    if device_count == 0 {
+        bail!("can't continue, no devices");
+    }
+    let device = cuda_result_call(|x| cuda.cuDeviceGet(x, 0))?;
+    let context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
+    let loader = CudaKernelLoader::new(cuda.clone(), "triton", device)?;
+    let (sq_meta, sq_cubin_path) = loader.find_kernel("square_fp32_16x16")?;
+    println!("Compute capability {}", loader.capability);
+    println!("sq_meta {:?}\nsq_cubin_path {:?}", sq_meta, sq_cubin_path);
+    let cubin_path = CString::new(sq_cubin_path.to_str().unwrap())?;
+    let module = cuda_result_call(|x| cuda.cuModuleLoad(x, cubin_path.as_ptr()))?;
+    dbg!(module);
+    let kernel_name = CString::new(sq_meta.name)?;
+    let kernel = cuda_result_call(|x| cuda.cuModuleGetFunction(x, module, kernel_name.as_ptr()))?;
+    drop(kernel_name);
+    dbg!(kernel);
+    let stream = cuda_result_call(|x| cuda.cuStreamCreate(x, 0))?;
+    dbg!(stream);
+    let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
+    for y in 0..ROWS {
+        for x in 0..COLS {
+            stage_buf[(y * COLS + x) as usize] = (y + x) as f32;
+        }
+    }
+    let buf = cuda_result_call(|x| {
+        cuda.cuMemAlloc_v2(
+            x,
+            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
+        )
+    })?;
+    cuda_call(|| {
+        cuda.cuMemcpyHtoD_v2(
+            buf,
+            stage_buf.as_ptr() as *const _,
+            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
+        )
+    })?;
+    let grid_x = ceil_div(COLS, 16);
+    let grid_y = ceil_div(ROWS, 16);
+    cuda_call(|| {
+        cuda.cuLaunchKernel(
+            kernel,
+            grid_x as u32,
+            grid_y as u32,
+            1,
+            32 * sq_meta.num_warps,
+            1,
+            1,
+            0,
+            stream,
+            &[
+                &buf as *const _ as *mut c_void,
+                &buf as *const _ as *mut c_void,
+                &COLS as *const _ as *mut c_void,
+                &ROWS as *const _ as *mut c_void,
+            ] as *const _ as *mut _,
+            std::ptr::null_mut(),
+        )
+    })?;
+    cuda_call(|| cuda.cuStreamSynchronize(stream))?;
+    cuda_call(|| {
+        cuda.cuMemcpyDtoH_v2(
+            stage_buf.as_mut_ptr() as *mut _,
+            buf,
+            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
+        )
+    })?;
+    for y in 0..ROWS {
+        for x in 0..COLS {
+            print!("{:4} ", stage_buf[(y * COLS + x) as usize]);
+        }
+        println!("");
+    }
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+
+    if args.len() >= 2 && args[1] == "cuda" {
+        unsafe { cuda_square()? }
+    } else {
+        unsafe { vulkan_square() }
+    }
+
+    Ok(())
 }

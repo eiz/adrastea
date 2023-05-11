@@ -7,7 +7,11 @@ description = "Software 3.11 for Workgroups"
 license = "AGPL-3.0-only"
 
 [dependencies]
+anyhow = "1.0.71"
 ash = { version = "0.37.2", features = ["loaded"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simt_cuda_sys = "0.1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"
