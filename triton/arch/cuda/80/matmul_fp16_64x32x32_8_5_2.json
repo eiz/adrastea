@@ -1,0 +1,14 @@
+{
+  "num_warps": 2,
+  "num_stages": 5,
+  "constants": {
+    "ACTIVATION": "",
+    "BLOCK_SIZE_M": 64,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 32,
+    "GROUP_SIZE_M": 8
+  },
+  "debug": false,
+  "shared": 6144,
+  "name": "matmul_kernel_01234567891011"
+}

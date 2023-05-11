@@ -109,22 +109,19 @@ struct SquareArgs {
 const ROWS: vk::DeviceSize = 8;
 const COLS: vk::DeviceSize = 8;
 
-unsafe fn vulkan_square() {
-    println!("The endless sea.");
-    let entry = Entry::load().expect("failed to load vulkan");
+unsafe fn vulkan_square() -> anyhow::Result<()> {
+    let entry = Entry::load()?;
     let app_info = vk::ApplicationInfo {
         api_version: vk::make_api_version(0, 1, 3, 0),
         ..Default::default()
     };
-    let instance = entry
-        .create_instance(
-            &vk::InstanceCreateInfo::builder().application_info(&app_info),
-            //.enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8]),
-            None,
-        )
-        .expect("derp");
+    let instance = entry.create_instance(
+        &vk::InstanceCreateInfo::builder().application_info(&app_info),
+        //.enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8]),
+        None,
+    )?;
     dbg!(instance.handle());
-    let phys_devs = instance.enumerate_physical_devices().expect("derp");
+    let phys_devs = instance.enumerate_physical_devices()?;
     dbg!(&phys_devs);
     let queue_family_index = find_compute_queue_family(&instance, phys_devs[0]);
     let queue_infos = [vk::DeviceQueueCreateInfo::builder()
@@ -162,43 +159,35 @@ unsafe fn vulkan_square() {
     create_info.p_next = &enabled_features as *const _ as *mut _;
     println!("features_12: {:?}", phys_features_12);
     println!("features_13: {:?}", phys_features_13);
-    let dev = instance
-        .create_device(phys_devs[0], &create_info, None)
-        .expect("derp");
+    let dev = instance.create_device(phys_devs[0], &create_info, None)?;
     dbg!(dev.handle());
-    let fence = dev.create_fence(&Default::default(), None).expect("derp");
+    let fence = dev.create_fence(&Default::default(), None)?;
     let queue = dev.get_device_queue(queue_family_index, 0);
     dbg!(&queue);
-    let command_pool = dev
-        .create_command_pool(
-            &vk::CommandPoolCreateInfo {
-                queue_family_index,
-                flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                ..Default::default()
-            },
-            None,
-        )
-        .expect("derp");
-    dbg!(&command_pool);
-    let bufs = dev
-        .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-            command_pool,
-            level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
+    let command_pool = dev.create_command_pool(
+        &vk::CommandPoolCreateInfo {
+            queue_family_index,
+            flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             ..Default::default()
-        })
-        .expect("derp");
+        },
+        None,
+    )?;
+    dbg!(&command_pool);
+    let bufs = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo {
+        command_pool,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+        ..Default::default()
+    })?;
     dbg!(&bufs);
-    let shader = dev
-        .create_shader_module(
-            &vk::ShaderModuleCreateInfo {
-                code_size: THEM_SHADERS.len(),
-                p_code: THEM_SHADERS.as_ptr() as *const _,
-                ..Default::default()
-            },
-            None,
-        )
-        .expect("derp");
+    let shader = dev.create_shader_module(
+        &vk::ShaderModuleCreateInfo {
+            code_size: THEM_SHADERS.len(),
+            p_code: THEM_SHADERS.as_ptr() as *const _,
+            ..Default::default()
+        },
+        None,
+    )?;
     dbg!(&shader);
     let p_create_info = vk::PipelineLayoutCreateInfo::builder()
         .push_constant_ranges(&[vk::PushConstantRange::builder()
@@ -207,13 +196,10 @@ unsafe fn vulkan_square() {
             .size(24)
             .build()])
         .build();
-    let p_layout = dev
-        .create_pipeline_layout(&p_create_info, None)
-        .expect("derp");
+    let p_layout = dev.create_pipeline_layout(&p_create_info, None)?;
     dbg!(&p_layout);
-    let p_cache = dev
-        .create_pipeline_cache(&vk::PipelineCacheCreateInfo::builder().build(), None)
-        .expect("derp");
+    let p_cache =
+        dev.create_pipeline_cache(&vk::PipelineCacheCreateInfo::builder().build(), None)?;
     let pipelines = dev
         .create_compute_pipelines(
             p_cache,
@@ -231,28 +217,24 @@ unsafe fn vulkan_square() {
         )
         .expect("derp");
     dbg!(&pipelines);
-    let buf = dev
-        .create_buffer(
-            &vk::BufferCreateInfo::builder()
-                .usage(
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                )
-                .size(ROWS * COLS * 4),
-            None,
-        )
-        .expect("derp");
+    let buf = dev.create_buffer(
+        &vk::BufferCreateInfo::builder()
+            .usage(
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            )
+            .size(ROWS * COLS * 4),
+        None,
+    )?;
     dbg!(&buf);
-    let stage_buf = dev
-        .create_buffer(
-            &vk::BufferCreateInfo::builder()
-                .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-                .size(ROWS * COLS * 4),
-            None,
-        )
-        .expect("derp");
+    let stage_buf = dev.create_buffer(
+        &vk::BufferCreateInfo::builder()
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+            .size(ROWS * COLS * 4),
+        None,
+    )?;
     dbg!(&stage_buf);
     let mem_props = instance.get_physical_device_memory_properties(phys_devs[0]);
     dbg!(&mem_props);
@@ -263,34 +245,27 @@ unsafe fn vulkan_square() {
     let default_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
     let stage_flags =
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let buf_mem = dev
-        .allocate_memory(
-            &vk::MemoryAllocateInfo::builder()
-                .memory_type_index(find_memory_type(&buf_reqs, &mem_props, default_flags))
-                .allocation_size(buf_reqs.size)
-                .push_next(
-                    &mut vk::MemoryAllocateFlagsInfo::builder()
-                        .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS),
-                ),
-            None,
-        )
-        .expect("derp");
-    let stage_mem = dev
-        .allocate_memory(
-            &vk::MemoryAllocateInfo::builder()
-                .memory_type_index(find_memory_type(&stage_reqs, &mem_props, stage_flags))
-                .allocation_size(stage_reqs.size),
-            None,
-        )
-        .expect("derp");
+    let buf_mem = dev.allocate_memory(
+        &vk::MemoryAllocateInfo::builder()
+            .memory_type_index(find_memory_type(&buf_reqs, &mem_props, default_flags))
+            .allocation_size(buf_reqs.size)
+            .push_next(
+                &mut vk::MemoryAllocateFlagsInfo::builder()
+                    .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS),
+            ),
+        None,
+    )?;
+    let stage_mem = dev.allocate_memory(
+        &vk::MemoryAllocateInfo::builder()
+            .memory_type_index(find_memory_type(&stage_reqs, &mem_props, stage_flags))
+            .allocation_size(stage_reqs.size),
+        None,
+    )?;
     dbg!(&buf_mem);
     dbg!(&stage_mem);
-    dev.bind_buffer_memory(buf, buf_mem, 0).expect("derp");
-    dev.bind_buffer_memory(stage_buf, stage_mem, 0)
-        .expect("derp");
-    let ptr = dev
-        .map_memory(stage_mem, 0, stage_reqs.size, Default::default())
-        .expect("derp");
+    dev.bind_buffer_memory(buf, buf_mem, 0)?;
+    dev.bind_buffer_memory(stage_buf, stage_mem, 0)?;
+    let ptr = dev.map_memory(stage_mem, 0, stage_reqs.size, Default::default())?;
     {
         let in_float: &mut [f32] =
             std::slice::from_raw_parts_mut(ptr as *mut _, (stage_reqs.size / 4) as usize);
@@ -308,8 +283,7 @@ unsafe fn vulkan_square() {
         &vk::CommandBufferBeginInfo {
             ..Default::default()
         },
-    )
-    .expect("derp");
+    )?;
     dev.cmd_copy_buffer(
         cmd,
         stage_buf,
@@ -367,7 +341,7 @@ unsafe fn vulkan_square() {
         stage_buf,
         &[vk::BufferCopy::builder().size(ROWS * COLS * 4).build()],
     );
-    dev.end_command_buffer(cmd).expect("derp");
+    dev.end_command_buffer(cmd)?;
     dev.queue_submit2(
         queue,
         &[vk::SubmitInfo2::builder()
@@ -389,6 +363,7 @@ unsafe fn vulkan_square() {
             println!("");
         }
     }
+    Ok(())
     // the aristocrats.
 
     // unsafe fn dadada(out: *mut f32, lhs: *const half, rhs: *const half, m: u32, n: u32, k: u32, ) {
@@ -495,9 +470,7 @@ impl CudaKernelLoader {
                 let cubin_path = self
                     .kernels_path
                     .join(format!("arch/cuda/{}/{}.cubin", cap, "square_fp32_16x16"));
-                if !std::path::Path::new(&json_path).exists()
-                    || !std::path::Path::new(&cubin_path).exists()
-                {
+                if !json_path.exists() || !cubin_path.exists() {
                     continue;
                 }
                 let metadata: TritonKernelMetadata =
@@ -510,12 +483,27 @@ impl CudaKernelLoader {
     }
 }
 
+/*
+simt::triton_kernel! {
+    #[grid(ceil_div(width, 16), ceil_div(height, 16), 1)]
+    unsafe fn square_fp32_16x16(out_ptr: *mut f32, in_ptr: *const f32, width: u32, height: u32);
+}
+*/
+
+// simt::launch!(square_fp32_16x16(1024, 256, 0, stream)
+//               (out_ptr, in_ptr, width, height));
+// or perhaps
+// let launch = simt::LaunchParams::new(
+//   simt::Dim3(ceil_div(width, 16), ceil_div(height, 16), 1),
+//   simt::Dim3(256, 1, 1), 0, stream);
+// square_fp32_16x16(launch, out_ptr, in_ptr, width, height)?;
+
 unsafe fn cuda_square() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     const LIB: &str = "libcuda.so";
     #[cfg(windows)]
     const LIB: &str = "nvcuda.dll";
-    let cuda = Arc::new(simt_cuda_sys::cuda::new(LIB).expect("bad end"));
+    let cuda = Arc::new(simt_cuda_sys::cuda::new(LIB)?);
     cuda_call(|| cuda.cuInit(0))?;
     let device_count = cuda_result_call(|x| cuda.cuDeviceGetCount(x))?;
     println!("{} device(s)", device_count);
@@ -529,7 +517,7 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
         bail!("can't continue, no devices");
     }
     let device = cuda_result_call(|x| cuda.cuDeviceGet(x, 0))?;
-    let context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
+    let _context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
     let loader = CudaKernelLoader::new(cuda.clone(), "triton", device)?;
     let (sq_meta, sq_cubin_path) = loader.find_kernel("square_fp32_16x16")?;
     println!("Compute capability {}", loader.capability);
@@ -544,24 +532,14 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     let stream = cuda_result_call(|x| cuda.cuStreamCreate(x, 0))?;
     dbg!(stream);
     let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
+    let buf_sz = (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize;
     for y in 0..ROWS {
         for x in 0..COLS {
             stage_buf[(y * COLS + x) as usize] = (y + x) as f32;
         }
     }
-    let buf = cuda_result_call(|x| {
-        cuda.cuMemAlloc_v2(
-            x,
-            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
-        )
-    })?;
-    cuda_call(|| {
-        cuda.cuMemcpyHtoD_v2(
-            buf,
-            stage_buf.as_ptr() as *const _,
-            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
-        )
-    })?;
+    let buf = cuda_result_call(|x| cuda.cuMemAlloc_v2(x, buf_sz))?;
+    cuda_call(|| cuda.cuMemcpyHtoD_v2(buf, stage_buf.as_ptr() as *const _, buf_sz))?;
     let grid_x = ceil_div(COLS, 16);
     let grid_y = ceil_div(ROWS, 16);
     cuda_call(|| {
@@ -585,13 +563,7 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
         )
     })?;
     cuda_call(|| cuda.cuStreamSynchronize(stream))?;
-    cuda_call(|| {
-        cuda.cuMemcpyDtoH_v2(
-            stage_buf.as_mut_ptr() as *mut _,
-            buf,
-            (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize,
-        )
-    })?;
+    cuda_call(|| cuda.cuMemcpyDtoH_v2(stage_buf.as_mut_ptr() as *mut _, buf, buf_sz))?;
     for y in 0..ROWS {
         for x in 0..COLS {
             print!("{:4} ", stage_buf[(y * COLS + x) as usize]);
@@ -603,12 +575,11 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
-
+    println!("The endless sea.");
     if args.len() >= 2 && args[1] == "cuda" {
         unsafe { cuda_square()? }
     } else {
-        unsafe { vulkan_square() }
+        unsafe { vulkan_square()? }
     }
-
     Ok(())
 }
