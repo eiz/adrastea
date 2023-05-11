@@ -25,7 +25,6 @@ use ash::{vk, Entry};
 use serde::{Deserialize, Serialize};
 
 const THEM_SHADERS: &[u8] = include_bytes!("../shaders/square.comp.spv");
-const CUBIN_SHADER: &[u8] = include_bytes!("../triton/arch/cuda/80/square_fp32_16x16.cubin");
 
 /*
 mod simt {
