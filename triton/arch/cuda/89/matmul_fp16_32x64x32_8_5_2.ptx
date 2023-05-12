@@ -3,7 +3,7 @@
 //
 
 .version 8.0
-.target sm_80
+.target sm_89
 .address_size 64
 
 	// .globl	matmul_kernel_0d1d2d3d4d5d6d7c8d9c10d11c
