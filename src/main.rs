@@ -14,6 +14,7 @@
  */
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ffi::{c_void, CStr, CString},
     path::{Path, PathBuf},
@@ -371,6 +372,7 @@ unsafe fn vulkan_square() -> anyhow::Result<()> {
     // foo⟪1024, 256, 0, stream⟫(0);
 }
 
+#[inline(always)]
 unsafe fn cuda_call<F: FnOnce() -> simt_cuda_sys::CUresult>(
     cb: F,
 ) -> Result<(), simt_cuda_sys::CUresult> {
@@ -382,6 +384,7 @@ unsafe fn cuda_call<F: FnOnce() -> simt_cuda_sys::CUresult>(
     }
 }
 
+#[inline(always)]
 unsafe fn cuda_result_call<T, F: FnOnce(*mut T) -> simt_cuda_sys::CUresult>(
     cb: F,
 ) -> Result<T, simt_cuda_sys::CUresult> {
@@ -402,6 +405,123 @@ struct TritonKernelMetadata {
     debug: bool,
     shared: u32,
     name: String,
+}
+
+struct CudaContext {
+    cuda: Arc<simt_cuda_sys::cuda>,
+    device: simt_cuda_sys::CUdevice,
+    context: simt_cuda_sys::CUcontext,
+}
+
+impl CudaContext {
+    pub unsafe fn new(cuda: Arc<simt_cuda_sys::cuda>, device_index: i32) -> anyhow::Result<Self> {
+        let device = cuda_result_call(|x| cuda.cuDeviceGet(x, device_index))?;
+        let context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
+        cuda_result_call(|x| cuda.cuCtxPopCurrent_v2(x)).expect("cuCtxPopCurrent_v2 failed");
+        Ok(Self {
+            cuda,
+            device,
+            context,
+        })
+    }
+}
+
+impl Drop for CudaContext {
+    fn drop(&mut self) {
+        unsafe {
+            cuda_call(|| self.cuda.cuCtxDestroy_v2(self.context)).expect("cuCtxDestroy_v2 failed");
+        }
+    }
+}
+
+// exercise for the reader: make get() not have to return a clone
+thread_local! {
+    static THREAD_LOCAL: RefCell<Option<Arc<CudaContext>>> = RefCell::new(None);
+}
+
+struct ScopedCudaContext {
+    old_value: Option<Arc<CudaContext>>,
+}
+
+impl ScopedCudaContext {
+    unsafe fn new(value: Arc<CudaContext>) -> Result<Self, simt_cuda_sys::CUresult> {
+        let old_value = THREAD_LOCAL.with(|v| {
+            let mut v = v.borrow_mut();
+            let old_value = v.clone();
+            cuda_call(|| value.cuda.cuCtxPushCurrent_v2(value.context))?;
+            *v = Some(value);
+            Ok(old_value)
+        })?;
+        Ok(ScopedCudaContext { old_value })
+    }
+
+    fn get() -> Result<Arc<CudaContext>, simt_cuda_sys::CUresult> {
+        THREAD_LOCAL
+            .with(|v| v.borrow().clone())
+            .ok_or(simt_cuda_sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
+    }
+}
+
+impl Drop for ScopedCudaContext {
+    fn drop(&mut self) {
+        THREAD_LOCAL.with(|v| {
+            let mut v = v.borrow_mut();
+            unsafe {
+                cuda_result_call(|x| v.as_ref().unwrap().cuda.cuCtxPopCurrent_v2(x))
+                    .expect("cuCtxPopCurrent_v2 failed");
+            }
+            *v = self.old_value.clone()
+        });
+    }
+}
+
+struct CudaBuffer {
+    ptr: simt_cuda_sys::CUdeviceptr,
+    size: usize,
+}
+
+impl CudaBuffer {
+    pub unsafe fn new(size: usize) -> anyhow::Result<Self> {
+        let ctx = ScopedCudaContext::get()?;
+        let ptr = cuda_result_call(|x| ctx.cuda.cuMemAlloc_v2(x, size))?;
+        Ok(Self { ptr, size })
+    }
+
+    pub unsafe fn copy_from(
+        &mut self,
+        src: *const std::ffi::c_void,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let ctx = ScopedCudaContext::get()?;
+        cuda_call(|| ctx.cuda.cuMemcpyHtoD_v2(self.ptr, src, size))?;
+        Ok(())
+    }
+
+    pub unsafe fn copy_to(&self, dst: *mut std::ffi::c_void, size: usize) -> anyhow::Result<()> {
+        let ctx = ScopedCudaContext::get()?;
+        cuda_call(|| ctx.cuda.cuMemcpyDtoH_v2(dst, self.ptr, size))?;
+        Ok(())
+    }
+
+    pub fn copy_from_slice<T: Copy>(&mut self, src: &[T]) -> anyhow::Result<()> {
+        assert_eq!(src.len() * std::mem::size_of::<T>(), self.size);
+        unsafe { self.copy_from(src.as_ptr() as *const std::ffi::c_void, self.size) }
+    }
+
+    pub fn copy_to_slice<T: Copy>(&self, dst: &mut [T]) -> anyhow::Result<()> {
+        assert_eq!(dst.len() * std::mem::size_of::<T>(), self.size);
+        unsafe { self.copy_to(dst.as_mut_ptr() as *mut std::ffi::c_void, self.size) }
+    }
+}
+
+impl Drop for CudaBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let ctx = ScopedCudaContext::get()
+                .expect("invariant: CudaBuffer must be dropped in a context scope");
+            cuda_call(|| ctx.cuda.cuMemFree_v2(self.ptr)).expect("cuMemFree_v2 failed");
+        }
+    }
 }
 
 struct CudaKernelLoader {
@@ -466,10 +586,10 @@ impl CudaKernelLoader {
             if *cap <= self.capability {
                 let json_path = self
                     .kernels_path
-                    .join(format!("arch/cuda/{}/{}.json", cap, "square_fp32_16x16"));
+                    .join(format!("arch/cuda/{}/{}.json", cap, name));
                 let cubin_path = self
                     .kernels_path
-                    .join(format!("arch/cuda/{}/{}.cubin", cap, "square_fp32_16x16"));
+                    .join(format!("arch/cuda/{}/{}.cubin", cap, name));
                 if !json_path.exists() || !cubin_path.exists() {
                     continue;
                 }
@@ -516,9 +636,9 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     if device_count == 0 {
         bail!("can't continue, no devices");
     }
-    let device = cuda_result_call(|x| cuda.cuDeviceGet(x, 0))?;
-    let _context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
-    let loader = CudaKernelLoader::new(cuda.clone(), "triton", device)?;
+    let context = Arc::new(CudaContext::new(cuda.clone(), 0)?);
+    let _scoped_ctx = ScopedCudaContext::new(context.clone());
+    let loader = CudaKernelLoader::new(cuda.clone(), "triton", context.device)?;
     let (sq_meta, sq_cubin_path) = loader.find_kernel("square_fp32_16x16")?;
     println!("Compute capability {}", loader.capability);
     println!("sq_meta {:?}\nsq_cubin_path {:?}", sq_meta, sq_cubin_path);
@@ -538,8 +658,8 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
             stage_buf[(y * COLS + x) as usize] = (y + x) as f32;
         }
     }
-    let buf = cuda_result_call(|x| cuda.cuMemAlloc_v2(x, buf_sz))?;
-    cuda_call(|| cuda.cuMemcpyHtoD_v2(buf, stage_buf.as_ptr() as *const _, buf_sz))?;
+    let mut buf = CudaBuffer::new(buf_sz)?;
+    buf.copy_from_slice(&stage_buf)?;
     let grid_x = ceil_div(COLS, 16);
     let grid_y = ceil_div(ROWS, 16);
     cuda_call(|| {
@@ -563,7 +683,7 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
         )
     })?;
     cuda_call(|| cuda.cuStreamSynchronize(stream))?;
-    cuda_call(|| cuda.cuMemcpyDtoH_v2(stage_buf.as_mut_ptr() as *mut _, buf, buf_sz))?;
+    buf.copy_to_slice(&mut stage_buf)?;
     for y in 0..ROWS {
         for x in 0..COLS {
             print!("{:4} ", stage_buf[(y * COLS + x) as usize]);

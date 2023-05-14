@@ -7,6 +7,10 @@ import square
 
 from triton.compiler import compile_artifacts
 
+instance_descriptor = namedtuple(
+    "instance_descriptor", ["divisible_by_16", "equal_to_1"]
+)
+
 
 def compile_one(fn, name, **kwargs):
     constants = kwargs.get("constants", {})
@@ -18,17 +22,23 @@ def compile_one(fn, name, **kwargs):
         fn, **{**kwargs, "constants": constants}
     )
     cc = str(kwargs.get("cc"))
-    os.makedirs(f"arch/cuda/{cc}", exist_ok=True)
+    if isinstance(cc, int):
+        arch = "cuda"
+    else:
+        arch = "amdgpu"
+    os.makedirs(f"arch/{arch}/{cc}", exist_ok=True)
     print(f"arch/cuda/{cc}/{name}.cubin")
-    with open(f"arch/cuda/{cc}/{name}.ptx", "w") as f:
+    with open(f"arch/{arch}/{cc}/{name}.ptx", "w") as f:
         f.write(asm["ptx"])
-    with open(f"arch/cuda/{cc}/{name}.cubin", "wb") as f:
+    with open(f"arch/{arch}/{cc}/{name}.cubin", "wb") as f:
         f.write(asm["cubin"])
-    with open(f"arch/cuda/{cc}/{name}.json", "w") as f:
+    with open(f"arch/{arch}/{cc}/{name}.json", "w") as f:
         f.write(json.dumps(metadata, indent=2))
 
 
-for cc in [80, 89]:
+AMDGPU_GFX1100 = ["amdgcn-amd-amdhsa", "gfx1100", ""]
+
+for cc in [80, 89, AMDGPU_GFX1100]:
     compile_one(
         square.square,
         "square_fp32_16x16",
@@ -55,7 +65,13 @@ for cc in [80, 89]:
             num_stages=config.num_stages,
             cc=cc,
             configs=(
-                namedtuple("instance_descriptor", ["divisible_by_16", "equal_to_1"])(
+                # TODO: this descriptor is needed to get the optimal code from the benchmark.
+                # otherwise you don't get the async memory loads and you get a massive amount
+                # of predicate ops as the kernel can't assume the matrices are contiguous
+                #
+                # make it nicer to declare this
+                instance_descriptor(
+                    # ordinal indices of args which are assumed divisible by 16
                     (
                         0,
                         1,
@@ -70,6 +86,7 @@ for cc in [80, 89]:
                         13,
                         14,
                     ),
+                    # ordinal indices of args which are assumed to equal 1
                     (7, 9, 11),
                 ),
             ),
