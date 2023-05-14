@@ -460,6 +460,27 @@ impl ScopedCudaContext {
             .with(|v| v.borrow().clone())
             .ok_or(simt_cuda_sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
     }
+
+    pub fn capability() -> Result<i32, simt_cuda_sys::CUresult> {
+        unsafe {
+            let ctx = ScopedCudaContext::get()?;
+            let major = cuda_result_call(|x| {
+                ctx.cuda.cuDeviceGetAttribute(
+                    x,
+                    simt_cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    ctx.device,
+                )
+            })?;
+            let minor = cuda_result_call(|x| {
+                ctx.cuda.cuDeviceGetAttribute(
+                    x,
+                    simt_cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    ctx.device,
+                )
+            })?;
+            Ok(major * 10 + minor)
+        }
+    }
 }
 
 impl Drop for ScopedCudaContext {
@@ -524,82 +545,48 @@ impl Drop for CudaBuffer {
     }
 }
 
-struct CudaKernelLoader {
-    capability: i32,
-    supported_capabilities: Vec<i32>,
-    kernels_path: PathBuf,
+pub struct CudaModule {
+    inner: simt_cuda_sys::CUmodule,
 }
 
-impl CudaKernelLoader {
-    pub unsafe fn new<P: AsRef<Path>>(
-        cuda: Arc<simt_cuda_sys::cuda>,
-        kernels_path: P,
-        device: simt_cuda_sys::CUdevice,
-    ) -> anyhow::Result<Self> {
-        Self::new_path(cuda, kernels_path.as_ref(), device)
+impl CudaModule {
+    pub unsafe fn new(data: &[u8]) -> anyhow::Result<Self> {
+        let ctx = ScopedCudaContext::get()?;
+        let inner = cuda_result_call(|x| ctx.cuda.cuModuleLoadData(x, data.as_ptr() as *const _))?;
+        Ok(Self { inner })
     }
 
-    unsafe fn new_path(
-        cuda: Arc<simt_cuda_sys::cuda>,
-        kernels_path: &Path,
-        device: simt_cuda_sys::CUdevice,
-    ) -> anyhow::Result<Self> {
-        let major = cuda_result_call(|x| {
-            cuda.cuDeviceGetAttribute(
-                x,
-                simt_cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                device,
-            )
-        })?;
-        let minor = cuda_result_call(|x| {
-            cuda.cuDeviceGetAttribute(
-                x,
-                simt_cuda_sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                device,
-            )
-        })?;
-        let capability = major * 10 + minor;
-        let mut supported_capabilities = vec![];
-        for arch in std::fs::read_dir(kernels_path.join("arch/cuda"))? {
-            let arch = arch?;
-            let metadata = arch.metadata()?;
-
-            if metadata.is_dir() {
-                let dir_name = arch.file_name();
-                let dir_name = dir_name.to_str().unwrap();
-                if let Ok(cap) = dir_name.parse::<i32>() {
-                    supported_capabilities.push(cap);
-                }
+    pub unsafe fn find(capability: i32, kernels: &[(&str, &[u8])]) -> anyhow::Result<Self> {
+        let ctx = ScopedCudaContext::get()?;
+        let mut compatible_kernels = vec![];
+        for (arch, bin) in kernels {
+            if !arch.starts_with("sm_") {
+                continue;
+            }
+            let arch = arch[3..].parse::<i32>()?;
+            if arch <= capability {
+                compatible_kernels.push((arch, bin));
             }
         }
-        supported_capabilities.sort();
-        println!("supported caps {:?}", supported_capabilities);
-        Ok(Self {
-            capability,
-            supported_capabilities,
-            kernels_path: kernels_path.to_path_buf(),
-        })
+        compatible_kernels.sort_by_key(|(arch, _)| *arch);
+        let (_, bin) = compatible_kernels
+            .iter()
+            .rev()
+            .filter(|(arch, _)| *arch <= capability)
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no compatible kernel found"))?;
+        let inner = cuda_result_call(|x| ctx.cuda.cuModuleLoadData(x, bin.as_ptr() as *const _))?;
+        Ok(Self { inner })
     }
+}
 
-    pub fn find_kernel(&self, name: &str) -> anyhow::Result<(TritonKernelMetadata, PathBuf)> {
-        for cap in self.supported_capabilities.iter().rev() {
-            if *cap <= self.capability {
-                let json_path = self
-                    .kernels_path
-                    .join(format!("arch/cuda/{}/{}.json", cap, name));
-                let cubin_path = self
-                    .kernels_path
-                    .join(format!("arch/cuda/{}/{}.cubin", cap, name));
-                if !json_path.exists() || !cubin_path.exists() {
-                    continue;
-                }
-                let metadata: TritonKernelMetadata =
-                    serde_json::from_str(&std::fs::read_to_string(json_path)?)?;
-                return Ok((metadata, cubin_path));
-            }
+impl Drop for CudaModule {
+    fn drop(&mut self) {
+        unsafe {
+            let ctx = ScopedCudaContext::get()
+                .expect("invariant: CudaModule must be dropped in a context scope");
+            cuda_call(|| ctx.cuda.cuModuleUnload(self.inner)).expect("cuModuleUnload failed");
         }
-
-        bail!["couldn't find a compatible implementation of {}", name];
     }
 }
 
@@ -638,16 +625,15 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     }
     let context = Arc::new(CudaContext::new(cuda.clone(), 0)?);
     let _scoped_ctx = ScopedCudaContext::new(context.clone());
-    let loader = CudaKernelLoader::new(cuda.clone(), "triton", context.device)?;
-    let (sq_meta, sq_cubin_path) = loader.find_kernel("square_fp32_16x16")?;
-    println!("Compute capability {}", loader.capability);
-    println!("sq_meta {:?}\nsq_cubin_path {:?}", sq_meta, sq_cubin_path);
-    let cubin_path = CString::new(sq_cubin_path.to_str().unwrap())?;
-    let module = cuda_result_call(|x| cuda.cuModuleLoad(x, cubin_path.as_ptr()))?;
-    dbg!(module);
-    let kernel_name = CString::new(sq_meta.name)?;
-    let kernel = cuda_result_call(|x| cuda.cuModuleGetFunction(x, module, kernel_name.as_ptr()))?;
-    drop(kernel_name);
+    let capability = ScopedCudaContext::capability()?;
+    let module = CudaModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
+    let kernel = cuda_result_call(|x| {
+        cuda.cuModuleGetFunction(
+            x,
+            module.inner,
+            b"square_fp32_16x16\0".as_ptr() as *const i8,
+        )
+    })?;
     dbg!(kernel);
     let stream = cuda_result_call(|x| cuda.cuStreamCreate(x, 0))?;
     dbg!(stream);
@@ -668,8 +654,8 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
             grid_x as u32,
             grid_y as u32,
             1,
-            32 * sq_meta.num_warps,
-            1,
+            16,
+            16,
             1,
             0,
             stream,

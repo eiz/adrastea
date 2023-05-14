@@ -15,6 +15,7 @@ fn main() {
         "rotary",
         "silu",
         "softmax_rows",
+        "square_fp32_16x16",
     ];
     let arches = &["sm_80", "sm_89"];
     let out_path = PathBuf::from(std::env::var("OUT_DIR").unwrap());

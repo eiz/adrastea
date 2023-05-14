@@ -6,6 +6,7 @@ version = 3
 name = "adrastea"
 version = "0.1.0"
 dependencies = [
+ "adrastea_kernels",
  "anyhow",
  "ash",
  "serde",

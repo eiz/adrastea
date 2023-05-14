@@ -1,18 +1,19 @@
 #![allow(non_upper_case_globals)]
 
 macro_rules! cuda_kernels {
-    (@arch $arch:ident [$($kernel:ident),*]) => {
+    (@expand_arches [$($arch:ident),*] $kernel:ident) => {
+        &[$(
+            (stringify!($arch), include_bytes!(
+                concat!(env!("OUT_DIR"), "/", stringify!($arch), "/", stringify!($kernel), ".cubin"))),
+        )*]
+    };
+    (@expand_kernels $arches:tt [$($kernel:ident),*]) => {
         $(
-            pub static $kernel: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", stringify!($arch), "/", stringify!($kernel), ".cubin"));
+            pub static $kernel: &[(& str, &[u8])] =
+                cuda_kernels!(@expand_arches $arches $kernel);
         )*
     };
-    ([$($arch:ident),*], $kernels:tt) => {
-        $(
-            pub mod $arch {
-                cuda_kernels!{@arch $arch $kernels}
-            }
-        )*
-    };
+    ($arches:tt, $kernels:tt) => { cuda_kernels!(@expand_kernels $arches $kernels); };
 }
 
 cuda_kernels! {
@@ -30,6 +31,7 @@ cuda_kernels! {
         rms_norm,
         rotary,
         silu,
-        softmax_rows
+        softmax_rows,
+        square_fp32_16x16
     ]
 }
