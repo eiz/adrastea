@@ -21,13 +21,13 @@ def compile_one(fn, name, **kwargs):
     fn2, so_path, metadata, asm = compile_artifacts(
         fn, **{**kwargs, "constants": constants}
     )
-    cc = str(kwargs.get("cc"))
+    cc = kwargs.get("cc")
     if isinstance(cc, int):
         arch = "cuda"
     else:
         arch = "amdgpu"
     os.makedirs(f"arch/{arch}/{cc}", exist_ok=True)
-    print(f"arch/cuda/{cc}/{name}.cubin")
+    print(f"arch/{arch}/{cc}/{name}.cubin")
     with open(f"arch/{arch}/{cc}/{name}.ptx", "w") as f:
         f.write(asm["ptx"])
     with open(f"arch/{arch}/{cc}/{name}.cubin", "wb") as f:
