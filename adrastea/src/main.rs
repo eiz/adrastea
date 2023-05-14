@@ -25,7 +25,7 @@ use anyhow::bail;
 use ash::{vk, Entry};
 use serde::{Deserialize, Serialize};
 
-const THEM_SHADERS: &[u8] = include_bytes!("../shaders/square.comp.spv");
+const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
 
 /*
 mod simt {

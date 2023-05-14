@@ -15,6 +15,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "adrastea_kernels"
+version = "0.1.0"
+
+[[package]]
 name = "anyhow"
 version = "1.0.71"
 source = "registry+https://github.com/rust-lang/crates.io-index"
