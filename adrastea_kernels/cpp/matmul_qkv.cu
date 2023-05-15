@@ -1,4 +1,4 @@
-#include <cuda_fp16.h>
+#include "compat.h"
 
 // lhs: (n_heads, seq_len_new, seq_len)
 // rhs: (seq_len, dim)
@@ -18,8 +18,8 @@ extern "C" __global__ void matmul_qkv(__half* output,
                                       int dim,
                                       int n_heads) {
   // TODO: write a tiled version of this.
-  int c = blockIdx.x * blockDim.x + threadIdx.x;
-  int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
+  int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
   int head_dim = dim / n_heads;
   int head = c / head_dim;
   if (r < seq_len_new && c < dim) {

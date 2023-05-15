@@ -1,4 +1,4 @@
-#include <cuda_fp16.h>
+#include "compat.h"
 
 // TODO: these embed kernels are objectively terrible
 extern "C" __global__ void embed(int n_dim,
@@ -6,7 +6,7 @@ extern "C" __global__ void embed(int n_dim,
                                  short* in_ids,
                                  __half* out_embeddings,
                                  __half* embeddings_table) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
   if (tid < n_ids) {
     int id = in_ids[tid];
     for (int i = 0; i < n_dim; i++) {

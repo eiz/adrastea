@@ -1,6 +1,4 @@
-#include <cstdint>
-
-#include <cuda_fp16.h>
+#include "compat.h"
 
 extern "C" __global__ void embed_uint8(int n_dim,
                                        int n_ids,
@@ -9,7 +7,7 @@ extern "C" __global__ void embed_uint8(int n_dim,
                                        uint8_t* embeddings_table,
                                        half* scales,
                                        int block_size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int tid = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
   int block_count = n_dim / block_size;
   if (tid < n_ids) {
     int id = in_ids[tid];

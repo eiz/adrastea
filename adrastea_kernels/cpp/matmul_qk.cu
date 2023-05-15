@@ -1,5 +1,4 @@
-#include <cuda_fp16.h>
-#include <math_constants.h>
+#include "compat.h"
 
 // q * k^T
 // output = (n_heads, seq_len_new, seq_len)
@@ -21,8 +20,8 @@ extern "C" __global__ void matmul_qk(__half* output,
   // TODO: write a tiled kernel for this. only for testing accuracy.
   // probably write a cuBLAS path too which will need to materialize the
   // transposes.
-  int c = blockIdx.x * blockDim.x + threadIdx.x;
-  int r = blockIdx.y * blockDim.y + threadIdx.y;
+  int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
+  int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
   int head = blockIdx.z;
   int head_dim = dim / n_heads;
   bool masked = c > (r + start_pos);

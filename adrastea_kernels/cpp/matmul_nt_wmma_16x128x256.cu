@@ -1,4 +1,5 @@
-#include <cuda_fp16.h>
+#include "compat.h"
+
 #include <mma.h>
 
 // output = lhs * rhs^T; lhs = (m, p); rhs = (n, p); output = (m, n)
@@ -20,10 +21,10 @@ extern "C" __global__ void matmul_nt_wmma_16x128x256(__half* __restrict__ output
 #define LHS(d0, d1) SDATA(__half, LHS, 272, d0, d1)
 #define RHS(d0, d1) SDATA(__half, RHS, 272, d0, d1)
 #define OUT(d0, d1) SDATA(float, LHS, 128, d0, d1)
-  int bid = blockIdx.x;
+  int bid = BLOCK_IDX_X;
   int dim_y = m / 16;
   int bx = (bid / dim_y) * 128, by = (bid % dim_y) * 16;
-  unsigned tid = threadIdx.x;
+  unsigned tid = THREAD_IDX_X;
   int tlo = tid & 63, thi = tid >> 6;
   int warp_id = tid / 32;
   int wx = 32 * (warp_id >> 1);

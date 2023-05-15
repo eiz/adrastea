@@ -1,4 +1,4 @@
-#include <cuda_fp16.h>
+#include "compat.h"
 
 extern "C" __global__ void rotary(__half* output,
                                   __half* input,
@@ -7,8 +7,8 @@ extern "C" __global__ void rotary(__half* output,
                                   int n_heads,
                                   int pos_offset = 0,
                                   float theta = 10000.0) {
-  int r = blockIdx.y * blockDim.y + threadIdx.y;
-  int c = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
+  int c = 2 * (BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X);
   int head_dim = w / n_heads;
   int head_c = c % head_dim;
 

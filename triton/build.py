@@ -38,7 +38,7 @@ def compile_one(fn, name, **kwargs):
 
 AMDGPU_GFX1100 = ["amdgcn-amd-amdhsa", "gfx1100", ""]
 
-for cc in [80, 89, AMDGPU_GFX1100]:
+for cc in [AMDGPU_GFX1100, 80, 89]:
     compile_one(
         square.square,
         "square_fp32_16x16",

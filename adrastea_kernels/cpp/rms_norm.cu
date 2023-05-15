@@ -1,4 +1,4 @@
-#include <cuda_fp16.h>
+#include "compat.h"
 
 // row-wise rms normalization
 // 1 block per row, x = row, 8 warps per block
@@ -8,8 +8,8 @@ extern "C" __global__ void rms_norm(__half* output,
                                     int h,
                                     int w,
                                     float eps) {
-  int row = blockIdx.x;
-  int tid = threadIdx.x;
+  int row = BLOCK_IDX_X;
+  int tid = THREAD_IDX_X;
   int row_idx = row * w;
   int warp_id = tid / 32;
   bool warp_leader = (tid % 32) == 0;
@@ -17,7 +17,7 @@ extern "C" __global__ void rms_norm(__half* output,
   __shared__ float s_warp_reduced[8];
   float sum_val = 0.0f;
   // sum_sq: thread reduction
-  for (int i = tid; i < w; i += blockDim.x) {
+  for (int i = tid; i < w; i += BLOCK_DIM_X) {
     float val = __half2float(input[row_idx + i]);
     sum_val += val * val;
   }
@@ -44,7 +44,7 @@ extern "C" __global__ void rms_norm(__half* output,
   }
   __syncthreads();
   float rms_inv = s_rms_inv;
-  for (int i = tid; i < w; i += blockDim.x) {
+  for (int i = tid; i < w; i += BLOCK_DIM_X) {
     float val = __half2float(input[row_idx + i]);
     output[row_idx + i] = weights[i] * __float2half(val * rms_inv);
   }

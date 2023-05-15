@@ -1,5 +1,4 @@
-#include <cuda_fp16.h>
-#include <math_constants.h>
+#include "compat.h"
 
 // row-wise softmax with optional temperature
 // input = (n_heads, seq_len, seq_len)
@@ -9,9 +8,9 @@ extern "C" __global__ void softmax_rows(__half* output,
                                         int h,
                                         int w,
                                         float temp = 1.0) {
-  int row = blockIdx.x;
-  int head = blockIdx.y;
-  int tid = threadIdx.x;
+  int row = BLOCK_IDX_X;
+  int head = BLOCK_IDX_Y;
+  int tid = THREAD_IDX_X;
   int row_idx = head * h * w + row * w;
   bool warp_leader = tid % 32 == 0;
   int warp_id = tid / 32;
@@ -19,7 +18,7 @@ extern "C" __global__ void softmax_rows(__half* output,
   __shared__ float s_warp_reduced[8];
   // max: thread reduction
   float max_val = -CUDART_INF_F;
-  for (int i = tid; i < w; i += blockDim.x) {
+  for (int i = tid; i < w; i += BLOCK_DIM_X) {
     max_val = fmaxf(max_val, __half2float(input[row_idx + i]) / temp);
   }
   __syncthreads();
@@ -46,7 +45,7 @@ extern "C" __global__ void softmax_rows(__half* output,
   __syncthreads();
   float sum_val = 0.0f;
   // expsum: thread reduction
-  for (int i = tid; i < w; i += blockDim.x) {
+  for (int i = tid; i < w; i += BLOCK_DIM_X) {
     float val = __half2float(input[row_idx + i]) / temp;
     sum_val += expf(val - s_max_val);
   }
@@ -70,7 +69,7 @@ extern "C" __global__ void softmax_rows(__half* output,
     }
   }
   __syncthreads();
-  for (int i = tid; i < w; i += blockDim.x) {
+  for (int i = tid; i < w; i += BLOCK_DIM_X) {
     float val = __half2float(input[row_idx + i]) / temp;
     output[row_idx + i] = __float2half(expf(val - s_max_val) / s_sum_exp);
   }
