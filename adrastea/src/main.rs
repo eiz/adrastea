@@ -16,8 +16,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    ffi::{c_void, CStr, CString},
-    path::{Path, PathBuf},
+    ffi::{c_void, CStr},
     sync::Arc,
 };
 
@@ -436,7 +435,7 @@ impl Drop for CudaContext {
 
 // exercise for the reader: make get() not have to return a clone
 thread_local! {
-    static THREAD_LOCAL: RefCell<Option<Arc<CudaContext>>> = RefCell::new(None);
+    static THREAD_CUDA_CONTEXT: RefCell<Option<Arc<CudaContext>>> = RefCell::new(None);
 }
 
 struct ScopedCudaContext {
@@ -445,7 +444,7 @@ struct ScopedCudaContext {
 
 impl ScopedCudaContext {
     unsafe fn new(value: Arc<CudaContext>) -> Result<Self, simt_cuda_sys::CUresult> {
-        let old_value = THREAD_LOCAL.with(|v| {
+        let old_value = THREAD_CUDA_CONTEXT.with(|v| {
             let mut v = v.borrow_mut();
             let old_value = v.clone();
             cuda_call(|| value.cuda.cuCtxPushCurrent_v2(value.context))?;
@@ -456,7 +455,7 @@ impl ScopedCudaContext {
     }
 
     fn get() -> Result<Arc<CudaContext>, simt_cuda_sys::CUresult> {
-        THREAD_LOCAL
+        THREAD_CUDA_CONTEXT
             .with(|v| v.borrow().clone())
             .ok_or(simt_cuda_sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
     }
@@ -485,7 +484,7 @@ impl ScopedCudaContext {
 
 impl Drop for ScopedCudaContext {
     fn drop(&mut self) {
-        THREAD_LOCAL.with(|v| {
+        THREAD_CUDA_CONTEXT.with(|v| {
             let mut v = v.borrow_mut();
             unsafe {
                 cuda_result_call(|x| v.as_ref().unwrap().cuda.cuCtxPopCurrent_v2(x))
@@ -679,11 +678,296 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[inline(always)]
+unsafe fn hip_call<F: FnOnce() -> simt_hip_sys::hipError_t>(
+    cb: F,
+) -> Result<(), simt_hip_sys::hipError_t> {
+    let res = cb();
+    if res == simt_hip_sys::hipError_t::hipSuccess {
+        Ok(())
+    } else {
+        Err(res)
+    }
+}
+
+#[inline(always)]
+unsafe fn hip_result_call<T, F: FnOnce(*mut T) -> simt_hip_sys::hipError_t>(
+    cb: F,
+) -> Result<T, simt_hip_sys::hipError_t> {
+    let mut out = std::mem::MaybeUninit::uninit();
+    let res = cb(out.as_mut_ptr());
+    if res == simt_hip_sys::hipError_t::hipSuccess {
+        Ok(out.assume_init())
+    } else {
+        Err(res)
+    }
+}
+
+struct HipContext {
+    hip: Arc<simt_hip_sys::hip>,
+    device: simt_hip_sys::hipDevice_t,
+    context: simt_hip_sys::hipCtx_t,
+}
+
+impl HipContext {
+    pub unsafe fn new(hip: Arc<simt_hip_sys::hip>, device_index: i32) -> anyhow::Result<Self> {
+        let device = hip_result_call(|x| hip.hipDeviceGet(x, device_index))?;
+        let context = hip_result_call(|x| hip.hipCtxCreate(x, 0, device))?;
+        hip_result_call(|x| hip.hipCtxPopCurrent(x)).expect("hipCtxPopCurrent failed");
+        Ok(Self {
+            hip,
+            device,
+            context,
+        })
+    }
+}
+
+impl Drop for HipContext {
+    fn drop(&mut self) {
+        unsafe {
+            hip_call(|| self.hip.hipCtxDestroy(self.context)).expect("hipCtxDestroy failed");
+        }
+    }
+}
+
+// exercise for the reader: make get() not have to return a clone
+thread_local! {
+    static THREAD_HIP_CONTEXT: RefCell<Option<Arc<HipContext>>> = RefCell::new(None);
+}
+
+struct ScopedHipContext {
+    old_value: Option<Arc<HipContext>>,
+}
+
+impl ScopedHipContext {
+    unsafe fn new(value: Arc<HipContext>) -> Result<Self, simt_hip_sys::hipError_t> {
+        let old_value = THREAD_HIP_CONTEXT.with(|v| {
+            let mut v = v.borrow_mut();
+            let old_value = v.clone();
+            hip_call(|| value.hip.hipCtxPushCurrent(value.context))?;
+            *v = Some(value);
+            Ok(old_value)
+        })?;
+        Ok(Self { old_value })
+    }
+
+    fn get() -> Result<Arc<HipContext>, simt_hip_sys::hipError_t> {
+        THREAD_HIP_CONTEXT
+            .with(|v| v.borrow().clone())
+            .ok_or(simt_hip_sys::hipError_t::hipErrorInvalidContext)
+    }
+
+    pub fn capability() -> Result<i32, simt_hip_sys::hipError_t> {
+        unsafe {
+            let ctx = Self::get()?;
+            let major = hip_result_call(|x| {
+                ctx.hip.hipDeviceGetAttribute(
+                    x,
+                    simt_hip_sys::hipDeviceAttribute_t::hipDeviceAttributeComputeCapabilityMajor,
+                    ctx.device,
+                )
+            })?;
+            let minor = hip_result_call(|x| {
+                ctx.hip.hipDeviceGetAttribute(
+                    x,
+                    simt_hip_sys::hipDeviceAttribute_t::hipDeviceAttributeComputeCapabilityMinor,
+                    ctx.device,
+                )
+            })?;
+            Ok(major * 100 + minor)
+        }
+    }
+}
+
+impl Drop for ScopedHipContext {
+    fn drop(&mut self) {
+        THREAD_HIP_CONTEXT.with(|v| {
+            let mut v = v.borrow_mut();
+            unsafe {
+                hip_result_call(|x| v.as_ref().unwrap().hip.hipCtxPopCurrent(x))
+                    .expect("hipCtxPopCurrent failed");
+            }
+            *v = self.old_value.clone()
+        });
+    }
+}
+
+struct HipBuffer {
+    ptr: simt_hip_sys::hipDeviceptr_t,
+    size: usize,
+}
+
+impl HipBuffer {
+    pub unsafe fn new(size: usize) -> anyhow::Result<Self> {
+        let ctx = ScopedHipContext::get()?;
+        let ptr = hip_result_call(|x| ctx.hip.hipMalloc(x, size))?;
+        Ok(Self { ptr, size })
+    }
+
+    pub unsafe fn copy_from(
+        &mut self,
+        src: *const std::ffi::c_void,
+        size: usize,
+    ) -> anyhow::Result<()> {
+        let ctx = ScopedHipContext::get()?;
+        hip_call(|| ctx.hip.hipMemcpyHtoD(self.ptr, src as *mut _, size))?;
+        Ok(())
+    }
+
+    pub unsafe fn copy_to(&self, dst: *mut std::ffi::c_void, size: usize) -> anyhow::Result<()> {
+        let ctx = ScopedHipContext::get()?;
+        hip_call(|| ctx.hip.hipMemcpyDtoH(dst, self.ptr, size))?;
+        Ok(())
+    }
+
+    pub fn copy_from_slice<T: Copy>(&mut self, src: &[T]) -> anyhow::Result<()> {
+        assert_eq!(src.len() * std::mem::size_of::<T>(), self.size);
+        unsafe { self.copy_from(src.as_ptr() as *const std::ffi::c_void, self.size) }
+    }
+
+    pub fn copy_to_slice<T: Copy>(&self, dst: &mut [T]) -> anyhow::Result<()> {
+        assert_eq!(dst.len() * std::mem::size_of::<T>(), self.size);
+        unsafe { self.copy_to(dst.as_mut_ptr() as *mut std::ffi::c_void, self.size) }
+    }
+}
+
+impl Drop for HipBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let ctx = ScopedHipContext::get()
+                .expect("invariant: HipBuffer must be dropped in a context scope");
+            hip_call(|| ctx.hip.hipFree(self.ptr)).expect("hipFree failed");
+        }
+    }
+}
+
+pub struct HipModule {
+    inner: simt_hip_sys::hipModule_t,
+}
+
+impl HipModule {
+    pub unsafe fn new(data: &[u8]) -> anyhow::Result<Self> {
+        let ctx = ScopedHipContext::get()?;
+        let inner = hip_result_call(|x| ctx.hip.hipModuleLoadData(x, data.as_ptr() as *const _))?;
+        Ok(Self { inner })
+    }
+
+    pub unsafe fn find(capability: i32, kernels: &[(&str, &[u8])]) -> anyhow::Result<Self> {
+        let ctx = ScopedHipContext::get()?;
+        let mut compatible_kernels = vec![];
+        for (arch, bin) in kernels {
+            if !arch.starts_with("gfx") {
+                continue;
+            }
+            let arch = arch[3..].parse::<i32>()?;
+            if arch <= capability {
+                compatible_kernels.push((arch, bin));
+            }
+        }
+        compatible_kernels.sort_by_key(|(arch, _)| *arch);
+        let (_, bin) = compatible_kernels
+            .iter()
+            .rev()
+            .filter(|(arch, _)| *arch <= capability)
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("no compatible kernel found"))?;
+        let inner = hip_result_call(|x| ctx.hip.hipModuleLoadData(x, bin.as_ptr() as *const _))?;
+        Ok(Self { inner })
+    }
+}
+
+impl Drop for HipModule {
+    fn drop(&mut self) {
+        unsafe {
+            let ctx = ScopedHipContext::get()
+                .expect("invariant: HipModule must be dropped in a context scope");
+            hip_call(|| ctx.hip.hipModuleUnload(self.inner)).expect("hipModuleUnload failed");
+        }
+    }
+}
+
+unsafe fn hip_square() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    const LIB: &str = "libamdhip64.so";
+    #[cfg(windows)]
+    const LIB: &str = "shrugemoji.dll";
+    let hip = Arc::new(simt_hip_sys::hip::new(LIB)?);
+    hip_call(|| hip.hipInit(0))?;
+    let device_count = hip_result_call(|x| hip.hipGetDeviceCount(x))?;
+    println!("{} device(s)", device_count);
+    for i in 0..device_count {
+        let mut name = [0u8; 256];
+        hip_call(|| hip.hipDeviceGetName(name.as_mut_ptr() as *mut _, 256, i))?;
+        let c_name = CStr::from_ptr(name.as_ptr() as *const _);
+        println!("Device {}: {}", i, c_name.to_str()?);
+    }
+    if device_count == 0 {
+        bail!("can't continue, no devices");
+    }
+    let context = Arc::new(HipContext::new(hip.clone(), 0)?);
+    let _scoped_ctx = ScopedHipContext::new(context.clone());
+    let capability = ScopedHipContext::capability()?;
+    println!("capability is {}", capability);
+    let module = HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
+    let kernel = hip_result_call(|x| {
+        hip.hipModuleGetFunction(
+            x,
+            module.inner,
+            b"square_fp32_16x16\0".as_ptr() as *const i8,
+        )
+    })?;
+    dbg!(kernel);
+    let stream = hip_result_call(|x| hip.hipStreamCreate(x))?;
+    dbg!(stream);
+    let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
+    let buf_sz = (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize;
+    for y in 0..ROWS {
+        for x in 0..COLS {
+            stage_buf[(y * COLS + x) as usize] = (y + x) as f32;
+        }
+    }
+    let mut buf = HipBuffer::new(buf_sz)?;
+    buf.copy_from_slice(&stage_buf)?;
+    let grid_x = ceil_div(COLS, 16);
+    let grid_y = ceil_div(ROWS, 16);
+    hip_call(|| {
+        hip.hipModuleLaunchKernel(
+            kernel,
+            grid_x as u32,
+            grid_y as u32,
+            1,
+            16,
+            16,
+            1,
+            0,
+            stream,
+            &[
+                &buf as *const _ as *mut c_void,
+                &buf as *const _ as *mut c_void,
+                &COLS as *const _ as *mut c_void,
+                &ROWS as *const _ as *mut c_void,
+            ] as *const _ as *mut _,
+            std::ptr::null_mut(),
+        )
+    })?;
+    hip_call(|| hip.hipStreamSynchronize(stream))?;
+    buf.copy_to_slice(&mut stage_buf)?;
+    for y in 0..ROWS {
+        for x in 0..COLS {
+            print!("{:4} ", stage_buf[(y * COLS + x) as usize]);
+        }
+        println!("");
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
     if args.len() >= 2 && args[1] == "cuda" {
         unsafe { cuda_square()? }
+    } else if args.len() >= 2 && args[1] == "hip" {
+        unsafe { hip_square()? }
     } else {
         unsafe { vulkan_square()? }
     }

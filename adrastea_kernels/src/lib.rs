@@ -4,7 +4,7 @@ macro_rules! cuda_kernels {
     (@expand_arches [$($arch:ident),*] $kernel:ident) => {
         &[$(
             (stringify!($arch), include_bytes!(
-                concat!(env!("OUT_DIR"), "/", stringify!($arch), "/", stringify!($kernel), ".cubin"))),
+                concat!(env!("OUT_DIR"), "/", stringify!($arch), "/", stringify!($kernel), ".bin"))),
         )*]
     };
     (@expand_kernels $arches:tt [$($kernel:ident),*]) => {
@@ -17,14 +17,11 @@ macro_rules! cuda_kernels {
 }
 
 cuda_kernels! {
-    [sm_80, sm_89],
+    [sm_80, sm_89, gfx1100],
     [
         embed,
         embed_uint8,
         matmul_nt_fp16u8,
-        matmul_nt_wmma_16x128x256_fp16u8,
-        matmul_nt_wmma_16x128x256,
-        matmul_nt_wmma_128x64x64,
         matmul_nt,
         matmul_qk,
         matmul_qkv,
@@ -33,5 +30,14 @@ cuda_kernels! {
         silu,
         softmax_rows,
         square_fp32_16x16
+    ]
+}
+
+cuda_kernels! {
+    [sm_80, sm_89],
+    [
+        matmul_nt_wmma_16x128x256_fp16u8,
+        matmul_nt_wmma_16x128x256,
+        matmul_nt_wmma_128x64x64
     ]
 }

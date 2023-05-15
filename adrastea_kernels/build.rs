@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn build_arch_cuda(out_path: &Path, arch: &str, kernels: &[&str]) {
     fs::create_dir_all(out_path.join(arch)).unwrap();
@@ -8,7 +12,7 @@ fn build_arch_cuda(out_path: &Path, arch: &str, kernels: &[&str]) {
             .arg(format!("-arch={}", arch))
             .arg("--cubin")
             .arg("-o")
-            .arg(out_path.join(arch).join(format!("{}.cubin", kernel)))
+            .arg(out_path.join(arch).join(format!("{}.bin", kernel)))
             .arg(format!("cpp/{}.cu", kernel))
             .status()
             .unwrap();
@@ -18,7 +22,7 @@ fn build_arch_cuda(out_path: &Path, arch: &str, kernels: &[&str]) {
     }
 }
 
-fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) { 
+fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
     fs::create_dir_all(out_path.join(arch)).unwrap();
     for kernel in kernels {
         println!("cargo:rerun-if-changed=cpp/{}.cu", kernel);
@@ -26,7 +30,7 @@ fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
             .arg("--genco")
             .arg(format!("--offload-arch={}", arch))
             .arg("-o")
-            .arg(out_path.join(arch).join(format!("{}.hsaco", kernel)))
+            .arg(out_path.join(arch).join(format!("{}.bin", kernel)))
             .arg(format!("cpp/{}.cu", kernel))
             .status()
             .unwrap();

@@ -12,6 +12,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simt_cuda_sys",
+ "simt_hip_sys",
  "windows",
 ]
 
@@ -126,6 +127,15 @@ name = "simt_cuda_sys"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6731d567ba4412ad9c4448c81877f852de2c1efdc4bdf2eb68422b66637d5f4e"
+dependencies = [
+ "libloading 0.8.0",
+]
+
+[[package]]
+name = "simt_hip_sys"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec4b289aa140083a8dccad22d4fd376cebc7d21f50f6ce2e1fa2a32eea761a4"
 dependencies = [
  "libloading 0.8.0",
 ]
