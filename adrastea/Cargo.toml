@@ -7,14 +7,17 @@ description = "Software 3.11 for Workgroups"
 license = "AGPL-3.0-only"
 
 [dependencies]
+adrastea_kernels = { path = "../adrastea_kernels" }
+
 anyhow = "1.0.71"
 ash = { version = "0.37.2", features = ["loaded"] }
+half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-simt_cuda_sys = "0.1.0"
-simt_hip_sys = "0.1.1"
-
-adrastea_kernels = { path = "../adrastea_kernels" }
+serde-pickle = "1.1.1"
+simt_cuda_sys = "0.1.1"
+simt_hip_sys = "0.1.2"
+zip = { version = "0.6.6", default-features = false, features = [] }
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"

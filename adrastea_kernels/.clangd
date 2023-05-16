@@ -1,6 +1,8 @@
 CompileFlags:
   Add:
     - -D_CLANGD=1
+    - -xcuda
+    - --cuda-path=/opt/cuda
   Remove:
     - -forward-unknown-to-host-compiler
     - --generate-code*

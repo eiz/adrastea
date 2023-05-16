@@ -704,13 +704,13 @@ unsafe fn hip_result_call<T, F: FnOnce(*mut T) -> simt_hip_sys::hipError_t>(
     }
 }
 
-struct HipContext {
+struct HipDevice {
     hip: Arc<simt_hip_sys::hip>,
     device: simt_hip_sys::hipDevice_t,
     context: simt_hip_sys::hipCtx_t,
 }
 
-impl HipContext {
+impl HipDevice {
     pub unsafe fn new(hip: Arc<simt_hip_sys::hip>, device_index: i32) -> anyhow::Result<Self> {
         let device = hip_result_call(|x| hip.hipDeviceGet(x, device_index))?;
         let context = hip_result_call(|x| hip.hipCtxCreate(x, 0, device))?;
@@ -723,7 +723,7 @@ impl HipContext {
     }
 }
 
-impl Drop for HipContext {
+impl Drop for HipDevice {
     fn drop(&mut self) {
         unsafe {
             hip_call(|| self.hip.hipCtxDestroy(self.context)).expect("hipCtxDestroy failed");
@@ -733,15 +733,15 @@ impl Drop for HipContext {
 
 // exercise for the reader: make get() not have to return a clone
 thread_local! {
-    static THREAD_HIP_CONTEXT: RefCell<Option<Arc<HipContext>>> = RefCell::new(None);
+    static THREAD_HIP_CONTEXT: RefCell<Option<Arc<HipDevice>>> = RefCell::new(None);
 }
 
-struct ScopedHipContext {
-    old_value: Option<Arc<HipContext>>,
+struct ScopedHipDevice {
+    old_value: Option<Arc<HipDevice>>,
 }
 
-impl ScopedHipContext {
-    unsafe fn new(value: Arc<HipContext>) -> Result<Self, simt_hip_sys::hipError_t> {
+impl ScopedHipDevice {
+    unsafe fn new(value: Arc<HipDevice>) -> Result<Self, simt_hip_sys::hipError_t> {
         let old_value = THREAD_HIP_CONTEXT.with(|v| {
             let mut v = v.borrow_mut();
             let old_value = v.clone();
@@ -752,7 +752,7 @@ impl ScopedHipContext {
         Ok(Self { old_value })
     }
 
-    fn get() -> Result<Arc<HipContext>, simt_hip_sys::hipError_t> {
+    fn get() -> Result<Arc<HipDevice>, simt_hip_sys::hipError_t> {
         THREAD_HIP_CONTEXT
             .with(|v| v.borrow().clone())
             .ok_or(simt_hip_sys::hipError_t::hipErrorInvalidContext)
@@ -780,7 +780,7 @@ impl ScopedHipContext {
     }
 }
 
-impl Drop for ScopedHipContext {
+impl Drop for ScopedHipDevice {
     fn drop(&mut self) {
         THREAD_HIP_CONTEXT.with(|v| {
             let mut v = v.borrow_mut();
@@ -800,7 +800,7 @@ struct HipBuffer {
 
 impl HipBuffer {
     pub unsafe fn new(size: usize) -> anyhow::Result<Self> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         let ptr = hip_result_call(|x| ctx.hip.hipMalloc(x, size))?;
         Ok(Self { ptr, size })
     }
@@ -810,13 +810,13 @@ impl HipBuffer {
         src: *const std::ffi::c_void,
         size: usize,
     ) -> anyhow::Result<()> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         hip_call(|| ctx.hip.hipMemcpyHtoD(self.ptr, src as *mut _, size))?;
         Ok(())
     }
 
     pub unsafe fn copy_to(&self, dst: *mut std::ffi::c_void, size: usize) -> anyhow::Result<()> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         hip_call(|| ctx.hip.hipMemcpyDtoH(dst, self.ptr, size))?;
         Ok(())
     }
@@ -835,7 +835,7 @@ impl HipBuffer {
 impl Drop for HipBuffer {
     fn drop(&mut self) {
         unsafe {
-            let ctx = ScopedHipContext::get()
+            let ctx = ScopedHipDevice::get()
                 .expect("invariant: HipBuffer must be dropped in a context scope");
             hip_call(|| ctx.hip.hipFree(self.ptr)).expect("hipFree failed");
         }
@@ -848,13 +848,13 @@ pub struct HipModule {
 
 impl HipModule {
     pub unsafe fn new(data: &[u8]) -> anyhow::Result<Self> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         let inner = hip_result_call(|x| ctx.hip.hipModuleLoadData(x, data.as_ptr() as *const _))?;
         Ok(Self { inner })
     }
 
     pub unsafe fn find(capability: i32, kernels: &[(&str, &[u8])]) -> anyhow::Result<Self> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         let mut compatible_kernels = vec![];
         for (arch, bin) in kernels {
             if !arch.starts_with("gfx") {
@@ -880,9 +880,41 @@ impl HipModule {
 impl Drop for HipModule {
     fn drop(&mut self) {
         unsafe {
-            let ctx = ScopedHipContext::get()
+            let ctx = ScopedHipDevice::get()
                 .expect("invariant: HipModule must be dropped in a context scope");
             hip_call(|| ctx.hip.hipModuleUnload(self.inner)).expect("hipModuleUnload failed");
+        }
+    }
+}
+
+pub struct HipPhysicalDevice(i32);
+
+impl HipPhysicalDevice {
+    pub fn count() -> anyhow::Result<i32> {
+        unsafe { Ok(hip_result_call(|x| simt_hip_sys::library().hipGetDeviceCount(x))? as i32) }
+    }
+
+    pub fn index(&self) -> i32 {
+        self.0
+    }
+
+    pub fn get(index: i32) -> Self {
+        HipPhysicalDevice(index)
+    }
+
+    pub fn name(&self) -> anyhow::Result<String> {
+        unsafe {
+            let mut name = [0u8; 256];
+            hip_call(|| {
+                simt_hip_sys::library().hipDeviceGetName(
+                    name.as_mut_ptr() as *mut _,
+                    name.len() as i32,
+                    self.0,
+                )
+            })?;
+            Ok(CStr::from_ptr(name.as_ptr() as *const i8)
+                .to_str()?
+                .to_owned())
         }
     }
 }
@@ -907,7 +939,7 @@ pub struct Kernel<T> {
 
 impl<T> Kernel<T> {
     pub fn new(module: &HipModule, name: &str) -> anyhow::Result<Self> {
-        let ctx = ScopedHipContext::get()?;
+        let ctx = ScopedHipDevice::get()?;
         let c_name = CString::new(name)?;
 
         unsafe {
@@ -932,7 +964,7 @@ macro_rules! impl_kernel {
                 launch_params: LaunchParams,
                 params: ($($ty_param),*,),
             ) -> anyhow::Result<()> {
-                let ctx = ScopedHipContext::get()?;
+                let ctx = ScopedHipDevice::get()?;
                 let (bx, by, bz) = launch_params.blocks;
                 let (tx, ty, tz) = launch_params.threads;
                 unsafe {
@@ -993,20 +1025,17 @@ unsafe fn hip_square() -> anyhow::Result<()> {
     const LIB: &str = "shrugemoji.dll";
     let hip = Arc::new(simt_hip_sys::hip::new(LIB)?);
     hip_call(|| hip.hipInit(0))?;
-    let device_count = hip_result_call(|x| hip.hipGetDeviceCount(x))?;
+    let device_count = HipPhysicalDevice::count()?;
     println!("{} device(s)", device_count);
     for i in 0..device_count {
-        let mut name = [0u8; 256];
-        hip_call(|| hip.hipDeviceGetName(name.as_mut_ptr() as *mut _, 256, i))?;
-        let c_name = CStr::from_ptr(name.as_ptr() as *const _);
-        println!("Device {}: {}", i, c_name.to_str()?);
+        println!("Device {}: {}", i, HipPhysicalDevice::get(i).name()?);
     }
     if device_count == 0 {
         bail!("can't continue, no devices");
     }
-    let context = Arc::new(HipContext::new(hip.clone(), 0)?);
-    let _scoped_ctx = ScopedHipContext::new(context.clone());
-    let capability = ScopedHipContext::capability()?;
+    let device = Arc::new(HipDevice::new(hip.clone(), 0)?);
+    let _scoped_device = ScopedHipDevice::new(device.clone());
+    let capability = ScopedHipDevice::capability()?;
     println!("capability is {}", capability);
     let module = HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
     let kernels = TestKernels {
