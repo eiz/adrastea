@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals)]
 
-macro_rules! cuda_kernels {
+macro_rules! simt_kernels {
     (@expand_arches [$($arch:ident),*] $kernel:ident) => {
         &[$(
             (stringify!($arch), include_bytes!(
@@ -10,13 +10,13 @@ macro_rules! cuda_kernels {
     (@expand_kernels $arches:tt [$($kernel:ident),*]) => {
         $(
             pub static $kernel: &[(& str, &[u8])] =
-                cuda_kernels!(@expand_arches $arches $kernel);
+                simt_kernels!(@expand_arches $arches $kernel);
         )*
     };
-    ($arches:tt, $kernels:tt) => { cuda_kernels!(@expand_kernels $arches $kernels); };
+    ($arches:tt, $kernels:tt) => { simt_kernels!(@expand_kernels $arches $kernels); };
 }
 
-cuda_kernels! {
+simt_kernels! {
     [sm_80, sm_89, gfx1100],
     [
         embed,
@@ -33,7 +33,7 @@ cuda_kernels! {
     ]
 }
 
-cuda_kernels! {
+simt_kernels! {
     [sm_80, sm_89],
     [
         matmul_nt_wmma_16x128x256_fp16u8,

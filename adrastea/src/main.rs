@@ -16,7 +16,8 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
-    ffi::{c_void, CStr},
+    ffi::{c_void, CStr, CString},
+    marker::PhantomData,
     sync::Arc,
 };
 
@@ -886,6 +887,105 @@ impl Drop for HipModule {
     }
 }
 
+pub trait KernelParam {
+    fn to_launch_arg(&self) -> *mut c_void {
+        self as *const _ as *mut _
+    }
+}
+
+impl<T: KernelParam> KernelParam for *mut T {}
+impl<T: KernelParam> KernelParam for *const T {}
+impl KernelParam for f32 {}
+impl KernelParam for f64 {}
+impl KernelParam for u32 {}
+impl KernelParam for u64 {}
+
+pub struct Kernel<T> {
+    ptr: simt_hip_sys::hipFunction_t,
+    _dead: PhantomData<T>,
+}
+
+impl<T> Kernel<T> {
+    pub fn new(module: &HipModule, name: &str) -> anyhow::Result<Self> {
+        let ctx = ScopedHipContext::get()?;
+        let c_name = CString::new(name)?;
+
+        unsafe {
+            let result = hip_result_call(|x| {
+                ctx.hip
+                    .hipModuleGetFunction(x, module.inner, c_name.as_ptr() as *const i8)
+            })?;
+
+            Ok(Self {
+                ptr: result,
+                _dead: PhantomData,
+            })
+        }
+    }
+}
+
+macro_rules! impl_kernel {
+    (($($ty_param:ident),*), ($($ty_idx:tt),*)) => {
+        impl<$($ty_param: KernelParam),*> Kernel<($($ty_param),*,)> {
+            pub fn launch(
+                &self,
+                launch_params: LaunchParams,
+                params: ($($ty_param),*,),
+            ) -> anyhow::Result<()> {
+                let ctx = ScopedHipContext::get()?;
+                let (bx, by, bz) = launch_params.blocks;
+                let (tx, ty, tz) = launch_params.threads;
+                unsafe {
+                    hip_call(|| {
+                        ctx.hip.hipModuleLaunchKernel(
+                            self.ptr,
+                            bx,
+                            by,
+                            bz,
+                            tx,
+                            ty,
+                            tz,
+                            launch_params.shared_mem,
+                            launch_params.stream.unwrap_or(std::ptr::null_mut()),
+                            &[$(params.$ty_idx.to_launch_arg()),*] as *const _ as *mut _,
+                            std::ptr::null_mut(),
+                        )
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+impl_kernel!((T1), (0));
+impl_kernel!((T1, T2), (0, 1));
+impl_kernel!((T1, T2, T3), (0, 1, 2));
+impl_kernel!((T1, T2, T3, T4), (0, 1, 2, 3));
+impl_kernel!((T1, T2, T3, T4, T5), (0, 1, 2, 3, 4));
+impl_kernel!((T1, T2, T3, T4, T5, T6), (0, 1, 2, 3, 4, 5));
+impl_kernel!((T1, T2, T3, T4, T5, T6, T7), (0, 1, 2, 3, 4, 5, 6));
+impl_kernel!((T1, T2, T3, T4, T5, T6, T7, T8), (0, 1, 2, 3, 4, 5, 6, 7));
+impl_kernel!(
+    (T1, T2, T3, T4, T5, T6, T7, T8, T9),
+    (0, 1, 2, 3, 4, 5, 6, 7, 8)
+);
+impl_kernel!(
+    (T1, T2, T3, T4, T5, T6, T7, T8, T9, T10),
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+);
+
+struct TestKernels {
+    square_fp32_16x16: Kernel<(*mut f32, *mut f32, u32, u32)>,
+}
+
+#[derive(Default, Clone)]
+pub struct LaunchParams {
+    blocks: (u32, u32, u32),
+    threads: (u32, u32, u32),
+    shared_mem: u32,
+    stream: Option<simt_hip_sys::hipStream_t>,
+}
+
 unsafe fn hip_square() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     const LIB: &str = "libamdhip64.so";
@@ -909,14 +1009,9 @@ unsafe fn hip_square() -> anyhow::Result<()> {
     let capability = ScopedHipContext::capability()?;
     println!("capability is {}", capability);
     let module = HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
-    let kernel = hip_result_call(|x| {
-        hip.hipModuleGetFunction(
-            x,
-            module.inner,
-            b"square_fp32_16x16\0".as_ptr() as *const i8,
-        )
-    })?;
-    dbg!(kernel);
+    let kernels = TestKernels {
+        square_fp32_16x16: Kernel::new(&module, "square_fp32_16x16")?,
+    };
     let stream = hip_result_call(|x| hip.hipStreamCreate(x))?;
     dbg!(stream);
     let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
@@ -930,26 +1025,20 @@ unsafe fn hip_square() -> anyhow::Result<()> {
     buf.copy_from_slice(&stage_buf)?;
     let grid_x = ceil_div(COLS, 16);
     let grid_y = ceil_div(ROWS, 16);
-    hip_call(|| {
-        hip.hipModuleLaunchKernel(
-            kernel,
-            grid_x as u32,
-            grid_y as u32,
-            1,
-            16,
-            16,
-            1,
-            0,
-            stream,
-            &[
-                &buf as *const _ as *mut c_void,
-                &buf as *const _ as *mut c_void,
-                &COLS as *const _ as *mut c_void,
-                &ROWS as *const _ as *mut c_void,
-            ] as *const _ as *mut _,
-            std::ptr::null_mut(),
-        )
-    })?;
+    kernels.square_fp32_16x16.launch(
+        LaunchParams {
+            blocks: (grid_x as u32, grid_y as u32, 1),
+            threads: (16, 16, 1),
+            shared_mem: 0,
+            stream: Some(stream),
+        },
+        (
+            buf.ptr as *mut f32,
+            buf.ptr as *mut f32,
+            COLS as u32,
+            ROWS as u32,
+        ),
+    )?;
     hip_call(|| hip.hipStreamSynchronize(stream))?;
     buf.copy_to_slice(&mut stage_buf)?;
     for y in 0..ROWS {
