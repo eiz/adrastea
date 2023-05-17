@@ -18,6 +18,7 @@ serde-pickle = "1.1.1"
 simt_cuda_sys = "0.1.1"
 simt_hip_sys = "0.1.2"
 zip = { version = "0.6.6", default-features = false, features = [] }
+memmap2 = "0.6.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"

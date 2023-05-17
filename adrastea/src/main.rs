@@ -919,12 +919,39 @@ impl HipPhysicalDevice {
     }
 }
 
+struct HipStream {
+    inner: simt_hip_sys::hipStream_t,
+}
+
+impl HipStream {
+    pub fn new() -> anyhow::Result<Self> {
+        let hip = simt_hip_sys::library();
+        let inner = unsafe { hip_result_call(|x| hip.hipStreamCreate(x))? };
+        Ok(Self { inner })
+    }
+
+    pub fn sync(&self) -> Result<(), simt_hip_sys::hipError_t> {
+        let hip = simt_hip_sys::library();
+        unsafe { hip_call(|| hip.hipStreamSynchronize(self.inner))? }
+        Ok(())
+    }
+}
+
+impl Drop for HipStream {
+    fn drop(&mut self) {
+        unsafe {
+            let hip = simt_hip_sys::library();
+            hip_call(|| hip.hipStreamDestroy(self.inner)).expect("hipStreamDestroy failed");
+        }
+    }
+}
+
 #[derive(Default, Clone)]
-pub struct LaunchParams {
+pub struct LaunchParams<'a> {
     blocks: (u32, u32, u32),
     threads: (u32, u32, u32),
     shared_mem: u32,
-    stream: Option<simt_hip_sys::hipStream_t>,
+    stream: Option<&'a HipStream>,
 }
 
 pub trait KernelParam {
@@ -963,6 +990,8 @@ impl<T> Kernel<T> {
     }
 }
 
+// TODO: launch should really be declared unsafe, but 'ehhh
+// that would be mildly inconvenient
 macro_rules! impl_kernel {
     (($($ty_param:ident),*), ($($ty_idx:tt),*)) => {
         impl<$($ty_param: KernelParam),*> Kernel<($($ty_param),*,)> {
@@ -985,7 +1014,7 @@ macro_rules! impl_kernel {
                             ty,
                             tz,
                             launch_params.shared_mem,
-                            launch_params.stream.unwrap_or(std::ptr::null_mut()),
+                            launch_params.stream.map(|x| x.inner).unwrap_or(std::ptr::null_mut()),
                             &[$(params.$ty_idx.to_launch_arg()),*] as *const _ as *mut _,
                             std::ptr::null_mut(),
                         )
@@ -1037,8 +1066,7 @@ fn hip_square() -> anyhow::Result<()> {
     let kernels = TestKernels {
         square_fp32_16x16: Kernel::new(&module, "square_fp32_16x16")?,
     };
-    let stream = unsafe { hip_result_call(|x| hip.hipStreamCreate(x))? };
-    dbg!(stream);
+    let stream = HipStream::new()?;
     let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
     let buf_sz = (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize;
     for y in 0..ROWS {
@@ -1055,7 +1083,7 @@ fn hip_square() -> anyhow::Result<()> {
             blocks: (grid_x as u32, grid_y as u32, 1),
             threads: (16, 16, 1),
             shared_mem: 0,
-            stream: Some(stream),
+            stream: Some(&stream),
         },
         (
             buf.ptr as *mut f32,
@@ -1064,7 +1092,7 @@ fn hip_square() -> anyhow::Result<()> {
             ROWS as u32,
         ),
     )?;
-    unsafe { hip_call(|| hip.hipStreamSynchronize(stream))? }
+    stream.sync()?;
     buf.copy_to_slice(&mut stage_buf)?;
     for y in 0..ROWS {
         for x in 0..COLS {
@@ -1081,7 +1109,7 @@ fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "cuda" {
         unsafe { cuda_square()? }
     } else if args.len() >= 2 && args[1] == "hip" {
-        unsafe { hip_square()? }
+        hip_square()?
     } else {
         unsafe { vulkan_square()? }
     }
