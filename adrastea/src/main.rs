@@ -18,7 +18,7 @@ use std::{
     collections::HashMap,
     ffi::{c_void, CStr, CString},
     marker::PhantomData,
-    sync::Arc,
+    sync::{Arc, Once},
 };
 
 use anyhow::bail;
@@ -887,10 +887,31 @@ impl Drop for HipModule {
     }
 }
 
+fn hip_ensure_initialized() -> anyhow::Result<()> {
+    static ONCE: Once = Once::new();
+    let mut init_err = None;
+    unsafe {
+        ONCE.call_once(|| {
+            if let Err(e) = simt_hip_sys::initialize() {
+                init_err = Some(anyhow::anyhow!(e));
+            }
+            if let Err(e) = hip_call(|| simt_hip_sys::library().hipInit(0)) {
+                init_err = Some(anyhow::anyhow!(e));
+            }
+        });
+    }
+    if init_err.is_some() {
+        Err(init_err.unwrap())
+    } else {
+        Ok(())
+    }
+}
+
 pub struct HipPhysicalDevice(i32);
 
 impl HipPhysicalDevice {
     pub fn count() -> anyhow::Result<i32> {
+        hip_ensure_initialized()?;
         unsafe { Ok(hip_result_call(|x| simt_hip_sys::library().hipGetDeviceCount(x))? as i32) }
     }
 
@@ -898,8 +919,9 @@ impl HipPhysicalDevice {
         self.0
     }
 
-    pub fn get(index: i32) -> Self {
-        HipPhysicalDevice(index)
+    pub fn get(index: i32) -> anyhow::Result<Self> {
+        hip_ensure_initialized()?;
+        Ok(HipPhysicalDevice(index))
     }
 
     pub fn name(&self) -> anyhow::Result<String> {
@@ -1047,13 +1069,10 @@ struct TestKernels {
 }
 
 fn hip_square() -> anyhow::Result<()> {
-    simt_hip_sys::initialize()?;
-    let hip = simt_hip_sys::library();
-    unsafe { hip_call(|| hip.hipInit(0))? }
     let device_count = HipPhysicalDevice::count()?;
     println!("{} device(s)", device_count);
     for i in 0..device_count {
-        println!("Device {}: {}", i, HipPhysicalDevice::get(i).name()?);
+        println!("Device {}: {}", i, HipPhysicalDevice::get(i)?.name()?);
     }
     if device_count == 0 {
         bail!("can't continue, no devices");
