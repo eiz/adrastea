@@ -28,7 +28,7 @@ use anyhow::bail;
 use ash::{vk, Entry};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use zip::ZipArchive;
+use zip::{CompressionMethod, ZipArchive};
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
 
@@ -1147,11 +1147,26 @@ impl MappedBuffer {
 }
 
 fn value_as_dict(
-    value: serde_pickle::Value,
+    mut value: serde_pickle::Value,
+    path: &[&str],
 ) -> anyhow::Result<BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
-    match value {
-        serde_pickle::Value::Dict(map) => Ok(map),
-        _ => bail!("expected dict"),
+    let mut i = 0;
+    loop {
+        let dict = match value {
+            serde_pickle::Value::Dict(map) => map,
+            _ => bail!("expected dict"),
+        };
+
+        if i < path.len() {
+            // TODO: really ugly
+            value = match dict.get(&serde_pickle::HashableValue::String(path[i].to_string())) {
+                Some(value) => value.clone(),
+                None => bail!("key not found"),
+            };
+            i += 1;
+        } else {
+            return Ok(dict);
+        }
     }
 }
 
@@ -1165,14 +1180,30 @@ type PyTensor = (
     serde_pickle::Value,
 );
 
-fn load_test() -> anyhow::Result<()> {
-    let buf = MappedBuffer::open("/home/eiz/filthy_instruct_v6/consolidated.00.pth")?;
+fn load_test(path: &str, dict_path: Option<&str>) -> anyhow::Result<()> {
+    let buf = MappedBuffer::open(path)?;
     let mut archive = ZipArchive::new(Cursor::new(buf.data()))?;
-    let entry = archive.by_name("consolidated.00/data.pkl")?;
-    let content =
-        &buf.data()[entry.data_start() as usize..(entry.data_start() + entry.size()) as usize];
+    let mut filehash = HashMap::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i)?;
+        if entry.compression() != CompressionMethod::Stored {
+            bail!("pytorch archives should not contain compressed files");
+        }
+        let path = Path::new(entry.name());
+        if let Some(name) = path.file_name() {
+            let content = &buf.data()
+                [entry.data_start() as usize..(entry.data_start() + entry.size()) as usize];
+            filehash.insert(name.to_string_lossy().to_string(), content);
+        }
+    }
+    let content = filehash
+        .get("data.pkl")
+        .ok_or_else(|| anyhow::anyhow!("data.pkl not found"))?;
     let pickle = serde_pickle::value_from_slice(content, serde_pickle::DeOptions::new())?;
-    let dict = value_as_dict(pickle)?;
+    let dict = match dict_path {
+        Some(dict_path) => value_as_dict(pickle, &[dict_path]),
+        _ => value_as_dict(pickle, &[]),
+    }?;
 
     for (k, v) in dict.iter() {
         if let serde_pickle::HashableValue::String(ref s) = k {
@@ -1199,8 +1230,13 @@ fn main() -> anyhow::Result<()> {
         unsafe { cuda_square()? }
     } else if args.len() >= 2 && args[1] == "hip" {
         hip_square()?
-    } else if args.len() >= 2 && args[1] == "load" {
-        load_test()?
+    } else if args.len() >= 3 && args[1] == "load" {
+        let dict_path = if args.len() >= 4 {
+            Some(args[3].as_str())
+        } else {
+            None
+        };
+        load_test(&args[2], dict_path)?
     } else {
         unsafe { vulkan_square()? }
     }
