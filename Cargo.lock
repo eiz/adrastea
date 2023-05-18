@@ -15,6 +15,7 @@ dependencies = [
  "serde-pickle",
  "serde_json",
  "simt_cuda_sys",
+ "simt_hip",
  "simt_hip_sys",
  "windows",
  "zip",
@@ -244,6 +245,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "simt_hip"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "354782c2e33421a62bb82da8b69aad07e16d3b20bdf0a2b70e6b9273a7ba0cea"
+dependencies = [
+ "simt_hip_sys",
+ "thiserror",
+]
+
+[[package]]
 name = "simt_hip_sys"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,6 +272,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978c9a314bd8dc99be594bc3c175faaa9794be04a5a5e153caba6915336cebac"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9456a42c5b0d803c8cd86e73dd7cc9edd429499f37a3550d286d5e86720569f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
