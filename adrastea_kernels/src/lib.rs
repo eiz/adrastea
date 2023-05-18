@@ -9,7 +9,7 @@ macro_rules! simt_kernels {
     };
     (@expand_kernels $arches:tt [$($kernel:ident),*]) => {
         $(
-            pub static $kernel: &[(& str, &[u8])] =
+            pub static $kernel: &[(&str, &[u8])] =
                 simt_kernels!(@expand_arches $arches $kernel);
         )*
     };
