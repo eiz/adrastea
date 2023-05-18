@@ -15,15 +15,20 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::{c_void, CStr, CString},
+    fs::File,
+    io::Cursor,
     marker::PhantomData,
+    path::Path,
     sync::{Arc, Once},
 };
 
 use anyhow::bail;
 use ash::{vk, Entry};
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use zip::ZipArchive;
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
 
@@ -710,10 +715,10 @@ struct HipDevice {
 }
 
 impl HipDevice {
-    pub fn new(device_index: i32) -> anyhow::Result<Self> {
+    pub fn new(device_index: HipPhysicalDevice) -> anyhow::Result<Self> {
         unsafe {
             let hip = simt_hip_sys::library();
-            let device = hip_result_call(|x| hip.hipDeviceGet(x, device_index))?;
+            let device = hip_result_call(|x| hip.hipDeviceGet(x, device_index.0))?;
             let context = hip_result_call(|x| hip.hipCtxCreate(x, 0, device))?;
             hip_result_call(|x| hip.hipCtxPopCurrent(x)).expect("hipCtxPopCurrent failed");
             Ok(Self { device, context })
@@ -1077,7 +1082,7 @@ fn hip_square() -> anyhow::Result<()> {
     if device_count == 0 {
         bail!("can't continue, no devices");
     }
-    let device = Arc::new(HipDevice::new(0)?);
+    let device = Arc::new(HipDevice::new(HipPhysicalDevice::get(0)?)?);
     let _scoped_device = ScopedHipDevice::new(device.clone());
     let capability = ScopedHipDevice::capability()?;
     println!("capability is {}", capability);
@@ -1122,6 +1127,71 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ya ya ya bla bla undefined behavior. whatever. make sure nobody secretly boops your files
+// while they are in use
+struct MappedBuffer {
+    _fp: File,
+    mapping: Mmap,
+}
+
+impl MappedBuffer {
+    pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let fp = File::open(path)?;
+        let mapping = unsafe { Mmap::map(&fp)? };
+        Ok(Self { _fp: fp, mapping })
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.mapping
+    }
+}
+
+fn value_as_dict(
+    value: serde_pickle::Value,
+) -> anyhow::Result<BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
+    match value {
+        serde_pickle::Value::Dict(map) => Ok(map),
+        _ => bail!("expected dict"),
+    }
+}
+
+type PyTensorStorage = (String, String, String, String, i64);
+type PyTensor = (
+    PyTensorStorage,
+    i64,
+    Vec<i64>,
+    Vec<i64>,
+    bool,
+    serde_pickle::Value,
+);
+
+fn load_test() -> anyhow::Result<()> {
+    let buf = MappedBuffer::open("/home/eiz/filthy_instruct_v6/consolidated.00.pth")?;
+    let mut archive = ZipArchive::new(Cursor::new(buf.data()))?;
+    let entry = archive.by_name("consolidated.00/data.pkl")?;
+    let content =
+        &buf.data()[entry.data_start() as usize..(entry.data_start() + entry.size()) as usize];
+    let pickle = serde_pickle::value_from_slice(content, serde_pickle::DeOptions::new())?;
+    let dict = value_as_dict(pickle)?;
+
+    for (k, v) in dict.iter() {
+        if let serde_pickle::HashableValue::String(ref s) = k {
+            if s != "_metadata" {
+                println!("{}", s);
+
+                let v: PyTensor = serde_pickle::from_value::<PyTensor>(v.clone())?;
+                println!("  {:?}", v);
+            }
+        }
+    }
+
+    let device = Arc::new(HipDevice::new(HipPhysicalDevice::get(0)?)?);
+    let _scoped_device = ScopedHipDevice::new(device.clone());
+    let mut gpu_buf = HipBuffer::new(buf.data().len())?;
+    gpu_buf.copy_from_slice(buf.data())?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1129,6 +1199,8 @@ fn main() -> anyhow::Result<()> {
         unsafe { cuda_square()? }
     } else if args.len() >= 2 && args[1] == "hip" {
         hip_square()?
+    } else if args.len() >= 2 && args[1] == "load" {
+        load_test()?
     } else {
         unsafe { vulkan_square()? }
     }

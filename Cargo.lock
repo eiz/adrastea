@@ -10,6 +10,7 @@ dependencies = [
  "anyhow",
  "ash",
  "half",
+ "memmap2",
  "serde",
  "serde-pickle",
  "serde_json",
@@ -102,6 +103,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "453ad9f582a441959e5f0d088b02ce04cfe8d51a8eaf077f12ac6d3e94164ca6"
 
 [[package]]
+name = "libc"
+version = "0.2.144"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b00cc1c228a6782d0f076e7b232802e0c5689d41bb5df366f2a6b6621cfdfe1"
+
+[[package]]
 name = "libloading"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -119,6 +126,15 @@ checksum = "d580318f95776505201b28cf98eb1fa5e4be3b689633ba6a3e6cd880ff22d8cb"
 dependencies = [
  "cfg-if",
  "windows-sys",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0aa1b505aeecb0adb017db2b6a79a17a38e64f882a201f05e9de8a982cd6096"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -187,8 +203,7 @@ dependencies = [
 [[package]]
 name = "serde-pickle"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c762ad136a26407c6a80825813600ceeab5e613660d93d79a41f0ec877171e71"
+source = "git+https://github.com/eiz/serde-pickle?branch=mack/persid#f061bb00d8f85897caec23d41043bf0acc020ea2"
 dependencies = [
  "byteorder",
  "iter-read",
