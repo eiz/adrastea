@@ -1,8 +1,9 @@
 #![allow(non_upper_case_globals)]
 
 macro_rules! simt_kernels {
-    (@expand_arches [$($arch:ident),*] $kernel:ident) => {
+    (@expand_arches [$($arch:ident : $arch_expr:expr),*] $kernel:ident) => {
         &[$(
+            #[cfg(feature = $arch_expr)]
             (stringify!($arch), include_bytes!(
                 concat!(env!("OUT_DIR"), "/", stringify!($arch), "/", stringify!($kernel), ".bin"))),
         )*]
@@ -17,7 +18,7 @@ macro_rules! simt_kernels {
 }
 
 simt_kernels! {
-    [sm_80, sm_89, gfx1100],
+    [sm_80: "sm_80", sm_89: "sm_89", gfx1100: "gfx1100"],
     [
         embed,
         embed_uint8,
@@ -34,7 +35,7 @@ simt_kernels! {
 }
 
 simt_kernels! {
-    [sm_80, sm_89],
+    [sm_80: "sm_80", sm_89: "sm_89"],
     [
         matmul_nt_wmma_16x128x256_fp16u8,
         matmul_nt_wmma_16x128x256,

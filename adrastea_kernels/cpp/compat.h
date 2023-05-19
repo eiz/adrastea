@@ -6,8 +6,8 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 #define THREAD_IDX_X threadIdx.x
-#define THREAD_IDX_Y threadIdx.x
-#define THREAD_IDX_Z threadIdx.x
+#define THREAD_IDX_Y threadIdx.y
+#define THREAD_IDX_Z threadIdx.z
 #define BLOCK_IDX_X blockIdx.x
 #define BLOCK_IDX_Y blockIdx.y
 #define BLOCK_IDX_Z blockIdx.z

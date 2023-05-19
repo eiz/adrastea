@@ -6,4 +6,13 @@ authors = ["Adrastea Authors <adrastea@str.rs>"]
 description = "Software 3.11 for Workgroups (kernels)"
 license = "AGPL-3.0-only"
 
+[features]
+default = ["cuda"]
+hip = ["gfx1100"]
+cuda = ["sm_80", "sm_89"]
+
+gfx1100 = []
+sm_80 = []
+sm_89 = []
+
 [dependencies]

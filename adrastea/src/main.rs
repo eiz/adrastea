@@ -655,6 +655,8 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     buf.copy_from_slice(&stage_buf)?;
     let grid_x = ceil_div(COLS, 16);
     let grid_y = ceil_div(ROWS, 16);
+    let width = COLS as u32;
+    let height = ROWS as u32;
     cuda_call(|| {
         cuda.cuLaunchKernel(
             kernel,
@@ -667,10 +669,10 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
             0,
             stream,
             &[
-                &buf as *const _ as *mut c_void,
-                &buf as *const _ as *mut c_void,
-                &COLS as *const _ as *mut c_void,
-                &ROWS as *const _ as *mut c_void,
+                &buf.ptr as *const _ as *mut c_void,
+                &buf.ptr as *const _ as *mut c_void,
+                &width as *const _ as *mut c_void,
+                &height as *const _ as *mut c_void,
             ] as *const _ as *mut _,
             std::ptr::null_mut(),
         )

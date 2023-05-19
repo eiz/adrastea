@@ -59,8 +59,17 @@ fn main() {
         "matmul_nt_wmma_16x128x256",
         "matmul_nt_wmma_128x64x64",
     ];
-    let cuda_arches = &["sm_80", "sm_89"];
-    let hip_arches = &["gfx1100"];
+    #[allow(unused_mut)]
+    let mut cuda_arches: Vec<&str> = vec![];
+    #[allow(unused_mut)]
+    let mut hip_arches: Vec<&str> = vec![];
+    #[cfg(feature = "sm_80")]
+    cuda_arches.push("sm_80");
+    #[cfg(feature = "sm_89")]
+    cuda_arches.push("sm_89");
+    #[cfg(feature = "gfx1100")]
+    hip_arches.push("gfx1100");
+
     let out_path = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     for arch in cuda_arches {
         build_arch_cuda(&out_path, arch, kernels);
