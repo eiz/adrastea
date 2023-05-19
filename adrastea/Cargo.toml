@@ -6,6 +6,9 @@ authors = ["Adrastea Authors <adrastea@str.rs>"]
 description = "Software 3.11 for Workgroups"
 license = "AGPL-3.0-only"
 
+[features]
+hip = ["adrastea_kernels/hip"]
+
 [dependencies]
 adrastea_kernels = { path = "../adrastea_kernels" }
 
