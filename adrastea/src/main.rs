@@ -791,6 +791,7 @@ fn value_as_dict(
 }
 
 type PyTensorStorage = (String, String, String, String, i64);
+// TODO this is probably gonna break when new fields are added (e.g. 'metadata' already exists now)
 type PyTensor = (
     PyTensorStorage,
     i64,
@@ -799,6 +800,31 @@ type PyTensor = (
     bool,
     serde_pickle::Value,
 );
+
+fn expand_dims_4d(dims: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
+    let result = match dims.len() {
+        0 => bail!("no dimensions"),
+        1 => (1, 1, 1, dims[0]),
+        2 => (1, 1, dims[0], dims[1]),
+        3 => (1, dims[0], dims[1], dims[2]),
+        4 => (dims[0], dims[1], dims[2], dims[3]),
+        _ => bail!("too many dimensions"),
+    };
+    Ok(result)
+}
+
+fn expand_stride_4d(dims: &[i64], strides: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
+    let dims_product = dims.iter().product::<i64>();
+    let result = match strides.len() {
+        0 => bail!("no dimensions"),
+        1 => (dims_product, dims_product, dims_product, strides[0]),
+        2 => (dims_product, dims_product, strides[0], strides[1]),
+        3 => (dims_product, strides[0], strides[1], strides[2]),
+        4 => (strides[0], strides[1], strides[2], strides[3]),
+        _ => bail!("too many dimensions"),
+    };
+    Ok(result)
+}
 
 fn load_test(path: &str, dict_path: Option<&str>) -> anyhow::Result<()> {
     let buf = MappedBuffer::open(path)?;
@@ -831,7 +857,13 @@ fn load_test(path: &str, dict_path: Option<&str>) -> anyhow::Result<()> {
                 println!("{}", s);
 
                 let v: PyTensor = serde_pickle::from_value::<PyTensor>(v.clone())?;
-                println!("  {:?}", v);
+                let (storage, storage_offset, size, stride, _requires_grad, _backwards_hooks) = v;
+                let size4d = expand_dims_4d(&size)?;
+                let stride4d = expand_stride_4d(&size, &stride)?;
+                println!("  Storage: {:?}", storage);
+                println!("  Storage offset: {:?}", storage_offset);
+                println!("  Size: {:?} vs {:?}", size4d, size);
+                println!("  Stride: {:?} vs {:?}", stride4d, stride);
             }
         }
     }
