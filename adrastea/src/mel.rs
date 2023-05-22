@@ -44,10 +44,9 @@ pub fn mel_filter_bank(out: &mut [f64], n_mels: usize, n_fft: usize, sample_rate
     mel_frequencies(&mut mel_freqs, 0.0, nyquist);
     fft_frequencies(&mut fft_freqs, n_fft, nyquist);
     for y in 0..n_mels {
-        let mel_width = mel_freqs[y + 1] - mel_freqs[y];
         for x in 0..fft_freqs.len() {
-            let lo = (fft_freqs[x] - mel_freqs[y]) / mel_width;
-            let hi = (mel_freqs[y + 2] - fft_freqs[x]) / mel_width;
+            let lo = (fft_freqs[x] - mel_freqs[y]) / (mel_freqs[y + 1] - mel_freqs[y]);
+            let hi = (mel_freqs[y + 2] - fft_freqs[x]) / (mel_freqs[y + 2] - mel_freqs[y + 1]);
             let weight = 0.0f64.max(lo.min(hi));
             // slaney norm
             out[y * fft_freqs.len() + x] = weight * 2.0 / (mel_freqs[y + 2] - mel_freqs[y]);
