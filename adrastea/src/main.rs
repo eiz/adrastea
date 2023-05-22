@@ -15,62 +15,21 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     ffi::{c_void, CStr},
-    fs::File,
-    io::Cursor,
-    path::Path,
     sync::Arc,
 };
 
 use anyhow::bail;
 use ash::{vk, Entry};
-use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
-use zip::{CompressionMethod, ZipArchive};
+
+pub mod pickle;
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
-
-/*
-mod simt {
-    pub mod intrinsics {
-        extern "C" {
-            pub fn block_idx() -> (u32, u32, u32);
-            pub fn block_dim() -> (u32, u32, u32);
-            pub fn thread_idx() -> (u32, u32, u32);
-            pub fn subgroup_size() -> u32;
-        }
-    }
-}
-
-struct half(u16);
-
-#[simt::device]
-unsafe fn foo(lhs: *const half, rhs: *const half, m: u32, n: u32, k: u32, x: u32, y: u32) -> f32 {
-    0.0
-}
-
-#[simt::device]
-#[inline(always)]
-unsafe fn elementwise_2d() -> (u32, u32) {
-    let block_idx = simt::intrinsics::block_idx();
-    let block_dim = simt::intrinsics::block_dim();
-    let thread_idx = simt::intrinsics::thread_idx();
-    (
-        block_idx.0 * block_dim.0 + thread_idx.0,
-        block_idx.1 * block_dim.1 + thread_idx.1,
-    )
-}
-
-#[simt::kernel]
-unsafe fn dadada(out: *mut f32, lhs: *const half, rhs: *const half, m: u32, n: u32, k: u32) {
-    let (x, y) = elementwise_2d();
-    let data = foo(lhs, rhs, m, n, k, x, y);
-    *(out.offset((y * n + x) as isize)) = data * 0.5;
-}*/
 
 fn ceil_div(a: vk::DeviceSize, b: vk::DeviceSize) -> vk::DeviceSize {
     (a + b - 1) / b
@@ -597,21 +556,6 @@ impl Drop for CudaModule {
     }
 }
 
-/*
-simt::triton_kernel! {
-    #[grid(ceil_div(width, 16), ceil_div(height, 16), 1)]
-    unsafe fn square_fp32_16x16(out_ptr: *mut f32, in_ptr: *const f32, width: u32, height: u32);
-}
-*/
-
-// simt::launch!(square_fp32_16x16(1024, 256, 0, stream)
-//               (out_ptr, in_ptr, width, height));
-// or perhaps
-// let launch = simt::LaunchParams::new(
-//   simt::Dim3(ceil_div(width, 16), ceil_div(height, 16), 1),
-//   simt::Dim3(256, 1, 1), 0, stream);
-// square_fp32_16x16(launch, out_ptr, in_ptr, width, height)?;
-
 unsafe fn cuda_square() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     const LIB: &str = "libcuda.so";
@@ -747,134 +691,6 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ya ya ya bla bla undefined behavior. whatever. make sure nobody secretly boops your files
-// while they are in use
-struct MappedBuffer {
-    _fp: File,
-    mapping: Mmap,
-}
-
-impl MappedBuffer {
-    pub fn open<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
-        let fp = File::open(path)?;
-        let mapping = unsafe { Mmap::map(&fp)? };
-        Ok(Self { _fp: fp, mapping })
-    }
-
-    pub fn data(&self) -> &[u8] {
-        &self.mapping
-    }
-}
-
-fn value_as_dict(
-    mut value: serde_pickle::Value,
-    path: &[&str],
-) -> anyhow::Result<BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
-    let mut i = 0;
-    loop {
-        let dict = match value {
-            serde_pickle::Value::Dict(map) => map,
-            _ => bail!("expected dict"),
-        };
-
-        if i < path.len() {
-            // TODO: really ugly
-            value = match dict.get(&serde_pickle::HashableValue::String(path[i].to_string())) {
-                Some(value) => value.clone(),
-                None => bail!("key not found"),
-            };
-            i += 1;
-        } else {
-            return Ok(dict);
-        }
-    }
-}
-
-type PyTensorStorage = (String, String, String, String, i64);
-// TODO this is probably gonna break when new fields are added (e.g. 'metadata' already exists now)
-type PyTensor = (
-    PyTensorStorage,
-    i64,
-    Vec<i64>,
-    Vec<i64>,
-    bool,
-    serde_pickle::Value,
-);
-
-fn expand_dims_4d(dims: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
-    let result = match dims.len() {
-        0 => bail!("no dimensions"),
-        1 => (1, 1, 1, dims[0]),
-        2 => (1, 1, dims[0], dims[1]),
-        3 => (1, dims[0], dims[1], dims[2]),
-        4 => (dims[0], dims[1], dims[2], dims[3]),
-        _ => bail!("too many dimensions"),
-    };
-    Ok(result)
-}
-
-fn expand_stride_4d(dims: &[i64], strides: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
-    let dims_product = dims.iter().product::<i64>();
-    let result = match strides.len() {
-        0 => bail!("no dimensions"),
-        1 => (dims_product, dims_product, dims_product, strides[0]),
-        2 => (dims_product, dims_product, strides[0], strides[1]),
-        3 => (dims_product, strides[0], strides[1], strides[2]),
-        4 => (strides[0], strides[1], strides[2], strides[3]),
-        _ => bail!("too many dimensions"),
-    };
-    Ok(result)
-}
-
-fn load_test(path: &str, dict_path: Option<&str>) -> anyhow::Result<()> {
-    let buf = MappedBuffer::open(path)?;
-    let mut archive = ZipArchive::new(Cursor::new(buf.data()))?;
-    let mut filehash = HashMap::new();
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i)?;
-        if entry.compression() != CompressionMethod::Stored {
-            bail!("pytorch archives should not contain compressed files");
-        }
-        let path = Path::new(entry.name());
-        if let Some(name) = path.file_name() {
-            let content = &buf.data()
-                [entry.data_start() as usize..(entry.data_start() + entry.size()) as usize];
-            filehash.insert(name.to_string_lossy().to_string(), content);
-        }
-    }
-    let content = filehash
-        .get("data.pkl")
-        .ok_or_else(|| anyhow::anyhow!("data.pkl not found"))?;
-    let pickle = serde_pickle::value_from_slice(content, serde_pickle::DeOptions::new())?;
-    let dict = match dict_path {
-        Some(dict_path) => value_as_dict(pickle, &[dict_path]),
-        _ => value_as_dict(pickle, &[]),
-    }?;
-
-    for (k, v) in dict.iter() {
-        if let serde_pickle::HashableValue::String(ref s) = k {
-            if s != "_metadata" {
-                println!("{}", s);
-
-                let v: PyTensor = serde_pickle::from_value::<PyTensor>(v.clone())?;
-                let (storage, storage_offset, size, stride, _requires_grad, _backwards_hooks) = v;
-                let size4d = expand_dims_4d(&size)?;
-                let stride4d = expand_stride_4d(&size, &stride)?;
-                println!("  Storage: {:?}", storage);
-                println!("  Storage offset: {:?}", storage_offset);
-                println!("  Size: {:?} vs {:?}", size4d, size);
-                println!("  Stride: {:?} vs {:?}", stride4d, stride);
-            }
-        }
-    }
-
-    let device = Arc::new(HipDevice::new(HipPhysicalDevice::get(0)?)?);
-    let _guard = device.lock()?;
-    let mut gpu_buf = HipBuffer::new(buf.data().len())?;
-    gpu_buf.copy_from_slice(buf.data())?;
-    Ok(())
-}
-
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -888,7 +704,8 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        load_test(&args[2], dict_path)?
+        let model = pickle::PickledModel::load_file(&args[2], dict_path)?;
+        println!("{:#?}", model.tensors);
     } else {
         unsafe { vulkan_square()? }
     }
