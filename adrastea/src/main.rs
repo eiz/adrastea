@@ -29,6 +29,8 @@ use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
 
+use crate::mel::fft_frequencies;
+
 pub mod mel;
 pub mod pickle;
 
@@ -717,9 +719,9 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     println!("{}", mel::hz_to_mel(0.0));
     println!("{}", mel::hz_to_mel(1500.0));
     println!("{}", mel::hz_to_mel(5000.0));
-    let mut mel_freqs = [0.0; 80];
-    mel::mel_frequencies(&mut mel_freqs, 0.0, 8000.0);
-    println!("{:?}", mel_freqs);
+    let mut filter_bank = [0.0; 40 * 201];
+    mel::mel_filter_bank(&mut filter_bank, 40, 400, 16000.0);
+    println!("{:?}", filter_bank);
     Ok(())
 }
 

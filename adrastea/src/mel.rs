@@ -29,6 +29,28 @@ pub fn mel_frequencies(out: &mut [f64], fmin: f64, fmax: f64) {
     }
 }
 
-pub fn mel_filter_bank(out: &mut [f64], n_mels: i32, n_fft: i32, sample_rate: f64) {
-    todo!()
+pub fn fft_frequencies(out: &mut [f64], n_fft: usize, nyquist: f64) {
+    let n_bins = n_fft / 2;
+    let df = nyquist / (n_bins as f64);
+    for idx in 0..out.len() {
+        out[idx] = df * (idx as f64);
+    }
+}
+
+pub fn mel_filter_bank(out: &mut [f64], n_mels: usize, n_fft: usize, sample_rate: f64) {
+    let mut mel_freqs = vec![0.0; n_mels + 2];
+    let mut fft_freqs = vec![0.0; n_fft / 2 + 1];
+    let nyquist = sample_rate / 2.0;
+    mel_frequencies(&mut mel_freqs, 0.0, nyquist);
+    fft_frequencies(&mut fft_freqs, n_fft, nyquist);
+    for y in 0..n_mels {
+        let mel_width = mel_freqs[y + 1] - mel_freqs[y];
+        for x in 0..fft_freqs.len() {
+            let lo = (fft_freqs[x] - mel_freqs[y]) / mel_width;
+            let hi = (mel_freqs[y + 2] - fft_freqs[x]) / mel_width;
+            let weight = 0.0f64.max(lo.min(hi));
+            // slaney norm
+            out[y * fft_freqs.len() + x] = weight * 2.0 / (mel_freqs[y + 2] - mel_freqs[y]);
+        }
+    }
 }
