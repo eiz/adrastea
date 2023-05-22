@@ -29,6 +29,7 @@ use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
 
+pub mod mel;
 pub mod pickle;
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
@@ -711,6 +712,14 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         "duration: {}s",
         data_len as f32 / (header.sampling_rate as f32 * header.channel_count as f32)
     );
+    println!("librosa test");
+    println!("{}", mel::hz_to_mel(60.0));
+    println!("{}", mel::hz_to_mel(0.0));
+    println!("{}", mel::hz_to_mel(1500.0));
+    println!("{}", mel::hz_to_mel(5000.0));
+    let mut mel_freqs = [0.0; 80];
+    mel::mel_frequencies(&mut mel_freqs, 0.0, 8000.0);
+    println!("{:?}", mel_freqs);
     Ok(())
 }
 
