@@ -17,6 +17,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ffi::{c_void, CStr},
+    fs::File,
+    path::Path,
     sync::Arc,
 };
 
@@ -691,6 +693,27 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    let mut fp = File::open(path)?;
+    // TODO: 'wav' eager loads everything =/
+    let (header, data) = wav::read(&mut fp)?;
+    println!("{:#?}", header);
+    let data_len = match data {
+        wav::BitDepth::Eight(v) => v.len(),
+        wav::BitDepth::Sixteen(v) => v.len(),
+        wav::BitDepth::TwentyFour(v) => v.len(),
+        wav::BitDepth::ThirtyTwoFloat(v) => v.len(),
+        wav::BitDepth::Empty => 0,
+    };
+    println!("samples: {}", data_len / header.channel_count as usize);
+    println!(
+        "duration: {}s",
+        data_len as f32 / (header.sampling_rate as f32 * header.channel_count as f32)
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -706,8 +729,12 @@ fn main() -> anyhow::Result<()> {
         };
         let model = pickle::PickledModel::load_file(&args[2], dict_path)?;
         println!("{:#?}", model.tensors);
-    } else {
+    } else if args.len() >= 3 && args[1] == "wav" {
+        wav_test(&args[2])?;
+    } else if args.len() >= 2 && args[1] == "vulkan" {
         unsafe { vulkan_square()? }
+    } else {
+        println!("test commands: cuda, hip, load, wav, vulkan");
     }
     Ok(())
 }
