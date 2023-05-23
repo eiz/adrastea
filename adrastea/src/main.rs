@@ -25,19 +25,17 @@ use std::{
 
 use anyhow::bail;
 use ash::{vk, Entry};
-use rustfft::{
-    num_complex::{Complex, Complex32},
-    FftPlanner,
-};
+use rustfft::num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
 
-use crate::mel::fft_frequencies;
+extern crate alloc;
 
 pub mod mel;
 pub mod pickle;
+pub mod stft;
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
 
@@ -751,44 +749,22 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         );
     }
     let mut filter_bank = [0.0; WHISPER_N_MELS * (WHISPER_N_FFT / 2 + 1)];
-    mel::mel_filter_bank(&mut filter_bank, 80, 400, 16000.0);
-    let window_fn = hann_window(WHISPER_N_FFT);
-    println!("{:?}", filter_bank);
-    let plan = FftPlanner::new().plan_fft_forward(WHISPER_N_FFT);
+    mel::mel_filter_bank(
+        &mut filter_bank,
+        WHISPER_N_MELS,
+        WHISPER_N_FFT,
+        WHISPER_SAMPLE_RATE as f32,
+    );
+    let mut stft_plan = stft::RealStft::new(
+        WHISPER_N_FFT,
+        WHISPER_HOP_LENGTH,
+        hann_window(WHISPER_N_FFT),
+    );
     let wave = wav2float_mono(&data);
-    println!("{:?}", &wave[0..10]);
-    let mut scratch = vec![Complex32::new(0.0, 0.0); plan.get_outofplace_scratch_len()];
-    let n_frames = 1 + wave.len() / WHISPER_HOP_LENGTH;
     // 1 row per freq bin, 1 col per frame
-    let mut stft = vec![Complex32::new(0.0, 0.0); n_frames * (WHISPER_N_FFT / 2 + 1)];
-    for i in 0..n_frames {
-        let mut frame = [Complex32::new(0.0, 0.0); WHISPER_N_FFT];
-        let mut fft = [Complex32::new(0.0, 0.0); WHISPER_N_FFT];
-        let center = i * WHISPER_HOP_LENGTH;
-        let pad = WHISPER_N_FFT / 2;
-        for j in 0..WHISPER_N_FFT {
-            let idx = center as isize + j as isize - pad as isize;
-            // mirror when out of bounds
-            frame[j] = match (idx >= 0, idx < wave.len() as isize) {
-                (true, true) => Complex32::new(wave[idx as usize], 0.0) * window_fn[j],
-                (true, false) => {
-                    Complex32::new(
-                        wave[wave.len() - 1 - (idx - wave.len() as isize) as usize],
-                        0.0,
-                    ) * window_fn[j]
-                }
-                (false, true) => Complex32::new(wave[-idx as usize], 0.0) * window_fn[j],
-                (false, false) => unreachable!(),
-            }
-        }
-        plan.process_outofplace_with_scratch(&mut frame, &mut fft, &mut scratch);
-        for j in 0..WHISPER_N_FFT / 2 + 1 {
-            stft[j * n_frames + i] = fft[j];
-        }
-    }
-    println!("{:?}", &stft[n_frames..n_frames + 10]);
-    println!("rows {} cols {}", WHISPER_N_FFT / 2 + 1, n_frames);
-    println!("{:?}", window_fn);
+    let mut stft_c = vec![Complex32::new(0.0, 0.0); stft_plan.output_size(wave.len())];
+    stft_plan.process(&mut stft_c, &wave);
+    println!("{:?}", &stft_c[0..10]);
     Ok(())
 }
 
