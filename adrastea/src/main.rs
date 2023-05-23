@@ -720,7 +720,7 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
 fn hann_window(n: usize) -> Vec<f32> {
     let mut window = vec![0.0; n];
     for i in 0..n {
-        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n - 1) as f32).cos());
+        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / n as f32).cos());
     }
     window
 }
@@ -769,34 +769,26 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         for j in 0..WHISPER_N_FFT {
             let idx = center as isize + j as isize - pad as isize;
             // mirror when out of bounds
-            match (idx >= 0, idx < wave.len() as isize) {
-                (true, true) => {
-                    frame[j] = Complex32::new(wave[idx as usize], 0.0) * window_fn[j];
-                }
+            frame[j] = match (idx >= 0, idx < wave.len() as isize) {
+                (true, true) => Complex32::new(wave[idx as usize], 0.0) * window_fn[j],
                 (true, false) => {
-                    frame[j] = Complex32::new(
+                    Complex32::new(
                         wave[wave.len() - 1 - (idx - wave.len() as isize) as usize],
                         0.0,
-                    ) * window_fn[j];
+                    ) * window_fn[j]
                 }
-                (false, true) => {
-                    frame[j] = Complex32::new(wave[-idx as usize], 0.0) * window_fn[j];
-                }
-                (false, false) => {
-                    unreachable!();
-                }
+                (false, true) => Complex32::new(wave[-idx as usize], 0.0) * window_fn[j],
+                (false, false) => unreachable!(),
             }
-        }
-        if i == 0 {
-            println!("frame {:?}", &frame[195..205]);
         }
         plan.process_outofplace_with_scratch(&mut frame, &mut fft, &mut scratch);
         for j in 0..WHISPER_N_FFT / 2 + 1 {
             stft[j * n_frames + i] = fft[j];
         }
     }
-    println!("{:?}", &stft[0..10]);
+    println!("{:?}", &stft[n_frames..n_frames + 10]);
     println!("rows {} cols {}", WHISPER_N_FFT / 2 + 1, n_frames);
+    println!("{:?}", window_fn);
     Ok(())
 }
 
