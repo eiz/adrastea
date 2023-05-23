@@ -24,6 +24,7 @@ simt_hip = "0.1.2"
 simt_hip_sys = "0.1.2"
 zip = { version = "0.6.6", default-features = false, features = [] }
 wav = "1.0.0"
+rustfft = "6.1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"

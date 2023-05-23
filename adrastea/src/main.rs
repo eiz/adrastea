@@ -16,6 +16,7 @@
 use std::{
     cell::RefCell,
     collections::HashMap,
+    f32::consts::PI,
     ffi::{c_void, CStr},
     fs::File,
     path::Path,
@@ -24,6 +25,10 @@ use std::{
 
 use anyhow::bail;
 use ash::{vk, Entry};
+use rustfft::{
+    num_complex::{Complex, Complex32},
+    FftPlanner,
+};
 use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
@@ -696,13 +701,37 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const WHISPER_N_FFT: usize = 400;
+pub const WHISPER_N_MELS: usize = 80;
+pub const WHISPER_HOP_LENGTH: usize = 160;
+pub const WHISPER_CHUNK_LENGTH: usize = 30;
+
+fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
+    match data {
+        wav::BitDepth::Eight(v) => v.iter().map(|x| *x as f32 / 128.0 - 1.0).collect(),
+        wav::BitDepth::Sixteen(v) => v.iter().map(|x| *x as f32 / 32768.0).collect(),
+        wav::BitDepth::TwentyFour(v) => v.iter().map(|x| *x as f32 / 8388608.0).collect(),
+        wav::BitDepth::ThirtyTwoFloat(v) => v.iter().map(|x| *x as f32).collect(),
+        wav::BitDepth::Empty => vec![],
+    }
+}
+
+fn hann_window(n: usize) -> Vec<f32> {
+    let mut window = vec![0.0; n];
+    for i in 0..n {
+        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n - 1) as f32).cos());
+    }
+    window
+}
+
 fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
     println!("{:#?}", header);
-    let data_len = match data {
+    let data_len = match &data {
         wav::BitDepth::Eight(v) => v.len(),
         wav::BitDepth::Sixteen(v) => v.len(),
         wav::BitDepth::TwentyFour(v) => v.len(),
@@ -714,14 +743,60 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         "duration: {}s",
         data_len as f32 / (header.sampling_rate as f32 * header.channel_count as f32)
     );
-    println!("librosa test");
-    println!("{}", mel::hz_to_mel(60.0));
-    println!("{}", mel::hz_to_mel(0.0));
-    println!("{}", mel::hz_to_mel(1500.0));
-    println!("{}", mel::hz_to_mel(5000.0));
-    let mut filter_bank = [0.0; 40 * 201];
-    mel::mel_filter_bank(&mut filter_bank, 40, 400, 16000.0);
+    if header.sampling_rate != WHISPER_SAMPLE_RATE {
+        bail!(
+            "unsupported sample rate {} x{}, resample to 16khz mono",
+            header.sampling_rate,
+            header.channel_count
+        );
+    }
+    let mut filter_bank = [0.0; WHISPER_N_MELS * (WHISPER_N_FFT / 2 + 1)];
+    mel::mel_filter_bank(&mut filter_bank, 80, 400, 16000.0);
+    let window_fn = hann_window(WHISPER_N_FFT);
     println!("{:?}", filter_bank);
+    let plan = FftPlanner::new().plan_fft_forward(WHISPER_N_FFT);
+    let wave = wav2float_mono(&data);
+    println!("{:?}", &wave[0..10]);
+    let mut scratch = vec![Complex32::new(0.0, 0.0); plan.get_outofplace_scratch_len()];
+    let n_frames = 1 + wave.len() / WHISPER_HOP_LENGTH;
+    // 1 row per freq bin, 1 col per frame
+    let mut stft = vec![Complex32::new(0.0, 0.0); n_frames * (WHISPER_N_FFT / 2 + 1)];
+    for i in 0..n_frames {
+        let mut frame = [Complex32::new(0.0, 0.0); WHISPER_N_FFT];
+        let mut fft = [Complex32::new(0.0, 0.0); WHISPER_N_FFT];
+        let center = i * WHISPER_HOP_LENGTH;
+        let pad = WHISPER_N_FFT / 2;
+        for j in 0..WHISPER_N_FFT {
+            let idx = center as isize + j as isize - pad as isize;
+            // mirror when out of bounds
+            match (idx >= 0, idx < wave.len() as isize) {
+                (true, true) => {
+                    frame[j] = Complex32::new(wave[idx as usize], 0.0) * window_fn[j];
+                }
+                (true, false) => {
+                    frame[j] = Complex32::new(
+                        wave[wave.len() - 1 - (idx - wave.len() as isize) as usize],
+                        0.0,
+                    ) * window_fn[j];
+                }
+                (false, true) => {
+                    frame[j] = Complex32::new(wave[-idx as usize], 0.0) * window_fn[j];
+                }
+                (false, false) => {
+                    unreachable!();
+                }
+            }
+        }
+        if i == 0 {
+            println!("frame {:?}", &frame[195..205]);
+        }
+        plan.process_outofplace_with_scratch(&mut frame, &mut fft, &mut scratch);
+        for j in 0..WHISPER_N_FFT / 2 + 1 {
+            stft[j * n_frames + i] = fft[j];
+        }
+    }
+    println!("{:?}", &stft[0..10]);
+    println!("rows {} cols {}", WHISPER_N_FFT / 2 + 1, n_frames);
     Ok(())
 }
 
