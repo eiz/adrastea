@@ -23,6 +23,7 @@ use std::{
 
 use anyhow::bail;
 use memmap2::Mmap;
+use serde::Deserialize;
 use zip::{CompressionMethod, ZipArchive};
 
 // ya ya ya bla bla undefined behavior. whatever. make sure nobody secretly boops your files
@@ -44,28 +45,46 @@ impl MappedBuffer {
     }
 }
 
-fn value_as_dict(
-    mut value: serde_pickle::Value,
+fn value_at_path<'a>(
+    mut value: &'a serde_pickle::Value,
     path: &[&str],
-) -> anyhow::Result<BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
+) -> anyhow::Result<&'a serde_pickle::Value> {
     let mut i = 0;
     loop {
-        let dict = match value {
-            serde_pickle::Value::Dict(map) => map,
-            _ => bail!("expected dict"),
-        };
-
         if i < path.len() {
+            let dict = match value {
+                serde_pickle::Value::Dict(map) => map,
+                _ => bail!("expected dict"),
+            };
+
             // TODO: really ugly
             value = match dict.get(&serde_pickle::HashableValue::String(path[i].to_string())) {
-                Some(value) => value.clone(),
+                Some(value) => value,
                 None => bail!("key not found"),
             };
             i += 1;
         } else {
-            return Ok(dict);
+            return Ok(value);
         }
     }
+}
+
+fn value_as_dict<'a>(
+    value: &'a serde_pickle::Value,
+    path: &[&str],
+) -> anyhow::Result<&'a BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
+    match value_at_path(value, path)? {
+        serde_pickle::Value::Dict(map) => Ok(map),
+        _ => bail!("expected dict"),
+    }
+}
+
+pub trait PytorchModel {
+    type Metadata;
+    type LoadParams;
+    fn init(&mut self, _params: Self::LoadParams) {}
+    fn state_dict(&self) -> &serde_pickle::Value;
+    fn into_metadata(self) -> Self::Metadata;
 }
 
 type PyTensorStorage = (String, String, String, String, i64);
@@ -132,7 +151,7 @@ fn expand_stride_4d(dims: &[i64], strides: &[i64]) -> anyhow::Result<(i64, i64, 
 }
 
 fn tensors_from_dict(
-    dict: BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>,
+    dict: &BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>,
     filehash: HashMap<String, Range<usize>>,
 ) -> Result<HashMap<String, PickledTensor>, anyhow::Error> {
     let mut tensorhash = HashMap::new();
@@ -166,13 +185,45 @@ fn tensors_from_dict(
     Ok(tensorhash)
 }
 
-pub struct PickledModel {
+pub struct PickledModel<T> {
     pub mapping: MappedBuffer,
     pub tensors: HashMap<String, PickledTensor>,
+    pub metadata: T,
 }
 
-impl PickledModel {
-    pub fn load_file<P: AsRef<Path>>(path: P, dict_path: Option<&str>) -> anyhow::Result<Self> {
+struct RawModel<'a>(Option<&'a str>, serde_pickle::Value);
+
+impl<'a> PytorchModel for RawModel<'a> {
+    type Metadata = ();
+    type LoadParams = Option<&'a str>;
+    fn init(&mut self, params: Self::LoadParams) {
+        self.0 = params;
+    }
+    fn state_dict(&self) -> &serde_pickle::Value {
+        match self.0 {
+            // TODO give this an error return
+            Some(name) => value_at_path(&self.1, &[name]).unwrap(),
+            None => &self.1,
+        }
+    }
+    fn into_metadata(self) -> Self::Metadata {}
+}
+
+impl<'a, 'de> Deserialize<'de> for RawModel<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_pickle::Value::deserialize(deserializer)?;
+        Ok(RawModel(None, value))
+    }
+}
+
+impl PickledModel<()> {
+    pub fn load_typed<'de, T: Deserialize<'de> + PytorchModel, P: AsRef<Path>>(
+        path: P,
+        params: T::LoadParams,
+    ) -> anyhow::Result<PickledModel<T::Metadata>> {
         let path = path.as_ref();
         let buf = MappedBuffer::open(path)?;
         let mut archive = ZipArchive::new(Cursor::new(buf.data()))?;
@@ -193,18 +244,25 @@ impl PickledModel {
         let content_range = filehash
             .get("data.pkl")
             .ok_or_else(|| anyhow::anyhow!("data.pkl not found"))?;
-        let pickle = serde_pickle::value_from_slice(
+        let mut model: T = serde_pickle::from_slice(
             &buf.data()[content_range.clone()],
             serde_pickle::DeOptions::new(),
         )?;
-        let dict = match dict_path {
-            Some(dict_path) => value_as_dict(pickle, &[dict_path]),
-            _ => value_as_dict(pickle, &[]),
-        }?;
+        model.init(params);
+        let dict = value_as_dict(model.state_dict(), &[])?;
+        println!("is it the other thing");
         let tensors = tensors_from_dict(dict, filehash)?;
         Ok(PickledModel {
             mapping: buf,
             tensors,
+            metadata: model.into_metadata(),
         })
+    }
+
+    pub fn load_file<P: AsRef<Path>>(
+        path: P,
+        dict_path: Option<&str>,
+    ) -> anyhow::Result<PickledModel<()>> {
+        Self::load_typed::<RawModel, _>(path, dict_path)
     }
 }

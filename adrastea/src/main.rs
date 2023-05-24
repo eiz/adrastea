@@ -701,6 +701,8 @@ pub const WHISPER_N_FFT: usize = 400;
 pub const WHISPER_N_MELS: usize = 80;
 pub const WHISPER_HOP_LENGTH: usize = 160;
 pub const WHISPER_CHUNK_LENGTH: usize = 30;
+pub const WHISPER_CHUNK_FRAMES: usize =
+    WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
 
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     match data {
@@ -756,8 +758,40 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         &mut real_scratch,
     );
     println!("log_spec1 {:?}", &mel_spec[0..10]);
-    println!("total frames: {}", mel_spec.len() / WHISPER_N_MELS);
+    let content_frames = mel_spec.len() / WHISPER_N_MELS - WHISPER_CHUNK_FRAMES;
+    println!("content_frames {}", content_frames);
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct WhisperDims {
+    pub n_mels: i32,
+    pub n_vocab: i32,
+    pub n_audio_ctx: i32,
+    pub n_audio_state: i32,
+    pub n_audio_head: i32,
+    pub n_audio_layer: i32,
+    pub n_text_ctx: i32,
+    pub n_text_state: i32,
+    pub n_text_head: i32,
+    pub n_text_layer: i32,
+}
+
+#[derive(Deserialize)]
+pub struct WhisperModel {
+    dims: WhisperDims,
+    model_state_dict: serde_pickle::Value,
+}
+
+impl pickle::PytorchModel for WhisperModel {
+    type Metadata = WhisperDims;
+    type LoadParams = ();
+    fn state_dict(&self) -> &serde_pickle::Value {
+        &self.model_state_dict
+    }
+    fn into_metadata(self) -> Self::Metadata {
+        self.dims
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -775,6 +809,10 @@ fn main() -> anyhow::Result<()> {
         };
         let model = pickle::PickledModel::load_file(&args[2], dict_path)?;
         println!("{:#?}", model.tensors);
+    } else if args.len() >= 3 && args[1] == "load_whisper" {
+        let model = pickle::PickledModel::load_typed::<WhisperModel, _>(&args[2], ())?;
+        println!("{:#?}", model.tensors);
+        println!("{:#?}", model.metadata);
     } else if args.len() >= 3 && args[1] == "wav" {
         wav_test(&args[2])?;
     } else if args.len() >= 2 && args[1] == "vulkan" {
