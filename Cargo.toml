@@ -1,9 +1,10 @@
 [workspace]
 
-members = [
-    "adrastea",
-    "adrastea_kernels",
-]
+members = ["adrastea", "adrastea_kernels"]
 
 [patch.crates-io]
 serde-pickle = { git = "https://github.com/eiz/serde-pickle", branch = "mack/persid" }
+
+[profile.release-lto]
+inherits = "release"
+lto = true

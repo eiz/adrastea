@@ -13,6 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
+use core::marker::PhantomData;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -715,14 +716,6 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     }
 }
 
-fn hann_window(n: usize) -> Vec<f32> {
-    let mut window = vec![0.0; n];
-    for i in 0..n {
-        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / n as f32).cos());
-    }
-    window
-}
-
 fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let mut fp = File::open(path)?;
@@ -748,58 +741,24 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
             header.channel_count
         );
     }
-    let mut filter_bank = [0.0; WHISPER_N_MELS * (WHISPER_N_FFT / 2 + 1)];
-    mel::mel_filter_bank(
-        &mut filter_bank,
-        WHISPER_N_MELS,
+    let wave = wav2float_mono(&data);
+    let mut transform = mel::LogMelSpectrogramTransform::new(
         WHISPER_N_FFT,
+        WHISPER_N_MELS,
+        WHISPER_HOP_LENGTH,
         WHISPER_SAMPLE_RATE as f32,
     );
-    let mut stft_plan = stft::RealStft::new(
-        WHISPER_N_FFT,
-        WHISPER_HOP_LENGTH,
-        hann_window(WHISPER_N_FFT),
+    let mut complex_scratch =
+        vec![Complex32::new(0.0, 0.0); transform.complex_scratch_size(wave.len())];
+    let mut real_scratch = vec![0.0; transform.real_scratch_size(wave.len())];
+    let mut mel_spec = vec![0.0; transform.output_size(wave.len())];
+    transform.process(
+        &mut mel_spec,
+        &wave,
+        &mut complex_scratch,
+        &mut real_scratch,
     );
-    let wave = wav2float_mono(&data);
-    let n_frames = stft_plan.num_frames(wave.len()) - 1;
-    let mut stft_c = vec![Complex32::new(0.0, 0.0); stft_plan.output_size(wave.len())];
-    let mut stft_mag = vec![0.0; n_frames * stft_plan.num_bins()];
-    stft_plan.process(&mut stft_c, &wave);
-    for y in 0..stft_plan.num_bins() {
-        for x in 0..n_frames {
-            let norm = stft_c[y * (n_frames + 1) + x].norm();
-            stft_mag[y * n_frames + x] = norm * norm;
-        }
-    }
-    let mut mel_spec = vec![0.0; WHISPER_N_MELS * n_frames];
-    let (m, k, n) = (WHISPER_N_MELS, WHISPER_N_FFT / 2 + 1, n_frames);
-    unsafe {
-        matrixmultiply::sgemm(
-            m,
-            k,
-            n,
-            1.0,
-            filter_bank.as_ptr(),
-            k as isize,
-            1,
-            stft_mag.as_ptr(),
-            n as isize,
-            1,
-            0.0,
-            mel_spec.as_mut_ptr(),
-            n as isize,
-            1,
-        );
-    }
-    let mut log_max = 0.0f32;
-    for v in &mut mel_spec {
-        *v = v.max(0.0).log10();
-        log_max = log_max.max(*v);
-    }
-    for v in &mut mel_spec {
-        *v = (v.max(log_max - 8.0) + 4.0) / 4.0;
-    }
-    println!("log_spec1 {:?} log_max {}", &mel_spec[0..10], log_max);
+    println!("log_spec1 {:?}", &mel_spec[0..10]);
     Ok(())
 }
 
