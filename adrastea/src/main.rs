@@ -737,7 +737,8 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
             header.channel_count
         );
     }
-    let wave = wav2float_mono(&data);
+    let mut wave = wav2float_mono(&data);
+    wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let mut transform = mel::LogMelSpectrogramTransform::new(
         WHISPER_N_FFT,
         WHISPER_N_MELS,
@@ -755,6 +756,7 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         &mut real_scratch,
     );
     println!("log_spec1 {:?}", &mel_spec[0..10]);
+    println!("total frames: {}", mel_spec.len() / WHISPER_N_MELS);
     Ok(())
 }
 

@@ -8,3 +8,5 @@ serde-pickle = { git = "https://github.com/eiz/serde-pickle", branch = "mack/per
 [profile.release-lto]
 inherits = "release"
 lto = true
+panic = "abort"
+strip = true
