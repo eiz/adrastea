@@ -28,8 +28,16 @@ impl RealStft {
         }
     }
 
+    pub fn num_frames(&self, input_size: usize) -> usize {
+        1 + input_size / self.hop_length
+    }
+
+    pub fn num_bins(&self) -> usize {
+        self.n_fft / 2 + 1
+    }
+
     pub fn output_size(&self, input_size: usize) -> usize {
-        (1 + input_size / self.hop_length) * (self.n_fft / 2 + 1)
+        self.num_frames(input_size) * self.num_bins()
     }
 
     pub fn process(&mut self, output: &mut [Complex32], wave: &[f32]) {

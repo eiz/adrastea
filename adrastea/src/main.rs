@@ -761,10 +761,42 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         hann_window(WHISPER_N_FFT),
     );
     let wave = wav2float_mono(&data);
-    // 1 row per freq bin, 1 col per frame
+    let n_frames = stft_plan.num_frames(wave.len()) - 1;
     let mut stft_c = vec![Complex32::new(0.0, 0.0); stft_plan.output_size(wave.len())];
+    let mut stft_mag = vec![0.0; n_frames * stft_plan.num_bins()];
     stft_plan.process(&mut stft_c, &wave);
-    println!("{:?}", &stft_c[0..10]);
+    for y in 0..stft_plan.num_bins() {
+        for x in 0..n_frames {
+            let norm = stft_c[y * n_frames + x].norm();
+            stft_mag[y * n_frames + x] = norm * norm;
+        }
+    }
+    let mut mel_spec = vec![0.0; WHISPER_N_MELS * n_frames];
+    let (m, k, n) = (WHISPER_N_MELS, WHISPER_N_FFT / 2 + 1, n_frames);
+    unsafe {
+        matrixmultiply::sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            filter_bank.as_ptr(),
+            k as isize,
+            1,
+            stft_mag.as_ptr(),
+            n as isize,
+            1,
+            0.0,
+            mel_spec.as_mut_ptr(),
+            n as isize,
+            1,
+        );
+    }
+
+    // so we need to do filters * stft_mag
+    // filters is 80x201, stft_mag is 201xN
+    println!("filt {:?}", &filter_bank[0..10]);
+    println!("mag {:?}", &stft_mag[0..10]);
+    println!("mel {:?}", &mel_spec[0..10]);
     Ok(())
 }
 
