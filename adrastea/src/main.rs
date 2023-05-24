@@ -13,17 +13,13 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use core::marker::PhantomData;
-use std::{
+use core::{
     cell::RefCell,
-    collections::HashMap,
-    f32::consts::PI,
     ffi::{c_void, CStr},
-    fs::File,
-    path::Path,
-    sync::Arc,
 };
+use std::{collections::HashMap, fs::File, path::Path};
 
+use alloc::sync::Arc;
 use anyhow::bail;
 use ash::{vk, Entry};
 use rustfft::num_complex::Complex32;
