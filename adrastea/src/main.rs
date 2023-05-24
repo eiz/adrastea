@@ -791,15 +791,15 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
             1,
         );
     }
-
-    // so we need to do filters * stft_mag
-    // filters is 80x201, stft_mag is 201xN
-    println!(
-        "filt {:?}",
-        &filter_bank[stft_plan.num_bins()..stft_plan.num_bins() + 10]
-    );
-    println!("mag {:?}", &stft_mag[n_frames..n_frames + 10]);
-    println!("mel {:?}", &mel_spec[n_frames..n_frames + 10]);
+    let mut log_max = 0.0f32;
+    for v in &mut mel_spec {
+        *v = v.max(0.0).log10();
+        log_max = log_max.max(*v);
+    }
+    for v in &mut mel_spec {
+        *v = (v.max(log_max - 8.0) + 4.0) / 4.0;
+    }
+    println!("log_spec1 {:?} log_max {}", &mel_spec[0..10], log_max);
     Ok(())
 }
 
