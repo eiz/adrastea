@@ -767,7 +767,7 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     stft_plan.process(&mut stft_c, &wave);
     for y in 0..stft_plan.num_bins() {
         for x in 0..n_frames {
-            let norm = stft_c[y * n_frames + x].norm();
+            let norm = stft_c[y * (n_frames + 1) + x].norm();
             stft_mag[y * n_frames + x] = norm * norm;
         }
     }
@@ -794,9 +794,12 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 
     // so we need to do filters * stft_mag
     // filters is 80x201, stft_mag is 201xN
-    println!("filt {:?}", &filter_bank[0..10]);
-    println!("mag {:?}", &stft_mag[0..10]);
-    println!("mel {:?}", &mel_spec[0..10]);
+    println!(
+        "filt {:?}",
+        &filter_bank[stft_plan.num_bins()..stft_plan.num_bins() + 10]
+    );
+    println!("mag {:?}", &stft_mag[n_frames..n_frames + 10]);
+    println!("mel {:?}", &mel_spec[n_frames..n_frames + 10]);
     Ok(())
 }
 
