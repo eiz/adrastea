@@ -250,7 +250,6 @@ impl PickledModel<()> {
         )?;
         model.init(params);
         let dict = value_as_dict(model.state_dict(), &[])?;
-        println!("is it the other thing");
         let tensors = tensors_from_dict(dict, filehash)?;
         Ok(PickledModel {
             mapping: buf,
