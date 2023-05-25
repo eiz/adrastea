@@ -79,12 +79,18 @@ fn value_as_dict<'a>(
     }
 }
 
-pub trait PytorchModel {
+pub trait ModelState<'de>: Deserialize<'de> {
     type Metadata;
     type LoadParams;
     fn init(&mut self, _params: Self::LoadParams) {}
     fn state_dict(&self) -> &serde_pickle::Value;
     fn into_metadata(self) -> Self::Metadata;
+    fn load<P: AsRef<Path>>(
+        path: P,
+        params: Self::LoadParams,
+    ) -> anyhow::Result<PickledModel<Self::Metadata>> {
+        PickledModel::load_typed::<Self, P>(path, params)
+    }
 }
 
 type PyTensorStorage = (String, String, String, String, i64);
@@ -193,7 +199,7 @@ pub struct PickledModel<T> {
 
 struct RawModel<'a>(Option<&'a str>, serde_pickle::Value);
 
-impl<'a> PytorchModel for RawModel<'a> {
+impl<'a, 'de> ModelState<'de> for RawModel<'a> {
     type Metadata = ();
     type LoadParams = Option<&'a str>;
     fn init(&mut self, params: Self::LoadParams) {
@@ -220,7 +226,7 @@ impl<'a, 'de> Deserialize<'de> for RawModel<'a> {
 }
 
 impl PickledModel<()> {
-    pub fn load_typed<'de, T: Deserialize<'de> + PytorchModel, P: AsRef<Path>>(
+    pub fn load_typed<'de, T: ModelState<'de>, P: AsRef<Path>>(
         path: P,
         params: T::LoadParams,
     ) -> anyhow::Result<PickledModel<T::Metadata>> {

@@ -22,11 +22,14 @@ use std::{collections::HashMap, fs::File, path::Path};
 use alloc::sync::Arc;
 use anyhow::bail;
 use ash::{vk, Entry};
+use half::f16;
 use rustfft::num_complex::Complex32;
 use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
+
+use crate::pickle::{ModelState, PickledModel};
 
 extern crate alloc;
 
@@ -639,6 +642,18 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
 
 struct TestKernels {
     square_fp32_16x16: Kernel<(*mut f32, *mut f32, u32, u32)>,
+    conv1d: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+    )>,
 }
 
 fn hip_square() -> anyhow::Result<()> {
@@ -655,9 +670,12 @@ fn hip_square() -> anyhow::Result<()> {
     let _scope = device.lock()?;
     let capability = phys.capability()?;
     println!("capability is {}", capability);
-    let module = HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
+    let module_square_fp32_16x16 =
+        HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
+    let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
     let kernels = TestKernels {
-        square_fp32_16x16: Kernel::new(&module, "square_fp32_16x16")?,
+        square_fp32_16x16: Kernel::new(&module_square_fp32_16x16, "square_fp32_16x16")?,
+        conv1d: Kernel::new(&module_conv1d, "conv1d")?,
     };
     let stream = HipStream::new()?;
     let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
@@ -696,6 +714,20 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct WhisperDims {
+    pub n_mels: i32,
+    pub n_vocab: i32,
+    pub n_audio_ctx: i32,
+    pub n_audio_state: i32,
+    pub n_audio_head: i32,
+    pub n_audio_layer: i32,
+    pub n_text_ctx: i32,
+    pub n_text_state: i32,
+    pub n_text_head: i32,
+    pub n_text_layer: i32,
+}
+
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
 pub const WHISPER_N_FFT: usize = 400;
 pub const WHISPER_N_MELS: usize = 80;
@@ -714,8 +746,14 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     }
 }
 
-fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
     let path = path.as_ref();
+    let model_path = model_path.as_ref();
+    let model = WhisperModelState::load(model_path, ())?;
+    let conv1_weight = model.tensors.get("encoder.conv1.weight").unwrap();
+    let conv1_bias = model.tensors.get("encoder.conv1.bias").unwrap();
+    let conv2_weight = model.tensors.get("encoder.conv2.weight").unwrap();
+    let conv2_bias = model.tensors.get("encoder.conv2.bias").unwrap();
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -727,6 +765,16 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         wav::BitDepth::ThirtyTwoFloat(v) => v.len(),
         wav::BitDepth::Empty => 0,
     };
+    println!("model: {:?}", model.metadata);
+    println!(
+        "conv1_weight: {:?} (stride {:?})",
+        conv1_weight.shape, conv1_weight.stride
+    );
+    println!(
+        "conv2_weight: {:?} (stride {:?})",
+        conv2_weight.shape, conv2_weight.stride
+    );
+    println!("conv1_bias: {:?}", conv1_bias.shape);
     println!("samples: {}", data_len / header.channel_count as usize);
     println!(
         "duration: {}s",
@@ -741,6 +789,7 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     }
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
+    let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
     let mut transform = mel::LogMelSpectrogramTransform::new(
         WHISPER_N_FFT,
         WHISPER_N_MELS,
@@ -760,30 +809,78 @@ fn wav_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     println!("log_spec1 {:?}", &mel_spec[0..10]);
     let content_frames = mel_spec.len() / WHISPER_N_MELS - WHISPER_CHUNK_FRAMES;
     println!("content_frames {}", content_frames);
+    let phys = HipPhysicalDevice::get(0)?;
+    let device = Arc::new(HipDevice::new(phys)?);
+    let _scope = device.lock()?;
+    let conv1_weight_data = &model.mapping.data()[conv1_weight.range.clone()];
+    let conv1_bias_data = &model.mapping.data()[conv1_bias.range.clone()];
+    let conv2_weight_data = &model.mapping.data()[conv2_weight.range.clone()];
+    let conv2_bias_data = &model.mapping.data()[conv2_bias.range.clone()];
+    let mut conv1_weight_buf = HipBuffer::new(conv1_weight_data.len())?;
+    let mut conv1_bias_buf = HipBuffer::new(conv1_bias_data.len())?;
+    let mut conv2_weight_buf = HipBuffer::new(conv2_weight_data.len())?;
+    let mut conv2_bias_buf = HipBuffer::new(conv2_bias_data.len())?;
+    conv1_weight_buf.copy_from_slice(&conv1_weight_data)?;
+    conv1_bias_buf.copy_from_slice(&conv1_bias_data)?;
+    conv2_weight_buf.copy_from_slice(&conv2_weight_data)?;
+    conv2_bias_buf.copy_from_slice(&conv2_bias_data)?;
+    // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
+    // use a better way
+    let capability = phys.capability()?;
+    let module_square_fp32_16x16 =
+        HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
+    let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
+    let kernels = TestKernels {
+        square_fp32_16x16: Kernel::new(&module_square_fp32_16x16, "square_fp32_16x16")?,
+        conv1d: Kernel::new(&module_conv1d, "conv1d")?,
+    };
+    let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
+    for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
+        *l = f16::from_f32(*r);
+    }
+    let mut mels_half_buf = HipBuffer::new(mels_half.len() * 2)?;
+    let mut conv_out = vec![
+        f16::from_f32(0.0);
+        transform.num_cols(wave.len()) * model.metadata.n_audio_state as usize
+    ];
+    let conv_out_buf = HipBuffer::new(conv_out.len() * 2)?;
+    mels_half_buf.copy_from_slice(&mels_half)?;
+    kernels.conv1d.launch(
+        LaunchParams {
+            blocks: (
+                ceil_div(transform.num_cols(wave.len()) as u64, 16) as u32,
+                ceil_div(model.metadata.n_audio_state as u64, 16) as u32,
+                1,
+            ),
+            threads: (16, 16, 1),
+            shared_mem: 0,
+            stream: None,
+        },
+        (
+            conv_out_buf.ptr as *mut f16,
+            mels_half_buf.ptr as *const f16,
+            conv1_weight_buf.ptr as *const f16,
+            conv1_bias_buf.ptr as *const f16,
+            WHISPER_N_MELS as i32,
+            model.metadata.n_audio_state,
+            3,
+            transform.num_cols(wave.len()) as i32,
+            1,
+            1,
+        ),
+    )?;
+    conv_out_buf.copy_to_slice(&mut conv_out)?;
+    println!("{:?}", &conv_out[0..10]);
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct WhisperDims {
-    pub n_mels: i32,
-    pub n_vocab: i32,
-    pub n_audio_ctx: i32,
-    pub n_audio_state: i32,
-    pub n_audio_head: i32,
-    pub n_audio_layer: i32,
-    pub n_text_ctx: i32,
-    pub n_text_state: i32,
-    pub n_text_head: i32,
-    pub n_text_layer: i32,
-}
-
 #[derive(Deserialize)]
-pub struct WhisperModel {
+pub struct WhisperModelState {
     dims: WhisperDims,
     model_state_dict: serde_pickle::Value,
 }
 
-impl pickle::PytorchModel for WhisperModel {
+impl<'de> pickle::ModelState<'de> for WhisperModelState {
     type Metadata = WhisperDims;
     type LoadParams = ();
     fn state_dict(&self) -> &serde_pickle::Value {
@@ -807,14 +904,14 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let model = pickle::PickledModel::load_file(&args[2], dict_path)?;
+        let model = PickledModel::load_file(&args[2], dict_path)?;
         println!("{:#?}", model.tensors);
     } else if args.len() >= 3 && args[1] == "load_whisper" {
-        let model = pickle::PickledModel::load_typed::<WhisperModel, _>(&args[2], ())?;
+        let model = PickledModel::load_typed::<WhisperModelState, _>(&args[2], ())?;
         println!("{:#?}", model.tensors);
         println!("{:#?}", model.metadata);
-    } else if args.len() >= 3 && args[1] == "wav" {
-        wav_test(&args[2])?;
+    } else if args.len() >= 4 && args[1] == "wav" {
+        wav_test(&args[2], &args[3])?;
     } else if args.len() >= 2 && args[1] == "vulkan" {
         unsafe { vulkan_square()? }
     } else {

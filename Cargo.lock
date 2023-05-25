@@ -342,10 +342,11 @@ dependencies = [
 
 [[package]]
 name = "simt_hip"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "354782c2e33421a62bb82da8b69aad07e16d3b20bdf0a2b70e6b9273a7ba0cea"
+checksum = "499374b550d9e63e48c69c15f6028ff633819d8c707c9b8cd0e98725ccae3023"
 dependencies = [
+ "half",
  "simt_hip_sys",
  "thiserror",
 ]

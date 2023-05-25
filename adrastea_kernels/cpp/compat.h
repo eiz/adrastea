@@ -14,6 +14,9 @@
 #define BLOCK_DIM_X blockDim.x
 #define BLOCK_DIM_Y blockDim.y
 #define BLOCK_DIM_Z blockDim.z
+#define GRID_DIM_X gridDim.x
+#define GRID_DIM_Y gridDim.y
+#define GRID_DIM_Z gridDim.z
 #else  // __CUDACC__
 #include <hip/hip_fp16.h>
 #include <hip/hip_math_constants.h>
@@ -27,6 +30,9 @@
 #define BLOCK_DIM_X hipBlockDim_x
 #define BLOCK_DIM_Y hipBlockDim_y
 #define BLOCK_DIM_Z hipBlockDim_z
+#define GRID_DIM_X hipGridDim_x
+#define GRID_DIM_Y hipGridDim_y
+#define GRID_DIM_Z hipGridDim_z
 #define CUDART_INF_F HIP_INF_F
 #define __shfl_xor_sync(mask, ...) __shfl_xor(__VA_ARGS__)
 #endif  // !__CUDACC__
