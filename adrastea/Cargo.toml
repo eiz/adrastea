@@ -26,6 +26,7 @@ zip = { version = "0.6.6", default-features = false, features = [] }
 wav = "1.0.0"
 rustfft = "6.1.0"
 matrixmultiply = { version = "0.3.7", features = ["threading"] }
+smallvec = "1.10.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"

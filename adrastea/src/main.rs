@@ -16,6 +16,7 @@
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
+    marker::PhantomData,
 };
 use std::{collections::HashMap, fs::File, path::Path};
 
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
+use smallvec::SmallVec;
 
 use crate::pickle::{ModelState, PickledModel};
 
@@ -715,6 +717,148 @@ fn hip_square() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+pub struct TensorLayout {
+    pub dims: SmallVec<[usize; 8]>,
+    pub strides: SmallVec<[usize; 8]>,
+}
+
+impl TensorLayout {
+    pub fn new(dims: &[usize], strides: &[usize]) -> Self {
+        assert_eq!(dims.len(), strides.len());
+        assert_ne!(dims.len(), 0);
+        assert_ne!(strides.len(), 0);
+        assert!(dims.iter().all(|&x| x != 0));
+        assert!(strides.iter().all(|&x| x != 0));
+        Self {
+            dims: dims.into(),
+            strides: strides.into(),
+        }
+    }
+
+    pub fn row_major(dims: &[usize]) -> Self {
+        let mut strides = SmallVec::<[usize; 8]>::new();
+        let mut stride = 1;
+        for &dim in dims.iter().rev() {
+            strides.push(stride);
+            stride *= dim;
+        }
+        strides.reverse();
+        Self::new(dims, &strides)
+    }
+
+    pub fn is_aliased(&self) -> bool {
+        todo!()
+    }
+
+    pub fn largest_address(&self) -> usize {
+        let mut addr = 0;
+        for &dim in self.dims.iter() {
+            addr += dim - 1;
+            addr *= dim;
+        }
+        addr
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TensorStoragePtr<T> {
+    Cpu(*const T),
+    Hip(simt_hip_sys::hipDeviceptr_t),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TensorStoragePtrMut<T> {
+    Cpu(*mut T),
+    Hip(simt_hip_sys::hipDeviceptr_t),
+}
+
+pub enum TensorStorage<T> {
+    Cpu(Vec<T>),
+    Hip(HipBuffer),
+}
+
+pub struct Tensor<T> {
+    storage: TensorStorage<T>,
+    layout: TensorLayout,
+    _dead: PhantomData<T>,
+}
+
+impl<T: Copy + Default> Tensor<T> {
+    pub fn new_cpu(dims: &[usize]) -> Self {
+        let layout = TensorLayout::row_major(dims);
+        let storage = TensorStorage::Cpu(vec![T::default(); layout.strides[0]]);
+        Tensor {
+            storage,
+            layout,
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn new_hip(dims: &[usize]) -> anyhow::Result<Self> {
+        Self::new_hip_layout(TensorLayout::row_major(dims))
+    }
+
+    pub fn new_hip_layout(layout: TensorLayout) -> anyhow::Result<Self> {
+        let storage = TensorStorage::Hip(HipBuffer::new(
+            layout.strides[0] * std::mem::size_of::<T>(),
+        )?);
+        Ok(Tensor {
+            storage,
+            layout,
+            _dead: PhantomData,
+        })
+    }
+
+    pub fn as_view(&self) -> TensorView<T> {
+        TensorView {
+            ptr: match &self.storage {
+                TensorStorage::Cpu(v) => TensorStoragePtr::Cpu(v.as_ptr()),
+                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr),
+            },
+            layout: self.layout.clone(),
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn as_view_mut(&mut self) -> TensorViewMut<T> {
+        TensorViewMut {
+            ptr: match &mut self.storage {
+                TensorStorage::Cpu(v) => TensorStoragePtrMut::Cpu(v.as_mut_ptr()),
+                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr),
+            },
+            layout: self.layout.clone(),
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn as_gpu_ptr(&self) -> *const T {
+        match &self.storage {
+            TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
+            TensorStorage::Hip(b) => b.ptr as *const T,
+        }
+    }
+
+    pub fn as_mut_gpu_ptr(&self) -> *mut T {
+        match &self.storage {
+            TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
+            TensorStorage::Hip(b) => b.ptr as *mut T,
+        }
+    }
+}
+
+pub struct TensorView<'a, T> {
+    ptr: TensorStoragePtr<T>,
+    layout: TensorLayout,
+    _dead: PhantomData<&'a T>,
+}
+
+pub struct TensorViewMut<'a, T> {
+    ptr: TensorStoragePtrMut<T>,
+    layout: TensorLayout,
+    _dead: PhantomData<&'a mut T>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct WhisperDims {
     pub n_mels: i32,
@@ -747,14 +891,32 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     }
 }
 
+fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tensor<f16>> {
+    let pickled_tensor = pickled
+        .tensors
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("tensor not found"))?;
+    let mut tensor = Tensor::new_hip_layout(TensorLayout::new(
+        &pickled_tensor.shape,
+        &pickled_tensor.stride,
+    ))?;
+    match tensor.storage {
+        TensorStorage::Hip(ref mut b) => {
+            b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(tensor)
+}
+
 fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
     let path = path.as_ref();
     let model_path = model_path.as_ref();
     let model = WhisperModelState::load(model_path, ())?;
-    let conv1_weight = model.tensors.get("encoder.conv1.weight").unwrap();
-    let conv1_bias = model.tensors.get("encoder.conv1.bias").unwrap();
-    let conv2_weight = model.tensors.get("encoder.conv2.weight").unwrap();
-    let conv2_bias = model.tensors.get("encoder.conv2.bias").unwrap();
+    let conv1_weight = load_tensor(&model, "encoder.conv1.weight")?;
+    let conv1_bias = load_tensor(&model, "encoder.conv1.bias")?;
+    let conv2_weight = load_tensor(&model, "encoder.conv2.weight")?;
+    let conv2_bias = load_tensor(&model, "encoder.conv2.bias")?;
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -767,15 +929,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         wav::BitDepth::Empty => 0,
     };
     println!("model: {:?}", model.metadata);
-    println!(
-        "conv1_weight: {:?} (stride {:?})",
-        conv1_weight.shape, conv1_weight.stride
-    );
-    println!(
-        "conv2_weight: {:?} (stride {:?})",
-        conv2_weight.shape, conv2_weight.stride
-    );
-    println!("conv1_bias: {:?}", conv1_bias.shape);
     println!("samples: {}", data_len / header.channel_count as usize);
     println!(
         "duration: {}s",
@@ -790,7 +943,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     }
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
-    //let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
+    let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
     let mut transform = mel::LogMelSpectrogramTransform::new(
         WHISPER_N_FFT,
         WHISPER_N_MELS,
@@ -812,18 +965,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
-    let conv1_weight_data = &model.mapping.data()[conv1_weight.range.clone()];
-    let conv1_bias_data = &model.mapping.data()[conv1_bias.range.clone()];
-    let conv2_weight_data = &model.mapping.data()[conv2_weight.range.clone()];
-    let conv2_bias_data = &model.mapping.data()[conv2_bias.range.clone()];
-    let mut conv1_weight_buf = HipBuffer::new(conv1_weight_data.len())?;
-    let mut conv1_bias_buf = HipBuffer::new(conv1_bias_data.len())?;
-    let mut conv2_weight_buf = HipBuffer::new(conv2_weight_data.len())?;
-    let mut conv2_bias_buf = HipBuffer::new(conv2_bias_data.len())?;
-    conv1_weight_buf.copy_from_slice(&conv1_weight_data)?;
-    conv1_bias_buf.copy_from_slice(&conv1_bias_data)?;
-    conv2_weight_buf.copy_from_slice(&conv2_weight_data)?;
-    conv2_bias_buf.copy_from_slice(&conv2_bias_data)?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
     let capability = phys.capability()?;
@@ -859,8 +1000,8 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv_out_buf.ptr as *mut f16,
             mels_half_buf.ptr as *const f16,
-            conv1_weight_buf.ptr as *const f16,
-            conv1_bias_buf.ptr as *const f16,
+            conv1_weight.as_gpu_ptr(),
+            conv1_bias.as_gpu_ptr(),
             WHISPER_N_MELS as i32,
             model.metadata.n_audio_state,
             3,
@@ -872,7 +1013,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     )?;
     conv_out_buf.copy_to_slice(&mut conv_out)?;
     println!("{:?}", &conv_out[0..10]);
-    assert_eq!(conv1_weight_data.len(), 1280 * 80 * 3 * 2);
     Ok(())
 }
 

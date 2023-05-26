@@ -126,31 +126,31 @@ impl TensorDataType {
 #[derive(Debug, Clone)]
 pub struct PickledTensor {
     pub dtype: TensorDataType,
-    pub shape: (i64, i64, i64, i64),
-    pub stride: (i64, i64, i64, i64),
+    pub shape: [usize; 4],
+    pub stride: [usize; 4],
     pub range: Range<usize>,
 }
 
-fn expand_dims_4d(dims: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
+fn expand_dims_4d(dims: &[usize]) -> anyhow::Result<[usize; 4]> {
     let result = match dims.len() {
         0 => bail!("no dimensions"),
-        1 => (1, 1, 1, dims[0]),
-        2 => (1, 1, dims[0], dims[1]),
-        3 => (1, dims[0], dims[1], dims[2]),
-        4 => (dims[0], dims[1], dims[2], dims[3]),
+        1 => [1, 1, 1, dims[0]],
+        2 => [1, 1, dims[0], dims[1]],
+        3 => [1, dims[0], dims[1], dims[2]],
+        4 => [dims[0], dims[1], dims[2], dims[3]],
         _ => bail!("too many dimensions"),
     };
     Ok(result)
 }
 
-fn expand_stride_4d(dims: &[i64], strides: &[i64]) -> anyhow::Result<(i64, i64, i64, i64)> {
-    let dims_product = dims.iter().product::<i64>();
+fn expand_stride_4d(dims: &[usize], strides: &[usize]) -> anyhow::Result<[usize; 4]> {
+    let dims_product = dims.iter().product::<usize>();
     let result = match strides.len() {
         0 => bail!("no dimensions"),
-        1 => (dims_product, dims_product, dims_product, strides[0]),
-        2 => (dims_product, dims_product, strides[0], strides[1]),
-        3 => (dims_product, strides[0], strides[1], strides[2]),
-        4 => (strides[0], strides[1], strides[2], strides[3]),
+        1 => [dims_product, dims_product, dims_product, strides[0]],
+        2 => [dims_product, dims_product, strides[0], strides[1]],
+        3 => [dims_product, strides[0], strides[1], strides[2]],
+        4 => [strides[0], strides[1], strides[2], strides[3]],
         _ => bail!("too many dimensions"),
     };
     Ok(result)
@@ -171,6 +171,8 @@ fn tensors_from_dict(
                 let tensor_data = filehash
                     .get(&data_idx)
                     .ok_or_else(|| anyhow::anyhow!("tensor data not found: {}", data_idx))?;
+                let size = size.iter().map(|x| *x as usize).collect::<Vec<_>>();
+                let stride = stride.iter().map(|x| *x as usize).collect::<Vec<_>>();
                 let size4d = expand_dims_4d(&size)?;
                 let stride4d = expand_stride_4d(&size, &stride)?;
                 tensorhash.insert(
