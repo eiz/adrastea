@@ -156,9 +156,9 @@ impl LogMelSpectrogramTransform {
                 1,
             );
         }
-        let mut log_max = 0.0f32;
+        let mut log_max = 1.0e-10f32;
         for v in mel_spec.iter_mut() {
-            *v = v.max(0.0).log10();
+            *v = v.max(1.0e-10).log10();
             log_max = log_max.max(*v);
         }
         for v in mel_spec {

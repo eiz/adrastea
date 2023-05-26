@@ -653,6 +653,7 @@ struct TestKernels {
         i32,
         i32,
         i32,
+        i32,
     )>,
 }
 
@@ -789,7 +790,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     }
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
-    let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
+    //let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
     let mut transform = mel::LogMelSpectrogramTransform::new(
         WHISPER_N_FFT,
         WHISPER_N_MELS,
@@ -806,7 +807,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         &mut complex_scratch,
         &mut real_scratch,
     );
-    println!("log_spec1 {:?}", &mel_spec[0..10]);
     let content_frames = mel_spec.len() / WHISPER_N_MELS - WHISPER_CHUNK_FRAMES;
     println!("content_frames {}", content_frames);
     let phys = HipPhysicalDevice::get(0)?;
@@ -865,12 +865,14 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             model.metadata.n_audio_state,
             3,
             transform.num_cols(wave.len()) as i32,
+            transform.num_cols(wave.len()) as i32,
             1,
             1,
         ),
     )?;
     conv_out_buf.copy_to_slice(&mut conv_out)?;
     println!("{:?}", &conv_out[0..10]);
+    assert_eq!(conv1_weight_data.len(), 1280 * 80 * 3 * 2);
     Ok(())
 }
 
