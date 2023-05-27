@@ -659,6 +659,7 @@ struct TestKernels {
         i32,
         i32,
         i32,
+        i32,
     )>,
 }
 
@@ -961,6 +962,12 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
     }
 }
 
+#[repr(u32)]
+enum Conv1dActivation {
+    None = 0,
+    GELU = 1,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct WhisperDims {
     pub n_mels: i32,
@@ -1084,17 +1091,18 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     .into_hip()?;
     let mut conv_out =
         Tensor::new_hip(&[model.metadata.n_audio_state as usize, mels_half.size(-1)])?;
+    let conv_params = LaunchParams {
+        blocks: (
+            ceil_div(mels_half.size(-1) as u64, 16) as u32,
+            ceil_div(model.metadata.n_audio_state as u64, 16) as u32,
+            1,
+        ),
+        threads: (16, 16, 1),
+        shared_mem: 0,
+        stream: None,
+    };
     kernels.conv1d.launch(
-        LaunchParams {
-            blocks: (
-                ceil_div(mels_half.size(-1) as u64, 16) as u32,
-                ceil_div(model.metadata.n_audio_state as u64, 16) as u32,
-                1,
-            ),
-            threads: (16, 16, 1),
-            shared_mem: 0,
-            stream: None,
-        },
+        conv_params.clone(),
         (
             conv_out.as_mut_gpu_ptr(),
             mels_half.as_gpu_ptr(),
@@ -1107,9 +1115,30 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             mels_half.size(-1) as i32,
             1,
             1,
+            Conv1dActivation::GELU as i32,
         ),
     )?;
     println!("{:?}", conv_out.as_view_mut());
+    let mut conv2_out =
+        Tensor::new_hip(&[model.metadata.n_audio_state as usize, mels_half.size(-1)])?;
+    kernels.conv1d.launch(
+        conv_params,
+        (
+            conv2_out.as_mut_gpu_ptr(),
+            conv_out.as_gpu_ptr(),
+            conv2_weight.as_gpu_ptr(),
+            conv2_bias.as_gpu_ptr(),
+            model.metadata.n_audio_state,
+            model.metadata.n_audio_state,
+            3,
+            mels_half.size(-1) as i32,
+            mels_half.size(-1) as i32,
+            2,
+            1,
+            Conv1dActivation::GELU as i32,
+        ),
+    )?;
+    println!("{:?}", conv2_out.as_view_mut());
     Ok(())
 }
 
