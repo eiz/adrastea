@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-pickle = "1.1.1"
 simt_cuda_sys = "0.1.1"
-simt_hip = "0.1.4"
+simt_hip = "0.1.5"
 simt_hip_sys = "0.1.2"
 zip = { version = "0.6.6", default-features = false, features = [] }
 wav = "1.0.0"

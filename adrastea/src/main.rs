@@ -14,9 +14,12 @@
  */
 
 use core::{
+    borrow::Borrow,
     cell::RefCell,
     ffi::{c_void, CStr},
+    fmt::{Debug, Formatter},
     marker::PhantomData,
+    ops::{Deref, DerefMut},
 };
 use std::{collections::HashMap, fs::File, path::Path};
 
@@ -783,6 +786,30 @@ pub struct Tensor<T> {
     _dead: PhantomData<T>,
 }
 
+impl<T> Tensor<T> {
+    pub fn as_view(&self) -> TensorView<T> {
+        TensorView {
+            ptr: match &self.storage {
+                TensorStorage::Cpu(v) => TensorStoragePtr::Cpu(v.as_ptr()),
+                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr),
+            },
+            layout: self.layout.clone(),
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn as_view_mut(&mut self) -> TensorViewMut<T> {
+        TensorViewMut {
+            ptr: match &mut self.storage {
+                TensorStorage::Cpu(v) => TensorStoragePtrMut::Cpu(v.as_mut_ptr()),
+                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr),
+            },
+            layout: self.layout.clone(),
+            _dead: PhantomData,
+        }
+    }
+}
+
 impl<T: Copy + Default> Tensor<T> {
     pub fn new_cpu(dims: &[usize]) -> Self {
         let layout = TensorLayout::row_major(dims);
@@ -799,6 +826,7 @@ impl<T: Copy + Default> Tensor<T> {
     }
 
     pub fn new_hip_layout(layout: TensorLayout) -> anyhow::Result<Self> {
+        // TODO: zero initialization
         let storage = TensorStorage::Hip(HipBuffer::new(
             (layout.largest_address() + 1) * std::mem::size_of::<T>(),
         )?);
@@ -833,28 +861,6 @@ impl<T: Copy + Default> Tensor<T> {
         }
     }
 
-    pub fn as_view(&self) -> TensorView<T> {
-        TensorView {
-            ptr: match &self.storage {
-                TensorStorage::Cpu(v) => TensorStoragePtr::Cpu(v.as_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr),
-            },
-            layout: self.layout.clone(),
-            _dead: PhantomData,
-        }
-    }
-
-    pub fn as_view_mut(&mut self) -> TensorViewMut<T> {
-        TensorViewMut {
-            ptr: match &mut self.storage {
-                TensorStorage::Cpu(v) => TensorStoragePtrMut::Cpu(v.as_mut_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr),
-            },
-            layout: self.layout.clone(),
-            _dead: PhantomData,
-        }
-    }
-
     pub fn as_gpu_ptr(&self) -> *const T {
         match &self.storage {
             TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
@@ -878,16 +884,81 @@ impl<T: Copy + Default> Tensor<T> {
     }
 }
 
+impl<T: Default + Debug + Copy> Debug for Tensor<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(f)
+    }
+}
+
+#[repr(C)]
 pub struct TensorView<'a, T> {
     ptr: TensorStoragePtr<T>,
     layout: TensorLayout,
     _dead: PhantomData<&'a T>,
 }
 
+fn format_slice_with_layout<T: Debug + Copy>(
+    f: &mut Formatter<'_>,
+    slice: &[T],
+    _layout: &TensorLayout,
+) -> std::fmt::Result {
+    // TODO
+    write!(f, "{:?}", &slice[0..10])
+}
+
+impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.ptr {
+            TensorStoragePtr::Cpu(p) => {
+                let slice =
+                    unsafe { std::slice::from_raw_parts(p, self.layout.largest_address() + 1) };
+                format_slice_with_layout(f, slice, &self.layout)?;
+            }
+            TensorStoragePtr::Hip(b) => {
+                let storage_size = self.layout.largest_address() + 1;
+                let mut cpu_data = vec![T::default(); storage_size];
+                unsafe {
+                    simt_hip::hip_call(|| {
+                        simt_hip_sys::library().hipMemcpy(
+                            cpu_data.as_mut_ptr() as *mut std::ffi::c_void,
+                            b as *const std::ffi::c_void,
+                            storage_size * std::mem::size_of::<T>(),
+                            simt_hip_sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                        )
+                    })
+                    .map_err(|_| std::fmt::Error)?;
+                }
+                format_slice_with_layout(f, &cpu_data, &self.layout)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[repr(C)]
 pub struct TensorViewMut<'a, T> {
     ptr: TensorStoragePtrMut<T>,
     layout: TensorLayout,
     _dead: PhantomData<&'a mut T>,
+}
+
+impl<'a, T> TensorViewMut<'a, T> {
+    pub fn as_view(&self) -> TensorView<'_, T> {
+        TensorView {
+            ptr: match &self.ptr {
+                TensorStoragePtrMut::Cpu(p) => TensorStoragePtr::Cpu(*p),
+                TensorStoragePtrMut::Hip(p) => TensorStoragePtr::Hip(*p),
+            },
+            layout: self.layout.clone(),
+            _dead: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.as_view().fmt(f)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -941,8 +1012,6 @@ fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tenso
 }
 
 fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    let model_path = model_path.as_ref();
     let model = WhisperModelState::load(model_path, ())?;
     let conv1_weight = load_tensor(&model, "encoder.conv1.weight")?;
     let conv1_bias = load_tensor(&model, "encoder.conv1.bias")?;
@@ -1013,11 +1082,8 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         TensorLayout::row_major(&[WHISPER_N_MELS, transform.num_cols(wave.len())]),
     )
     .into_hip()?;
-    let mut conv_out = vec![
-        f16::from_f32(0.0);
-        transform.num_cols(wave.len()) * model.metadata.n_audio_state as usize
-    ];
-    let conv_out_buf = HipBuffer::new(conv_out.len() * 2)?;
+    let mut conv_out =
+        Tensor::new_hip(&[model.metadata.n_audio_state as usize, mels_half.size(-1)])?;
     kernels.conv1d.launch(
         LaunchParams {
             blocks: (
@@ -1030,21 +1096,20 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             stream: None,
         },
         (
-            conv_out_buf.ptr as *mut f16,
+            conv_out.as_mut_gpu_ptr(),
             mels_half.as_gpu_ptr(),
             conv1_weight.as_gpu_ptr(),
             conv1_bias.as_gpu_ptr(),
             WHISPER_N_MELS as i32,
             model.metadata.n_audio_state,
             3,
-            transform.num_cols(wave.len()) as i32,
-            transform.num_cols(wave.len()) as i32,
+            mels_half.size(-1) as i32,
+            mels_half.size(-1) as i32,
             1,
             1,
         ),
     )?;
-    conv_out_buf.copy_to_slice(&mut conv_out)?;
-    println!("{:?}", &conv_out[0..10]);
+    println!("{:?}", conv_out.as_view_mut());
     Ok(())
 }
 
