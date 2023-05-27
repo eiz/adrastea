@@ -753,9 +753,8 @@ impl TensorLayout {
 
     pub fn largest_address(&self) -> usize {
         let mut addr = 0;
-        for &dim in self.dims.iter() {
-            addr += dim - 1;
-            addr *= dim;
+        for (&dim, &stride) in self.dims.iter().zip(self.strides.iter()) {
+            addr += (dim - 1) * stride;
         }
         addr
     }
@@ -787,7 +786,7 @@ pub struct Tensor<T> {
 impl<T: Copy + Default> Tensor<T> {
     pub fn new_cpu(dims: &[usize]) -> Self {
         let layout = TensorLayout::row_major(dims);
-        let storage = TensorStorage::Cpu(vec![T::default(); layout.strides[0]]);
+        let storage = TensorStorage::Cpu(vec![T::default(); layout.largest_address() + 1]);
         Tensor {
             storage,
             layout,
@@ -801,13 +800,37 @@ impl<T: Copy + Default> Tensor<T> {
 
     pub fn new_hip_layout(layout: TensorLayout) -> anyhow::Result<Self> {
         let storage = TensorStorage::Hip(HipBuffer::new(
-            layout.strides[0] * std::mem::size_of::<T>(),
+            (layout.largest_address() + 1) * std::mem::size_of::<T>(),
         )?);
         Ok(Tensor {
             storage,
             layout,
             _dead: PhantomData,
         })
+    }
+
+    pub fn from_vec(vec: Vec<T>, layout: TensorLayout) -> Self {
+        assert!(vec.len() > layout.largest_address());
+        Tensor {
+            storage: TensorStorage::Cpu(vec),
+            layout,
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn into_hip(self) -> anyhow::Result<Self> {
+        match self.storage {
+            TensorStorage::Cpu(v) => {
+                let mut buf = HipBuffer::new(v.len() * std::mem::size_of::<T>())?;
+                buf.copy_from_slice(&v)?;
+                Ok(Tensor {
+                    storage: TensorStorage::Hip(buf),
+                    layout: self.layout,
+                    _dead: PhantomData,
+                })
+            }
+            TensorStorage::Hip(_) => Ok(self),
+        }
     }
 
     pub fn as_view(&self) -> TensorView<T> {
@@ -843,6 +866,14 @@ impl<T: Copy + Default> Tensor<T> {
         match &self.storage {
             TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
             TensorStorage::Hip(b) => b.ptr as *mut T,
+        }
+    }
+
+    pub fn size(&self, dim: isize) -> usize {
+        if dim < 0 {
+            self.layout.dims[self.layout.dims.len() - (-dim as usize)]
+        } else {
+            self.layout.dims[dim as usize]
         }
     }
 }
@@ -960,8 +991,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         &mut complex_scratch,
         &mut real_scratch,
     );
-    let content_frames = mel_spec.len() / WHISPER_N_MELS - WHISPER_CHUNK_FRAMES;
-    println!("content_frames {}", content_frames);
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
@@ -979,17 +1008,20 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
         *l = f16::from_f32(*r);
     }
-    let mut mels_half_buf = HipBuffer::new(mels_half.len() * 2)?;
+    let mels_half = Tensor::from_vec(
+        mels_half,
+        TensorLayout::row_major(&[WHISPER_N_MELS, transform.num_cols(wave.len())]),
+    )
+    .into_hip()?;
     let mut conv_out = vec![
         f16::from_f32(0.0);
         transform.num_cols(wave.len()) * model.metadata.n_audio_state as usize
     ];
     let conv_out_buf = HipBuffer::new(conv_out.len() * 2)?;
-    mels_half_buf.copy_from_slice(&mels_half)?;
     kernels.conv1d.launch(
         LaunchParams {
             blocks: (
-                ceil_div(transform.num_cols(wave.len()) as u64, 16) as u32,
+                ceil_div(mels_half.size(-1) as u64, 16) as u32,
                 ceil_div(model.metadata.n_audio_state as u64, 16) as u32,
                 1,
             ),
@@ -999,7 +1031,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         },
         (
             conv_out_buf.ptr as *mut f16,
-            mels_half_buf.ptr as *const f16,
+            mels_half.as_gpu_ptr(),
             conv1_weight.as_gpu_ptr(),
             conv1_bias.as_gpu_ptr(),
             WHISPER_N_MELS as i32,
