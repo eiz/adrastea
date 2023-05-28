@@ -43,6 +43,7 @@ fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
 fn main() {
     let kernels = &[
         "conv1d",
+        "elementwise",
         "embed",
         "embed_uint8",
         "layer_norm",

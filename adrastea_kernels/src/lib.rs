@@ -21,6 +21,7 @@ simt_kernels! {
     [sm_80: "sm_80", sm_89: "sm_89", gfx1100: "gfx1100"],
     [
         conv1d,
+        elementwise,
         embed,
         embed_uint8,
         layer_norm,

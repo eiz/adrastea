@@ -751,6 +751,22 @@ impl TensorLayout {
         }
         Self::new(&dims, &strides)
     }
+
+    pub fn size(&self, dim: isize) -> usize {
+        if dim < 0 {
+            self.dims[self.dims.len() - (-dim as usize)]
+        } else {
+            self.dims[dim as usize]
+        }
+    }
+
+    pub fn stride(&self, dim: isize) -> usize {
+        if dim < 0 {
+            self.strides[self.strides.len() - (-dim as usize)]
+        } else {
+            self.strides[dim as usize]
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -880,11 +896,11 @@ impl<T: Copy + Default> Tensor<T> {
     }
 
     pub fn size(&self, dim: isize) -> usize {
-        if dim < 0 {
-            self.layout.dims[self.layout.dims.len() - (-dim as usize)]
-        } else {
-            self.layout.dims[dim as usize]
-        }
+        self.layout.size(dim)
+    }
+
+    pub fn stride(&self, dim: isize) -> usize {
+        self.layout.stride(dim)
     }
 }
 
@@ -1007,6 +1023,21 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
 }
 
 impl<'a, T> TensorView<'a, T> {
+    pub fn as_gpu_ptr(&self) -> *const T {
+        match self.ptr {
+            TensorStoragePtr::Cpu(_) => panic!("not a gpu tensor"),
+            TensorStoragePtr::Hip(b) => b as *const T,
+        }
+    }
+
+    pub fn size(&self, dim: isize) -> usize {
+        self.layout.size(dim)
+    }
+
+    pub fn stride(&self, dim: isize) -> usize {
+        self.layout.stride(dim)
+    }
+
     pub fn permute(&self, dim_order: &[usize]) -> Self {
         Self {
             ptr: self.ptr,
@@ -1034,6 +1065,36 @@ impl<'a, T> TensorViewMut<'a, T> {
             _dead: PhantomData,
         }
     }
+
+    pub fn as_gpu_ptr(&self) -> *const T {
+        match self.ptr {
+            TensorStoragePtrMut::Cpu(_) => panic!("not a gpu tensor"),
+            TensorStoragePtrMut::Hip(b) => b as *const T,
+        }
+    }
+
+    pub fn as_mut_gpu_ptr(&mut self) -> *mut T {
+        match self.ptr {
+            TensorStoragePtrMut::Cpu(_) => panic!("not a gpu tensor"),
+            TensorStoragePtrMut::Hip(b) => b as *mut T,
+        }
+    }
+
+    pub fn size(&self, dim: isize) -> usize {
+        self.layout.size(dim)
+    }
+
+    pub fn stride(&self, dim: isize) -> usize {
+        self.layout.stride(dim)
+    }
+
+    pub fn permute(&self, dim_order: &[usize]) -> Self {
+        Self {
+            ptr: self.ptr,
+            layout: self.layout.permute(dim_order),
+            _dead: PhantomData,
+        }
+    }
 }
 
 impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
@@ -1046,6 +1107,11 @@ impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
 enum Conv1dActivation {
     None = 0,
     GELU = 1,
+}
+
+#[repr(u32)]
+enum BinaryOp {
+    ADD = 1,
 }
 
 struct WhisperKernels {
@@ -1064,6 +1130,20 @@ struct WhisperKernels {
         i32,
     )>,
     layer_norm: Kernel<(*mut f32, *const f32, *const f32, *const f32, i32, i32, f32)>,
+    elementwise_binary_2d_f16: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        u32,
+    )>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1173,9 +1253,11 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let capability = phys.capability()?;
     let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
     let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
+    let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
     let kernels = WhisperKernels {
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
         layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
+        elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
     };
     let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
     for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
@@ -1236,8 +1318,66 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    println!("{:>+7.4?}", conv2_out.as_view_mut());
+    let pos_embedding = sinusoid_position_embedding(model).into_hip()?;
+    println!("pos embedding");
+    println!("{:>+7.4?}", pos_embedding);
+    let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
+    println!("conv2 shape {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
+    kernels.elementwise_binary_2d_f16.launch(
+        LaunchParams {
+            blocks: (
+                ceil_div(conv2_out.size(1) as u64, 16) as u32,
+                ceil_div(conv2_out.size(0) as u64, 16) as u32,
+                1,
+            ),
+            threads: (16, 16, 1),
+            shared_mem: 0,
+            stream: None,
+        },
+        (
+            conv2_out.as_mut_gpu_ptr(),
+            conv2_out.as_gpu_ptr(),
+            pos_embedding.as_gpu_ptr(),
+            conv2_out.size(1) as i32,
+            conv2_out.size(0) as i32,
+            conv2_out.stride(1) as i32,
+            conv2_out.stride(0) as i32,
+            conv2_out.stride(1) as i32,
+            conv2_out.stride(0) as i32,
+            pos_embedding.stride(1) as i32,
+            pos_embedding.stride(0) as i32,
+            BinaryOp::ADD as u32,
+        ),
+    )?;
+    println!("with embedding {:>+7.4?}", conv2_out);
     Ok(())
+}
+
+fn sinusoid_position_embedding(model: PickledModel<WhisperDims>) -> Tensor<f16> {
+    let mut pos_embedding_vec = vec![
+        f16::from_f32(0.0);
+        model.metadata.n_audio_ctx as usize
+            * model.metadata.n_audio_state as usize
+    ];
+    let increment = (10000.0f32).ln() / (model.metadata.n_audio_state / 2 - 1) as f32;
+    for i in 0..model.metadata.n_audio_ctx as usize {
+        for j in 0..model.metadata.n_audio_state as usize / 2 {
+            let theta = i as f32 * (j as f32 * -increment).exp();
+            pos_embedding_vec[i * model.metadata.n_audio_state as usize + j] =
+                f16::from_f32(theta.sin());
+            pos_embedding_vec[i * model.metadata.n_audio_state as usize
+                + model.metadata.n_audio_state as usize / 2
+                + j] = f16::from_f32(theta.cos());
+        }
+    }
+    let pos_embedding = Tensor::from_vec(
+        pos_embedding_vec,
+        TensorLayout::row_major(&[
+            model.metadata.n_audio_ctx as usize,
+            model.metadata.n_audio_state as usize,
+        ]),
+    );
+    pos_embedding
 }
 
 #[derive(Deserialize)]
