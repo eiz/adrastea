@@ -16,7 +16,7 @@
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
-    fmt::{Debug, Formatter},
+    fmt::{Debug, Display, Formatter},
     marker::PhantomData,
 };
 use std::{collections::HashMap, fs::File, path::Path};
@@ -645,20 +645,6 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
 
 struct TestKernels {
     square_fp32_16x16: Kernel<(*mut f32, *mut f32, u32, u32)>,
-    conv1d: Kernel<(
-        *mut f16,
-        *const f16,
-        *const f16,
-        *const f16,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-    )>,
 }
 
 fn hip_square() -> anyhow::Result<()> {
@@ -677,10 +663,8 @@ fn hip_square() -> anyhow::Result<()> {
     println!("capability is {}", capability);
     let module_square_fp32_16x16 =
         HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
-    let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
     let kernels = TestKernels {
         square_fp32_16x16: Kernel::new(&module_square_fp32_16x16, "square_fp32_16x16")?,
-        conv1d: Kernel::new(&module_conv1d, "conv1d")?,
     };
     let stream = HipStream::new()?;
     let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
@@ -888,7 +872,7 @@ impl<T: Copy + Default> Tensor<T> {
         }
     }
 
-    pub fn as_mut_gpu_ptr(&self) -> *mut T {
+    pub fn as_mut_gpu_ptr(&mut self) -> *mut T {
         match &self.storage {
             TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
             TensorStorage::Hip(b) => b.ptr as *mut T,
@@ -917,6 +901,46 @@ pub struct TensorView<'a, T> {
     _dead: PhantomData<&'a T>,
 }
 
+pub struct ElidingRangeIterator {
+    end: usize,
+    current: usize,
+    threshold: usize,
+    edge_items: usize,
+}
+
+impl ElidingRangeIterator {
+    pub fn new(n: usize, elide_threshold: usize, edge_items: usize) -> Self {
+        Self {
+            end: n,
+            current: 0,
+            threshold: elide_threshold,
+            edge_items,
+        }
+    }
+}
+
+impl Iterator for ElidingRangeIterator {
+    type Item = (bool, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current < self.end {
+            let result = self.current;
+            self.current += 1;
+
+            if self.end > self.threshold {
+                if self.current >= self.edge_items && self.current < self.end - self.edge_items {
+                    self.current = self.end - self.edge_items;
+                    return Some((true, result));
+                }
+            }
+
+            Some((false, result))
+        } else {
+            None
+        }
+    }
+}
+
 fn format_slice_with_layout<T: Debug + Copy>(
     f: &mut Formatter<'_>,
     slice: &[T],
@@ -924,28 +948,30 @@ fn format_slice_with_layout<T: Debug + Copy>(
     layout: &TensorLayout,
 ) -> std::fmt::Result {
     let dims_right = layout.dims.len() - dim - 1;
-    let mut offset = 0;
     let mut first = true;
-
     if dims_right == 0 {
-        for _i in 0..layout.dims[dim] {
+        for (skip, i) in ElidingRangeIterator::new(layout.dims[dim], 6, 3) {
             if !first {
                 write!(f, ", ")?;
             }
             first = false;
-            write!(f, "{:?}", slice[offset])?;
-            offset += layout.strides[dim];
+            Debug::fmt(&slice[layout.strides[dim] * i], f)?;
+            if skip {
+                f.write_str(", ...")?;
+            }
         }
     } else {
-        for _i in 0..layout.dims[dim] {
+        for (skip, i) in ElidingRangeIterator::new(layout.dims[dim], 6, 3) {
             if !first {
                 write!(f, "\n")?;
             }
             first = false;
             write!(f, "[")?;
-            format_slice_with_layout(f, &slice[offset..], dim + 1, layout)?;
+            format_slice_with_layout(f, &slice[layout.strides[dim] * i..], dim + 1, layout)?;
             write!(f, "]")?;
-            offset += layout.strides[dim];
+            if skip {
+                write!(f, "\n...")?;
+            }
         }
     }
     Ok(())
@@ -1010,7 +1036,7 @@ impl<'a, T> TensorViewMut<'a, T> {
     }
 }
 
-impl<'a, T: Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
+impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.as_view().fmt(f)
     }
@@ -1020,6 +1046,24 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
 enum Conv1dActivation {
     None = 0,
     GELU = 1,
+}
+
+struct WhisperKernels {
+    conv1d: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+    )>,
+    layer_norm: Kernel<(*mut f32, *const f32, *const f32, *const f32, i32, i32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1127,12 +1171,11 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
     let capability = phys.capability()?;
-    let module_square_fp32_16x16 =
-        HipModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
     let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
-    let kernels = TestKernels {
-        square_fp32_16x16: Kernel::new(&module_square_fp32_16x16, "square_fp32_16x16")?,
+    let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
+    let kernels = WhisperKernels {
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
+        layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
     };
     let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
     for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
@@ -1172,9 +1215,10 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    println!("{:?}", conv_out.as_view_mut());
-    let mut conv2_out =
-        Tensor::new_hip(&[model.metadata.n_audio_state as usize, mels_half.size(-1)])?;
+    let mut conv2_out = Tensor::new_hip(&[
+        model.metadata.n_audio_state as usize,
+        mels_half.size(-1) / 2,
+    ])?;
     kernels.conv1d.launch(
         conv_params,
         (
@@ -1186,13 +1230,13 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             model.metadata.n_audio_state,
             3,
             mels_half.size(-1) as i32,
-            mels_half.size(-1) as i32,
+            mels_half.size(-1) as i32 / 2,
             2,
             1,
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    println!("{:?}", conv2_out.as_view_mut());
+    println!("{:>+7.4?}", conv2_out.as_view_mut());
     Ok(())
 }
 
@@ -1244,7 +1288,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Tensor, TensorLayout};
+    use crate::{ElidingRangeIterator, Tensor, TensorLayout};
 
     #[test]
     fn test_print_tensor() {
@@ -1256,5 +1300,14 @@ mod tests {
         );
         println!("standard\n{:?}\n", tensor);
         println!("transpose\n{:?}", tensor.as_view().permute(&[1, 0]));
+    }
+
+    #[test]
+    fn test_elided_range() {
+        let mut indices = vec![];
+        for (_skip, i) in ElidingRangeIterator::new(10, 6, 3) {
+            indices.push(i);
+        }
+        assert_eq!(indices, vec![0, 1, 2, 7, 8, 9]);
     }
 }
