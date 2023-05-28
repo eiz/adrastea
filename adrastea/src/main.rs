@@ -14,12 +14,10 @@
  */
 
 use core::{
-    borrow::Borrow,
     cell::RefCell,
     ffi::{c_void, CStr},
     fmt::{Debug, Formatter},
     marker::PhantomData,
-    ops::{Deref, DerefMut},
 };
 use std::{collections::HashMap, fs::File, path::Path};
 
@@ -751,10 +749,6 @@ impl TensorLayout {
         Self::new(dims, &strides)
     }
 
-    pub fn is_aliased(&self) -> bool {
-        todo!()
-    }
-
     pub fn largest_address(&self) -> usize {
         let mut addr = 0;
         for (&dim, &stride) in self.dims.iter().zip(self.strides.iter()) {
@@ -762,18 +756,43 @@ impl TensorLayout {
         }
         addr
     }
+
+    pub fn permute(&self, dim_order: &[usize]) -> Self {
+        assert_eq!(dim_order.len(), self.dims.len());
+        let mut dims = SmallVec::<[usize; 8]>::new();
+        let mut strides = SmallVec::<[usize; 8]>::new();
+        for &dim in dim_order.iter() {
+            dims.push(self.dims[dim]);
+            strides.push(self.strides[dim]);
+        }
+        Self::new(&dims, &strides)
+    }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtr<T> {
     Cpu(*const T),
     Hip(simt_hip_sys::hipDeviceptr_t),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+impl<T> Copy for TensorStoragePtr<T> {}
+impl<T> Clone for TensorStoragePtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtrMut<T> {
     Cpu(*mut T),
     Hip(simt_hip_sys::hipDeviceptr_t),
+}
+
+impl<T> Copy for TensorStoragePtrMut<T> {}
+impl<T> Clone for TensorStoragePtrMut<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 pub enum TensorStorage<T> {
@@ -901,10 +920,35 @@ pub struct TensorView<'a, T> {
 fn format_slice_with_layout<T: Debug + Copy>(
     f: &mut Formatter<'_>,
     slice: &[T],
-    _layout: &TensorLayout,
+    dim: usize,
+    layout: &TensorLayout,
 ) -> std::fmt::Result {
-    // TODO
-    write!(f, "{:?}", &slice[0..10])
+    let dims_right = layout.dims.len() - dim - 1;
+    let mut offset = 0;
+    let mut first = true;
+
+    if dims_right == 0 {
+        for _i in 0..layout.dims[dim] {
+            if !first {
+                write!(f, ", ")?;
+            }
+            first = false;
+            write!(f, "{:?}", slice[offset])?;
+            offset += layout.strides[dim];
+        }
+    } else {
+        for _i in 0..layout.dims[dim] {
+            if !first {
+                write!(f, "\n")?;
+            }
+            first = false;
+            write!(f, "[")?;
+            format_slice_with_layout(f, &slice[offset..], dim + 1, layout)?;
+            write!(f, "]")?;
+            offset += layout.strides[dim];
+        }
+    }
+    Ok(())
 }
 
 impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
@@ -913,7 +957,7 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
             TensorStoragePtr::Cpu(p) => {
                 let slice =
                     unsafe { std::slice::from_raw_parts(p, self.layout.largest_address() + 1) };
-                format_slice_with_layout(f, slice, &self.layout)?;
+                format_slice_with_layout(f, slice, 0, &self.layout)?;
             }
             TensorStoragePtr::Hip(b) => {
                 let storage_size = self.layout.largest_address() + 1;
@@ -929,10 +973,20 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
                     })
                     .map_err(|_| std::fmt::Error)?;
                 }
-                format_slice_with_layout(f, &cpu_data, &self.layout)?;
+                format_slice_with_layout(f, &cpu_data, 0, &self.layout)?;
             }
         }
         Ok(())
+    }
+}
+
+impl<'a, T> TensorView<'a, T> {
+    pub fn permute(&self, dim_order: &[usize]) -> Self {
+        Self {
+            ptr: self.ptr,
+            layout: self.layout.permute(dim_order),
+            _dead: PhantomData,
+        }
     }
 }
 
@@ -1186,4 +1240,21 @@ fn main() -> anyhow::Result<()> {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Tensor, TensorLayout};
+
+    #[test]
+    fn test_print_tensor() {
+        let tensor = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], TensorLayout::row_major(&[2, 2]));
+        println!("{:?}", tensor);
+        let tensor = Tensor::from_vec(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            TensorLayout::row_major(&[3, 3]),
+        );
+        println!("standard\n{:?}\n", tensor);
+        println!("transpose\n{:?}", tensor.as_view().permute(&[1, 0]));
+    }
 }
