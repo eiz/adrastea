@@ -45,6 +45,7 @@ fn main() {
         "conv1d",
         "embed",
         "embed_uint8",
+        "layer_norm",
         "matmul_nt_fp16u8",
         "matmul_nt",
         "matmul_qk",
