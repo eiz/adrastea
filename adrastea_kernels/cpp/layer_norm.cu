@@ -64,7 +64,7 @@ layer_norm(__half* output, __half* input, __half* weights, __half* bias, int h, 
       sum_val += other_val;
     }
     if (warp_leader) {
-      s_stddev = sqrt(sum_val + eps);
+      s_stddev = sqrt(sum_val / w + eps);
     }
   }
   __syncthreads();
