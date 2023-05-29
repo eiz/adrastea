@@ -1318,7 +1318,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    let pos_embedding = sinusoid_position_embedding(model).into_hip()?;
+    let pos_embedding = sinusoid_position_embedding(&model.metadata).into_hip()?;
     println!("pos embedding");
     println!("{:>+7.4?}", pos_embedding);
     let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
@@ -1353,29 +1353,22 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
-fn sinusoid_position_embedding(model: PickledModel<WhisperDims>) -> Tensor<f16> {
-    let mut pos_embedding_vec = vec![
-        f16::from_f32(0.0);
-        model.metadata.n_audio_ctx as usize
-            * model.metadata.n_audio_state as usize
-    ];
-    let increment = (10000.0f32).ln() / (model.metadata.n_audio_state / 2 - 1) as f32;
-    for i in 0..model.metadata.n_audio_ctx as usize {
-        for j in 0..model.metadata.n_audio_state as usize / 2 {
+fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
+    let mut pos_embedding_vec =
+        vec![f16::from_f32(0.0); dims.n_audio_ctx as usize * dims.n_audio_state as usize];
+    let increment = (10000.0f32).ln() / (dims.n_audio_state / 2 - 1) as f32;
+    for i in 0..dims.n_audio_ctx as usize {
+        for j in 0..dims.n_audio_state as usize / 2 {
             let theta = i as f32 * (j as f32 * -increment).exp();
-            pos_embedding_vec[i * model.metadata.n_audio_state as usize + j] =
-                f16::from_f32(theta.sin());
-            pos_embedding_vec[i * model.metadata.n_audio_state as usize
-                + model.metadata.n_audio_state as usize / 2
-                + j] = f16::from_f32(theta.cos());
+            pos_embedding_vec[i * dims.n_audio_state as usize + j] = f16::from_f32(theta.sin());
+            pos_embedding_vec
+                [i * dims.n_audio_state as usize + dims.n_audio_state as usize / 2 + j] =
+                f16::from_f32(theta.cos());
         }
     }
     let pos_embedding = Tensor::from_vec(
         pos_embedding_vec,
-        TensorLayout::row_major(&[
-            model.metadata.n_audio_ctx as usize,
-            model.metadata.n_audio_state as usize,
-        ]),
+        TensorLayout::row_major(&[dims.n_audio_ctx as usize, dims.n_audio_state as usize]),
     );
     pos_embedding
 }
