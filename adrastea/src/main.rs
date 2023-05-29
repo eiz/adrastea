@@ -1353,6 +1353,127 @@ fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
     pos_embedding
 }
 
+struct WhisperContext {
+    model: Arc<WhisperModel>,
+    kernels: Arc<WhisperKernels>,
+    mel_transform: mel::LogMelSpectrogramTransform,
+}
+
+impl WhisperContext {
+    pub fn new(model: Arc<WhisperModel>, kernels: Arc<WhisperKernels>) -> Self {
+        Self {
+            model,
+            kernels,
+            mel_transform: mel::LogMelSpectrogramTransform::new(
+                WHISPER_N_FFT,
+                WHISPER_N_MELS,
+                WHISPER_HOP_LENGTH,
+                WHISPER_SAMPLE_RATE as f32,
+            ),
+        }
+    }
+
+    pub fn encode(&mut self, wave: &[f32]) -> anyhow::Result<Tensor<f16>> {
+        let mut complex_scratch =
+            vec![Complex32::new(0.0, 0.0); self.mel_transform.complex_scratch_size(wave.len())];
+        let mut real_scratch = vec![0.0; self.mel_transform.real_scratch_size(wave.len())];
+        let mut mel_spec = vec![0.0; self.mel_transform.output_size(wave.len())];
+
+        self.mel_transform
+            .process(&mut mel_spec, wave, &mut complex_scratch, &mut real_scratch);
+
+        let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
+        for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
+            *l = f16::from_f32(*r);
+        }
+        let mels_half = Tensor::from_vec(
+            mels_half,
+            TensorLayout::row_major(&[WHISPER_N_MELS, self.mel_transform.num_cols(wave.len())]),
+        )
+        .into_hip()?;
+        let mut conv_out =
+            Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1)])?;
+        let conv_params = LaunchParams {
+            blocks: (
+                ceil_div(mels_half.size(-1) as u64, 16) as u32,
+                ceil_div(self.model.dims.n_audio_state as u64, 16) as u32,
+                1,
+            ),
+            threads: (16, 16, 1),
+            shared_mem: 0,
+            stream: None,
+        };
+        self.kernels.conv1d.launch(
+            conv_params.clone(),
+            (
+                conv_out.as_mut_gpu_ptr(),
+                mels_half.as_gpu_ptr(),
+                self.model.encoder.conv1.weight.as_gpu_ptr(),
+                self.model.encoder.conv1.bias.as_gpu_ptr(),
+                WHISPER_N_MELS as i32,
+                self.model.dims.n_audio_state,
+                3,
+                mels_half.size(-1) as i32,
+                mels_half.size(-1) as i32,
+                1,
+                1,
+                Conv1dActivation::GELU as i32,
+            ),
+        )?;
+        let mut conv2_out = Tensor::new_hip(&[
+            self.model.dims.n_audio_state as usize,
+            mels_half.size(-1) / 2,
+        ])?;
+        self.kernels.conv1d.launch(
+            conv_params,
+            (
+                conv2_out.as_mut_gpu_ptr(),
+                conv_out.as_gpu_ptr(),
+                self.model.encoder.conv2.weight.as_gpu_ptr(),
+                self.model.encoder.conv2.bias.as_gpu_ptr(),
+                self.model.dims.n_audio_state,
+                self.model.dims.n_audio_state,
+                3,
+                mels_half.size(-1) as i32,
+                mels_half.size(-1) as i32 / 2,
+                2,
+                1,
+                Conv1dActivation::GELU as i32,
+            ),
+        )?;
+        let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
+        println!("conv2 shape {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
+        self.kernels.elementwise_binary_2d_f16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(conv2_out.size(1) as u64, 16) as u32,
+                    ceil_div(conv2_out.size(0) as u64, 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                conv2_out.as_mut_gpu_ptr(),
+                conv2_out.as_gpu_ptr(),
+                self.model.encoder.position_embedding.as_gpu_ptr(),
+                conv2_out.size(1) as i32,
+                conv2_out.size(0) as i32,
+                conv2_out.stride(1) as i32,
+                conv2_out.stride(0) as i32,
+                conv2_out.stride(1) as i32,
+                conv2_out.stride(0) as i32,
+                self.model.encoder.position_embedding.stride(1) as i32,
+                self.model.encoder.position_embedding.stride(0) as i32,
+                BinaryOp::ADD as u32,
+            ),
+        )?;
+        println!("with embedding {:>+7.4?}", conv2_out);
+        todo!()
+    }
+}
+
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     match data {
         wav::BitDepth::Eight(v) => v.iter().map(|x| *x as f32 / 128.0 - 1.0).collect(),
@@ -1397,6 +1518,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
     };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
+    let mut context = WhisperContext::new(Arc::new(model), Arc::new(kernels));
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -1423,108 +1545,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
-    let mut transform = mel::LogMelSpectrogramTransform::new(
-        WHISPER_N_FFT,
-        WHISPER_N_MELS,
-        WHISPER_HOP_LENGTH,
-        WHISPER_SAMPLE_RATE as f32,
-    );
-    let mut complex_scratch =
-        vec![Complex32::new(0.0, 0.0); transform.complex_scratch_size(wave.len())];
-    let mut real_scratch = vec![0.0; transform.real_scratch_size(wave.len())];
-    let mut mel_spec = vec![0.0; transform.output_size(wave.len())];
-    transform.process(
-        &mut mel_spec,
-        &wave,
-        &mut complex_scratch,
-        &mut real_scratch,
-    );
-
-    let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
-    for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
-        *l = f16::from_f32(*r);
-    }
-    let mels_half = Tensor::from_vec(
-        mels_half,
-        TensorLayout::row_major(&[WHISPER_N_MELS, transform.num_cols(wave.len())]),
-    )
-    .into_hip()?;
-    let mut conv_out = Tensor::new_hip(&[model.dims.n_audio_state as usize, mels_half.size(-1)])?;
-    let conv_params = LaunchParams {
-        blocks: (
-            ceil_div(mels_half.size(-1) as u64, 16) as u32,
-            ceil_div(model.dims.n_audio_state as u64, 16) as u32,
-            1,
-        ),
-        threads: (16, 16, 1),
-        shared_mem: 0,
-        stream: None,
-    };
-    kernels.conv1d.launch(
-        conv_params.clone(),
-        (
-            conv_out.as_mut_gpu_ptr(),
-            mels_half.as_gpu_ptr(),
-            model.encoder.conv1.weight.as_gpu_ptr(),
-            model.encoder.conv1.bias.as_gpu_ptr(),
-            WHISPER_N_MELS as i32,
-            model.dims.n_audio_state,
-            3,
-            mels_half.size(-1) as i32,
-            mels_half.size(-1) as i32,
-            1,
-            1,
-            Conv1dActivation::GELU as i32,
-        ),
-    )?;
-    let mut conv2_out =
-        Tensor::new_hip(&[model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
-    kernels.conv1d.launch(
-        conv_params,
-        (
-            conv2_out.as_mut_gpu_ptr(),
-            conv_out.as_gpu_ptr(),
-            model.encoder.conv2.weight.as_gpu_ptr(),
-            model.encoder.conv2.bias.as_gpu_ptr(),
-            model.dims.n_audio_state,
-            model.dims.n_audio_state,
-            3,
-            mels_half.size(-1) as i32,
-            mels_half.size(-1) as i32 / 2,
-            2,
-            1,
-            Conv1dActivation::GELU as i32,
-        ),
-    )?;
-    let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
-    println!("conv2 shape {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
-    kernels.elementwise_binary_2d_f16.launch(
-        LaunchParams {
-            blocks: (
-                ceil_div(conv2_out.size(1) as u64, 16) as u32,
-                ceil_div(conv2_out.size(0) as u64, 16) as u32,
-                1,
-            ),
-            threads: (16, 16, 1),
-            shared_mem: 0,
-            stream: None,
-        },
-        (
-            conv2_out.as_mut_gpu_ptr(),
-            conv2_out.as_gpu_ptr(),
-            model.encoder.position_embedding.as_gpu_ptr(),
-            conv2_out.size(1) as i32,
-            conv2_out.size(0) as i32,
-            conv2_out.stride(1) as i32,
-            conv2_out.stride(0) as i32,
-            conv2_out.stride(1) as i32,
-            conv2_out.stride(0) as i32,
-            model.encoder.position_embedding.stride(1) as i32,
-            model.encoder.position_embedding.stride(0) as i32,
-            BinaryOp::ADD as u32,
-        ),
-    )?;
-    println!("with embedding {:>+7.4?}", conv2_out);
+    context.encode(wave)?;
     Ok(())
 }
 
