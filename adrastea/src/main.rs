@@ -1273,26 +1273,84 @@ impl WhisperConv1d {
 }
 
 #[derive(Debug)]
-pub struct WhisperModel {
-    dims: WhisperDims,
+pub struct WhisperAudioEncoder {
     conv1: WhisperConv1d,
     conv2: WhisperConv1d,
     position_embedding: Tensor<f16>,
-    audio_encoder_layers: Vec<WhisperTransformerBlock>,
+    layers: Vec<WhisperTransformerBlock>,
+    ln_post: WhisperLayerNorm,
+}
+
+impl WhisperAudioEncoder {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            conv1: WhisperConv1d::new(pickle, &format!("{}.conv1", prefix))?,
+            conv2: WhisperConv1d::new(pickle, &format!("{}.conv2", prefix))?,
+            position_embedding: sinusoid_position_embedding(&pickle.metadata).into_hip()?,
+            layers: (0..pickle.metadata.n_audio_layer)
+                .map(|i| WhisperTransformerBlock::new(pickle, &format!("{}.blocks.{}", prefix, i)))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            ln_post: WhisperLayerNorm::new(pickle, &format!("{}.ln_post", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperTextDecoder {
+    token_embedding: Tensor<f16>,
+    positional_embedding: Tensor<f16>,
+    ln: WhisperLayerNorm,
+    layers: Vec<WhisperTransformerBlock>,
+}
+
+impl WhisperTextDecoder {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            token_embedding: load_tensor(pickle, &format!("{}.token_embedding.weight", prefix))?,
+            positional_embedding: load_tensor(pickle, &format!("{}.positional_embedding", prefix))?,
+            ln: WhisperLayerNorm::new(pickle, &format!("{}.ln", prefix))?,
+            layers: (0..pickle.metadata.n_text_layer)
+                .map(|i| WhisperTransformerBlock::new(pickle, &format!("{}.blocks.{}", prefix, i)))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperModel {
+    dims: WhisperDims,
+    encoder: WhisperAudioEncoder,
+    decoder: WhisperTextDecoder,
 }
 
 impl WhisperModel {
     pub fn new(pickle: &PickledModel<WhisperDims>) -> anyhow::Result<Self> {
         Ok(Self {
             dims: pickle.metadata.clone(),
-            conv1: WhisperConv1d::new(pickle, "encoder.conv1")?,
-            conv2: WhisperConv1d::new(pickle, "encoder.conv2")?,
-            position_embedding: sinusoid_position_embedding(&pickle.metadata).into_hip()?,
-            audio_encoder_layers: (0..pickle.metadata.n_audio_layer)
-                .map(|i| WhisperTransformerBlock::new(pickle, &format!("encoder.blocks.{}", i)))
-                .collect::<anyhow::Result<Vec<_>>>()?,
+            encoder: WhisperAudioEncoder::new(pickle, "encoder")?,
+            decoder: WhisperTextDecoder::new(pickle, "decoder")?,
         })
     }
+}
+
+fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
+    let mut pos_embedding_vec =
+        vec![f16::from_f32(0.0); dims.n_audio_ctx as usize * dims.n_audio_state as usize];
+    let increment = (10000.0f32).ln() / (dims.n_audio_state / 2 - 1) as f32;
+    for i in 0..dims.n_audio_ctx as usize {
+        for j in 0..dims.n_audio_state as usize / 2 {
+            let theta = i as f32 * (j as f32 * -increment).exp();
+            pos_embedding_vec[i * dims.n_audio_state as usize + j] = f16::from_f32(theta.sin());
+            pos_embedding_vec
+                [i * dims.n_audio_state as usize + dims.n_audio_state as usize / 2 + j] =
+                f16::from_f32(theta.cos());
+        }
+    }
+    let pos_embedding = Tensor::from_vec(
+        pos_embedding_vec,
+        TensorLayout::row_major(&[dims.n_audio_ctx as usize, dims.n_audio_state as usize]),
+    );
+    pos_embedding
 }
 
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
@@ -1324,6 +1382,20 @@ fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tenso
 }
 
 fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
+    let phys = HipPhysicalDevice::get(0)?;
+    let device = Arc::new(HipDevice::new(phys)?);
+    let _scope = device.lock()?;
+    // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
+    // use a better way
+    let capability = phys.capability()?;
+    let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
+    let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
+    let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
+    let kernels = WhisperKernels {
+        conv1d: Kernel::new(&module_conv1d, "conv1d")?,
+        layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
+        elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
+    };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
@@ -1367,20 +1439,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         &mut complex_scratch,
         &mut real_scratch,
     );
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
-    let _scope = device.lock()?;
-    // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
-    // use a better way
-    let capability = phys.capability()?;
-    let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
-    let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
-    let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
-    let kernels = WhisperKernels {
-        conv1d: Kernel::new(&module_conv1d, "conv1d")?,
-        layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
-        elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
-    };
+
     let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
     for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
         *l = f16::from_f32(*r);
@@ -1406,8 +1465,8 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv_out.as_mut_gpu_ptr(),
             mels_half.as_gpu_ptr(),
-            model.conv1.weight.as_gpu_ptr(),
-            model.conv1.bias.as_gpu_ptr(),
+            model.encoder.conv1.weight.as_gpu_ptr(),
+            model.encoder.conv1.bias.as_gpu_ptr(),
             WHISPER_N_MELS as i32,
             model.dims.n_audio_state,
             3,
@@ -1425,8 +1484,8 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv2_out.as_mut_gpu_ptr(),
             conv_out.as_gpu_ptr(),
-            model.conv2.weight.as_gpu_ptr(),
-            model.conv2.bias.as_gpu_ptr(),
+            model.encoder.conv2.weight.as_gpu_ptr(),
+            model.encoder.conv2.bias.as_gpu_ptr(),
             model.dims.n_audio_state,
             model.dims.n_audio_state,
             3,
@@ -1453,40 +1512,20 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv2_out.as_mut_gpu_ptr(),
             conv2_out.as_gpu_ptr(),
-            model.position_embedding.as_gpu_ptr(),
+            model.encoder.position_embedding.as_gpu_ptr(),
             conv2_out.size(1) as i32,
             conv2_out.size(0) as i32,
             conv2_out.stride(1) as i32,
             conv2_out.stride(0) as i32,
             conv2_out.stride(1) as i32,
             conv2_out.stride(0) as i32,
-            model.position_embedding.stride(1) as i32,
-            model.position_embedding.stride(0) as i32,
+            model.encoder.position_embedding.stride(1) as i32,
+            model.encoder.position_embedding.stride(0) as i32,
             BinaryOp::ADD as u32,
         ),
     )?;
     println!("with embedding {:>+7.4?}", conv2_out);
     Ok(())
-}
-
-fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
-    let mut pos_embedding_vec =
-        vec![f16::from_f32(0.0); dims.n_audio_ctx as usize * dims.n_audio_state as usize];
-    let increment = (10000.0f32).ln() / (dims.n_audio_state / 2 - 1) as f32;
-    for i in 0..dims.n_audio_ctx as usize {
-        for j in 0..dims.n_audio_state as usize / 2 {
-            let theta = i as f32 * (j as f32 * -increment).exp();
-            pos_embedding_vec[i * dims.n_audio_state as usize + j] = f16::from_f32(theta.sin());
-            pos_embedding_vec
-                [i * dims.n_audio_state as usize + dims.n_audio_state as usize / 2 + j] =
-                f16::from_f32(theta.cos());
-        }
-    }
-    let pos_embedding = Tensor::from_vec(
-        pos_embedding_vec,
-        TensorLayout::row_major(&[dims.n_audio_ctx as usize, dims.n_audio_state as usize]),
-    );
-    pos_embedding
 }
 
 fn main() -> anyhow::Result<()> {
