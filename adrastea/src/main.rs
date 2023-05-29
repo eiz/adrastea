@@ -1114,6 +1114,14 @@ enum BinaryOp {
     ADD = 1,
 }
 
+pub const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const WHISPER_N_FFT: usize = 400;
+pub const WHISPER_N_MELS: usize = 80;
+pub const WHISPER_HOP_LENGTH: usize = 160;
+pub const WHISPER_CHUNK_LENGTH: usize = 30;
+pub const WHISPER_CHUNK_FRAMES: usize =
+    WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
+
 struct WhisperKernels {
     conv1d: Kernel<(
         *mut f16,
@@ -1160,13 +1168,132 @@ pub struct WhisperDims {
     pub n_text_layer: i32,
 }
 
-pub const WHISPER_SAMPLE_RATE: u32 = 16000;
-pub const WHISPER_N_FFT: usize = 400;
-pub const WHISPER_N_MELS: usize = 80;
-pub const WHISPER_HOP_LENGTH: usize = 160;
-pub const WHISPER_CHUNK_LENGTH: usize = 30;
-pub const WHISPER_CHUNK_FRAMES: usize =
-    WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
+#[derive(Deserialize)]
+pub struct WhisperModelState {
+    dims: WhisperDims,
+    model_state_dict: serde_pickle::Value,
+}
+
+impl<'de> pickle::ModelState<'de> for WhisperModelState {
+    type Metadata = WhisperDims;
+    type LoadParams = ();
+    fn state_dict(&self) -> &serde_pickle::Value {
+        &self.model_state_dict
+    }
+    fn into_metadata(self) -> Self::Metadata {
+        self.dims
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperLayerNorm {
+    weight: Tensor<f16>,
+    bias: Tensor<f16>,
+}
+
+impl WhisperLayerNorm {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            weight: load_tensor(pickle, &format!("{}.weight", prefix))?,
+            bias: load_tensor(pickle, &format!("{}.bias", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperAttention {
+    query: WhisperLinear,
+    key: Tensor<f16>,
+    value: WhisperLinear,
+    out: WhisperLinear,
+}
+
+impl WhisperAttention {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            query: WhisperLinear::new(pickle, &format!("{}.query", prefix))?,
+            key: load_tensor(pickle, &format!("{}.key.weight", prefix))?,
+            value: WhisperLinear::new(pickle, &format!("{}.value", prefix))?,
+            out: WhisperLinear::new(pickle, &format!("{}.out", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperLinear {
+    weight: Tensor<f16>,
+    bias: Tensor<f16>,
+}
+
+impl WhisperLinear {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            weight: load_tensor(pickle, &format!("{}.weight", prefix))?,
+            bias: load_tensor(pickle, &format!("{}.bias", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperTransformerBlock {
+    attn: WhisperAttention,
+    cross_attn: Option<WhisperAttention>,
+    attn_ln: WhisperLayerNorm,
+    mlp_0: WhisperLinear,
+    mlp_2: WhisperLinear,
+    mlp_ln: WhisperLayerNorm,
+}
+
+impl WhisperTransformerBlock {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            attn: WhisperAttention::new(pickle, &format!("{}.attn", prefix))?,
+            cross_attn: None,
+            attn_ln: WhisperLayerNorm::new(pickle, &format!("{}.attn_ln", prefix))?,
+            mlp_0: WhisperLinear::new(pickle, &format!("{}.mlp.0", prefix))?,
+            mlp_2: WhisperLinear::new(pickle, &format!("{}.mlp.2", prefix))?,
+            mlp_ln: WhisperLayerNorm::new(pickle, &format!("{}.mlp_ln", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperConv1d {
+    weight: Tensor<f16>,
+    bias: Tensor<f16>,
+}
+
+impl WhisperConv1d {
+    pub fn new(pickle: &PickledModel<WhisperDims>, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            weight: load_tensor(pickle, &format!("{}.weight", prefix))?,
+            bias: load_tensor(pickle, &format!("{}.bias", prefix))?,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct WhisperModel {
+    dims: WhisperDims,
+    conv1: WhisperConv1d,
+    conv2: WhisperConv1d,
+    position_embedding: Tensor<f16>,
+    audio_encoder_layers: Vec<WhisperTransformerBlock>,
+}
+
+impl WhisperModel {
+    pub fn new(pickle: &PickledModel<WhisperDims>) -> anyhow::Result<Self> {
+        Ok(Self {
+            dims: pickle.metadata.clone(),
+            conv1: WhisperConv1d::new(pickle, "encoder.conv1")?,
+            conv2: WhisperConv1d::new(pickle, "encoder.conv2")?,
+            position_embedding: sinusoid_position_embedding(&pickle.metadata).into_hip()?,
+            audio_encoder_layers: (0..pickle.metadata.n_audio_layer)
+                .map(|i| WhisperTransformerBlock::new(pickle, &format!("encoder.blocks.{}", i)))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        })
+    }
+}
 
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     match data {
@@ -1182,7 +1309,7 @@ fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tenso
     let pickled_tensor = pickled
         .tensors
         .get(name)
-        .ok_or_else(|| anyhow::anyhow!("tensor not found"))?;
+        .ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
     let mut tensor = Tensor::new_hip_layout(TensorLayout::new(
         &pickled_tensor.shape,
         &pickled_tensor.stride,
@@ -1197,11 +1324,7 @@ fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tenso
 }
 
 fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
-    let model = WhisperModelState::load(model_path, ())?;
-    let conv1_weight = load_tensor(&model, "encoder.conv1.weight")?;
-    let conv1_bias = load_tensor(&model, "encoder.conv1.bias")?;
-    let conv2_weight = load_tensor(&model, "encoder.conv2.weight")?;
-    let conv2_bias = load_tensor(&model, "encoder.conv2.bias")?;
+    let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -1213,7 +1336,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         wav::BitDepth::ThirtyTwoFloat(v) => v.len(),
         wav::BitDepth::Empty => 0,
     };
-    println!("model: {:?}", model.metadata);
     println!("samples: {}", data_len / header.channel_count as usize);
     println!(
         "duration: {}s",
@@ -1268,12 +1390,11 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         TensorLayout::row_major(&[WHISPER_N_MELS, transform.num_cols(wave.len())]),
     )
     .into_hip()?;
-    let mut conv_out =
-        Tensor::new_hip(&[model.metadata.n_audio_state as usize, mels_half.size(-1)])?;
+    let mut conv_out = Tensor::new_hip(&[model.dims.n_audio_state as usize, mels_half.size(-1)])?;
     let conv_params = LaunchParams {
         blocks: (
             ceil_div(mels_half.size(-1) as u64, 16) as u32,
-            ceil_div(model.metadata.n_audio_state as u64, 16) as u32,
+            ceil_div(model.dims.n_audio_state as u64, 16) as u32,
             1,
         ),
         threads: (16, 16, 1),
@@ -1285,10 +1406,10 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv_out.as_mut_gpu_ptr(),
             mels_half.as_gpu_ptr(),
-            conv1_weight.as_gpu_ptr(),
-            conv1_bias.as_gpu_ptr(),
+            model.conv1.weight.as_gpu_ptr(),
+            model.conv1.bias.as_gpu_ptr(),
             WHISPER_N_MELS as i32,
-            model.metadata.n_audio_state,
+            model.dims.n_audio_state,
             3,
             mels_half.size(-1) as i32,
             mels_half.size(-1) as i32,
@@ -1297,19 +1418,17 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    let mut conv2_out = Tensor::new_hip(&[
-        model.metadata.n_audio_state as usize,
-        mels_half.size(-1) / 2,
-    ])?;
+    let mut conv2_out =
+        Tensor::new_hip(&[model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
     kernels.conv1d.launch(
         conv_params,
         (
             conv2_out.as_mut_gpu_ptr(),
             conv_out.as_gpu_ptr(),
-            conv2_weight.as_gpu_ptr(),
-            conv2_bias.as_gpu_ptr(),
-            model.metadata.n_audio_state,
-            model.metadata.n_audio_state,
+            model.conv2.weight.as_gpu_ptr(),
+            model.conv2.bias.as_gpu_ptr(),
+            model.dims.n_audio_state,
+            model.dims.n_audio_state,
             3,
             mels_half.size(-1) as i32,
             mels_half.size(-1) as i32 / 2,
@@ -1318,9 +1437,6 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             Conv1dActivation::GELU as i32,
         ),
     )?;
-    let pos_embedding = sinusoid_position_embedding(&model.metadata).into_hip()?;
-    println!("pos embedding");
-    println!("{:>+7.4?}", pos_embedding);
     let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
     println!("conv2 shape {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
     kernels.elementwise_binary_2d_f16.launch(
@@ -1337,15 +1453,15 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         (
             conv2_out.as_mut_gpu_ptr(),
             conv2_out.as_gpu_ptr(),
-            pos_embedding.as_gpu_ptr(),
+            model.position_embedding.as_gpu_ptr(),
             conv2_out.size(1) as i32,
             conv2_out.size(0) as i32,
             conv2_out.stride(1) as i32,
             conv2_out.stride(0) as i32,
             conv2_out.stride(1) as i32,
             conv2_out.stride(0) as i32,
-            pos_embedding.stride(1) as i32,
-            pos_embedding.stride(0) as i32,
+            model.position_embedding.stride(1) as i32,
+            model.position_embedding.stride(0) as i32,
             BinaryOp::ADD as u32,
         ),
     )?;
@@ -1371,23 +1487,6 @@ fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
         TensorLayout::row_major(&[dims.n_audio_ctx as usize, dims.n_audio_state as usize]),
     );
     pos_embedding
-}
-
-#[derive(Deserialize)]
-pub struct WhisperModelState {
-    dims: WhisperDims,
-    model_state_dict: serde_pickle::Value,
-}
-
-impl<'de> pickle::ModelState<'de> for WhisperModelState {
-    type Metadata = WhisperDims;
-    type LoadParams = ();
-    fn state_dict(&self) -> &serde_pickle::Value {
-        &self.model_state_dict
-    }
-    fn into_metadata(self) -> Self::Metadata {
-        self.dims
-    }
 }
 
 fn main() -> anyhow::Result<()> {
