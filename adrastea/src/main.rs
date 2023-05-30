@@ -705,8 +705,8 @@ fn hip_square() -> anyhow::Result<()> {
 
 #[derive(Clone, Debug)]
 pub struct TensorLayout {
-    pub dims: SmallVec<[usize; 8]>,
-    pub strides: SmallVec<[usize; 8]>,
+    pub dims: SmallVec<[usize; 7]>,
+    pub strides: SmallVec<[usize; 7]>,
 }
 
 impl TensorLayout {
@@ -723,7 +723,7 @@ impl TensorLayout {
     }
 
     pub fn row_major(dims: &[usize]) -> Self {
-        let mut strides = SmallVec::<[usize; 8]>::new();
+        let mut strides = SmallVec::<[usize; 7]>::new();
         let mut stride = 1;
         for &dim in dims.iter().rev() {
             strides.push(stride);
@@ -743,8 +743,8 @@ impl TensorLayout {
 
     pub fn permute(&self, dim_order: &[usize]) -> Self {
         assert_eq!(dim_order.len(), self.dims.len());
-        let mut dims = SmallVec::<[usize; 8]>::new();
-        let mut strides = SmallVec::<[usize; 8]>::new();
+        let mut dims = SmallVec::<[usize; 7]>::new();
+        let mut strides = SmallVec::<[usize; 7]>::new();
         for &dim in dim_order.iter() {
             dims.push(self.dims[dim]);
             strides.push(self.strides[dim]);
@@ -1137,7 +1137,19 @@ struct WhisperKernels {
         i32,
         i32,
     )>,
-    layer_norm: Kernel<(*mut f32, *const f32, *const f32, *const f32, i32, i32, f32)>,
+    layer_norm: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        f32,
+    )>,
     elementwise_binary_2d_f16: Kernel<(
         *mut f16,
         *const f16,
@@ -1374,14 +1386,13 @@ impl WhisperContext {
     }
 
     pub fn encode(&mut self, wave: &[f32]) -> anyhow::Result<Tensor<f16>> {
+        // TODO we should be accepting a fixed length and not allocate these each time
         let mut complex_scratch =
             vec![Complex32::new(0.0, 0.0); self.mel_transform.complex_scratch_size(wave.len())];
         let mut real_scratch = vec![0.0; self.mel_transform.real_scratch_size(wave.len())];
         let mut mel_spec = vec![0.0; self.mel_transform.output_size(wave.len())];
-
         self.mel_transform
             .process(&mut mel_spec, wave, &mut complex_scratch, &mut real_scratch);
-
         let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
         for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
             *l = f16::from_f32(*r);
@@ -1442,12 +1453,11 @@ impl WhisperContext {
             ),
         )?;
         let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
-        println!("conv2 shape {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
         self.kernels.elementwise_binary_2d_f16.launch(
             LaunchParams {
                 blocks: (
-                    ceil_div(conv2_out.size(1) as u64, 16) as u32,
-                    ceil_div(conv2_out.size(0) as u64, 16) as u32,
+                    ceil_div(conv2_out.size(-1) as u64, 16) as u32,
+                    ceil_div(conv2_out.size(-2) as u64, 16) as u32,
                     1,
                 ),
                 threads: (16, 16, 1),
@@ -1458,19 +1468,45 @@ impl WhisperContext {
                 conv2_out.as_mut_gpu_ptr(),
                 conv2_out.as_gpu_ptr(),
                 self.model.encoder.position_embedding.as_gpu_ptr(),
-                conv2_out.size(1) as i32,
-                conv2_out.size(0) as i32,
-                conv2_out.stride(1) as i32,
-                conv2_out.stride(0) as i32,
-                conv2_out.stride(1) as i32,
-                conv2_out.stride(0) as i32,
-                self.model.encoder.position_embedding.stride(1) as i32,
-                self.model.encoder.position_embedding.stride(0) as i32,
+                conv2_out.size(-1) as i32,
+                conv2_out.size(-2) as i32,
+                conv2_out.stride(-1) as i32,
+                conv2_out.stride(-2) as i32,
+                conv2_out.stride(-1) as i32,
+                conv2_out.stride(-2) as i32,
+                self.model.encoder.position_embedding.stride(-1) as i32,
+                self.model.encoder.position_embedding.stride(-2) as i32,
                 BinaryOp::ADD as u32,
             ),
         )?;
-        println!("with embedding {:>+7.4?}", conv2_out);
-        todo!()
+        println!("embedded {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
+        for layer in &self.model.encoder.layers {
+            let mut ln_out = Tensor::new_hip(&conv2_out.layout.dims)?;
+            self.kernels.layer_norm.launch(
+                LaunchParams {
+                    blocks: (conv2_out.size(-2) as u32, 1, 1),
+                    threads: (256, 1, 1),
+                    shared_mem: 0,
+                    stream: None,
+                },
+                (
+                    ln_out.as_mut_gpu_ptr(),
+                    conv2_out.as_gpu_ptr(),
+                    layer.attn_ln.weight.as_gpu_ptr(),
+                    layer.attn_ln.bias.as_gpu_ptr(),
+                    ln_out.size(-1) as i32,
+                    ln_out.size(-2) as i32,
+                    ln_out.stride(-1) as i32,
+                    ln_out.stride(-2) as i32,
+                    conv2_out.stride(-1) as i32,
+                    conv2_out.stride(-2) as i32,
+                    1.0e-5,
+                ),
+            )?;
+            println!("layer norm {:>+7.4?} {:?}", ln_out, ln_out.layout.strides);
+            todo!()
+        }
+        todo!();
     }
 }
 
