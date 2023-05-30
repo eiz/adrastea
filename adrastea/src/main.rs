@@ -846,12 +846,14 @@ impl<T: Copy + Default> Tensor<T> {
     }
 
     pub fn new_hip_layout(layout: TensorLayout) -> anyhow::Result<Self> {
-        // TODO: zero initialization
-        let storage = TensorStorage::Hip(HipBuffer::new(
-            (layout.largest_address() + 1) * std::mem::size_of::<T>(),
-        )?);
+        let buf = HipBuffer::new((layout.largest_address() + 1) * std::mem::size_of::<T>())?;
+        unsafe {
+            simt_hip::hip_call(|| {
+                simt_hip_sys::library().hipMemset(buf.ptr as *mut _, 0, buf.size)
+            })?;
+        }
         Ok(Tensor {
-            storage,
+            storage: TensorStorage::Hip(buf),
             layout,
             _dead: PhantomData,
         })
