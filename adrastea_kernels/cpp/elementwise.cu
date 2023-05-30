@@ -18,6 +18,17 @@
   STRIDE_1_BINARY_1D(stride_1x, stride_2x, stride_3x,                                             \
                      STRIDE_1_BINARY_1D(stride_1y, stride_2y, stride_3y, __VA_ARGS__))
 
+enum UnaryOp {
+  IDENTITY = 1,
+};
+
+struct Identity {
+  template <typename T>
+  __device__ __forceinline__ T operator()(T const& input) const {
+    return input;
+  }
+};
+
 enum BinaryOp {
   ADD = 1,
 };
@@ -28,6 +39,29 @@ struct Add {
     return left + right;
   }
 };
+
+template <typename T, typename Operator>
+void __device__ __forceinline__ elementwise_unary_1d(T* const output,
+                                                     T const* const input,
+                                                     int const stride_o,
+                                                     int const stride_i,
+                                                     int const i) {
+  Operator op;
+  output[i * stride_o] = op(input[i * stride_i]);
+}
+
+template <typename T, typename Operator>
+void __device__ __forceinline__ elementwise_unary_2d(T* const output,
+                                                     T const* const input,
+                                                     int const stride_ox,
+                                                     int const stride_oy,
+                                                     int const stride_ix,
+                                                     int const stride_iy,
+                                                     int const i,
+                                                     int const j) {
+  Operator op;
+  output[i * stride_ox + j * stride_oy] = op(input[i * stride_ix + j * stride_iy]);
+}
 
 template <typename T, typename Operator>
 void __device__ __forceinline__ elementwise_binary_1d(T* const output,
@@ -56,6 +90,53 @@ void __device__ __forceinline__ elementwise_binary_2d(T* const output,
   Operator op;
   output[i * stride_ox + j * stride_oy] =
       op(left[i * stride_lx + j * stride_ly], right[i * stride_rx + j * stride_ry]);
+}
+
+template <typename T>
+void __device__ __forceinline__ elementwise_unary_1d_generic(T* const output,
+                                                             T const* const input,
+                                                             int length,
+                                                             int const stride_o,
+                                                             int const stride_i,
+                                                             UnaryOp op) {
+  int n = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
+  if (n >= length)
+    return;
+
+  switch (op) {
+    case IDENTITY:
+      STRIDE_1_BINARY_1D(stride_o, stride_i, stride_i,
+                         elementwise_unary_1d<T, Identity>(output, input, stride_o, stride_i, n));
+      break;
+    default:
+      assert(false);
+  }
+}
+
+template <typename T>
+void __device__ __forceinline__ elementwise_unary_2d_generic(T* const output,
+                                                             T const* const input,
+                                                             int length_x,
+                                                             int length_y,
+                                                             int const stride_ox,
+                                                             int const stride_oy,
+                                                             int const stride_ix,
+                                                             int const stride_iy,
+                                                             UnaryOp op) {
+  int x = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
+  int y = BLOCK_DIM_Y * BLOCK_IDX_Y + THREAD_IDX_Y;
+  if (x >= length_x || y >= length_y)
+    return;
+
+  switch (op) {
+    case IDENTITY:
+      STRIDE_1_BINARY_2D(stride_ox, stride_oy, stride_ix, stride_iy, stride_ix, stride_iy,
+                         elementwise_unary_2d<T, Identity>(output, input, stride_ox, stride_oy,
+                                                           stride_ix, stride_iy, x, y));
+      break;
+    default:
+      assert(false);
+  }
 }
 
 template <typename T>
@@ -95,9 +176,9 @@ void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
                                                               int const stride_rx,
                                                               int const stride_ry,
                                                               BinaryOp op) {
-  int n = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
-  int m = BLOCK_DIM_Y * BLOCK_IDX_Y + THREAD_IDX_Y;
-  if (n >= length_x || m >= length_y)
+  int x = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
+  int y = BLOCK_DIM_Y * BLOCK_IDX_Y + THREAD_IDX_Y;
+  if (x >= length_x || y >= length_y)
     return;
 
   switch (op) {
@@ -105,7 +186,7 @@ void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
       STRIDE_1_BINARY_2D(
           stride_ox, stride_oy, stride_lx, stride_ly, stride_rx, stride_ry,
           elementwise_binary_2d<T, Add>(output, left, right, stride_ox, stride_oy, stride_lx,
-                                        stride_ly, stride_rx, stride_ry, n, m));
+                                        stride_ly, stride_rx, stride_ry, x, y));
       break;
     default:
       assert(false);
@@ -113,6 +194,28 @@ void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
 }
 
 extern "C" {
+void __global__ elementwise_unary_1d_f16(half* const output,
+                                         half const* const input,
+                                         int length,
+                                         int const stride_o,
+                                         int const stride_i,
+                                         UnaryOp op) {
+  elementwise_unary_1d_generic<half>(output, input, length, stride_o, stride_i, op);
+}
+
+void __global__ elementwise_unary_2d_f16(half* const output,
+                                         half const* const input,
+                                         int length_x,
+                                         int length_y,
+                                         int const stride_ox,
+                                         int const stride_oy,
+                                         int const stride_ix,
+                                         int const stride_iy,
+                                         UnaryOp op) {
+  elementwise_unary_2d_generic<half>(output, input, length_x, length_y, stride_ox, stride_oy,
+                                     stride_ix, stride_iy, op);
+}
+
 void __global__ elementwise_binary_1d_f16(half* const output,
                                           half const* const left,
                                           half const* const right,
