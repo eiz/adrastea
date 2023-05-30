@@ -25,6 +25,7 @@ extern "C" __global__ void linear(__half* const output,
              __half2float(rhs[c * stride_ry + i * stride_rx]);
     }
     output[r * stride_oy + c * stride_ox] =
-        sum + __half2float(bias[c]) + beta * __half2float(output[r * stride_oy + c * stride_ox]);
+        sum + __half2float(bias ? bias[c] : __half(0.0)) +
+        beta * __half2float(output[r * stride_oy + c * stride_ox]);
   }
 }

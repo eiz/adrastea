@@ -1184,6 +1184,47 @@ struct WhisperKernels {
     )>,
 }
 
+impl WhisperKernels {
+    pub fn linear(
+        &self,
+        mut output: TensorViewMut<f16>,
+        left: TensorView<f16>,
+        right: TensorView<f16>,
+        bias: Option<TensorView<f16>>,
+        beta: f32,
+    ) -> anyhow::Result<()> {
+        self.linear.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                left.as_gpu_ptr(),
+                right.as_gpu_ptr(),
+                bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null()),
+                left.size(-2) as i32,
+                left.size(-1) as i32,
+                right.size(-1) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                left.stride(-1) as i32,
+                left.stride(-2) as i32,
+                right.stride(-1) as i32,
+                right.stride(-2) as i32,
+                beta,
+            ),
+        )?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct WhisperDims {
     pub n_mels: i32,
@@ -1522,36 +1563,33 @@ impl WhisperContext {
                 ),
             )?;
             println!("layer norm {:>+7.4?} {:?}", ln_out, ln_out.layout.strides);
-            let mut query: Tensor<f16> = Tensor::new_hip(&ln_out.layout.dims)?;
-            self.kernels.linear.launch(
-                LaunchParams {
-                    blocks: (
-                        ceil_div(ln_out.size(-1) as u64, 16) as u32,
-                        ceil_div(ln_out.size(-2) as u64, 16) as u32,
-                        1,
-                    ),
-                    threads: (16, 16, 1),
-                    shared_mem: 0,
-                    stream: None,
-                },
-                (
-                    query.as_mut_gpu_ptr(),
-                    ln_out.as_gpu_ptr(),
-                    layer.attn.query.weight.as_gpu_ptr(),
-                    layer.attn.query.bias.as_gpu_ptr(),
-                    ln_out.size(-2) as i32,
-                    ln_out.size(-1) as i32,
-                    layer.attn.query.weight.size(-1) as i32,
-                    query.stride(-1) as i32,
-                    query.stride(-2) as i32,
-                    ln_out.stride(-1) as i32,
-                    ln_out.stride(-2) as i32,
-                    layer.attn.query.weight.stride(-1) as i32,
-                    layer.attn.query.weight.stride(-2) as i32,
-                    0.0,
-                ),
+            let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
+            let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
+            let mut value = Tensor::new_hip(&ln_out.layout.dims)?;
+            self.kernels.linear(
+                query.as_view_mut(),
+                ln_out.as_view(),
+                layer.attn.query.weight.as_view(),
+                Some(layer.attn.query.bias.as_view()),
+                0.0,
             )?;
             println!("query {:?}\n{:>+7.4?}", query.layout, query);
+            self.kernels.linear(
+                key.as_view_mut(),
+                ln_out.as_view(),
+                layer.attn.key.as_view(),
+                None,
+                0.0,
+            )?;
+            println!("key {:?}\n{:>+7.4?}", key.layout, key);
+            self.kernels.linear(
+                value.as_view_mut(),
+                ln_out.as_view(),
+                layer.attn.value.weight.as_view(),
+                Some(layer.attn.value.bias.as_view()),
+                0.0,
+            )?;
+            println!("value {:?}\n{:>+7.4?}", value.layout, value);
             todo!()
         }
         todo!();
