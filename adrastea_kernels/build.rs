@@ -47,7 +47,7 @@ fn main() {
         "embed",
         "embed_uint8",
         "layer_norm",
-        "linear",
+        "matmul",
         "matmul_nt_fp16u8",
         "matmul_qk",
         "matmul_qkv",

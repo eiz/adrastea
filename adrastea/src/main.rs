@@ -1634,11 +1634,11 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
     let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
     let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
-    let module_linear = HipModule::find(capability, adrastea_kernels::linear)?;
+    let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
     let kernels = WhisperKernels {
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
         layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
-        linear: Kernel::new(&module_linear, "linear")?,
+        linear: Kernel::new(&module_matmul, "linear")?,
         elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
     };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
