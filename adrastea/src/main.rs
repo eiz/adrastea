@@ -752,6 +752,35 @@ impl TensorLayout {
         Self::new(&dims, &strides)
     }
 
+    // TODO: poor man's .view(), except it won't tell you if you mess up!
+    pub fn shape_cast(&self, dims: &[isize]) -> Self {
+        let mut mut_dims: SmallVec<[isize; 7]> = dims.into();
+        let mut strides = SmallVec::<[usize; 7]>::new();
+        let mut has_neg_dim = false;
+        for dim in mut_dims.iter_mut() {
+            if *dim < 0 {
+                assert!(!has_neg_dim);
+                has_neg_dim = true;
+                *dim = self.dims.iter().product::<usize>() as isize
+                    / dims.iter().filter(|&&x| x >= 0).product::<isize>();
+            }
+        }
+        assert_eq!(
+            mut_dims.iter().product::<isize>(),
+            self.dims.iter().product::<usize>() as isize
+        );
+        let mut stride = 1;
+        for &dim in mut_dims.iter().rev() {
+            strides.push(stride as usize);
+            stride *= dim;
+        }
+        strides.reverse();
+        Self {
+            dims: mut_dims.iter().map(|x| *x as usize).collect(),
+            strides,
+        }
+    }
+
     pub fn size(&self, dim: isize) -> usize {
         if dim < 0 {
             self.dims[self.dims.len() - (-dim as usize)]
@@ -1044,6 +1073,14 @@ impl<'a, T> TensorView<'a, T> {
         Self {
             ptr: self.ptr,
             layout: self.layout.permute(dim_order),
+            _dead: PhantomData,
+        }
+    }
+
+    pub fn shape_cast(&self, shape: &[isize]) -> Self {
+        Self {
+            ptr: self.ptr,
+            layout: self.layout.shape_cast(shape),
             _dead: PhantomData,
         }
     }
@@ -1590,6 +1627,15 @@ impl WhisperContext {
                 0.0,
             )?;
             println!("value {:?}\n{:>+7.4?}", value.layout, value);
+            let q_view = query
+                .as_view()
+                .shape_cast(&[
+                    query.size(-2) as isize,
+                    self.model.dims.n_audio_head as isize,
+                    -1,
+                ])
+                .permute(&[1, 0, 2]);
+            println!("q_view {:?}\n{:>+7.4?}", q_view.layout, q_view);
             todo!()
         }
         todo!();
@@ -1725,5 +1771,20 @@ mod tests {
             indices.push(i);
         }
         assert_eq!(indices, vec![0, 1, 2, 7, 8, 9]);
+    }
+
+    #[test]
+    fn shape_cast() {
+        let tensor = Tensor::from_vec(
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0,
+            ],
+            TensorLayout::row_major(&[4, 4]),
+        );
+
+        println!("{:?}", tensor);
+        println!("");
+        println!("{:>5?}", tensor.as_view().shape_cast(&[-1, 8]));
     }
 }
