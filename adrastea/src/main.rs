@@ -89,10 +89,8 @@ const COLS: vk::DeviceSize = 8;
 
 unsafe fn vulkan_square() -> anyhow::Result<()> {
     let entry = Entry::load()?;
-    let app_info = vk::ApplicationInfo {
-        api_version: vk::make_api_version(0, 1, 3, 0),
-        ..Default::default()
-    };
+    let app_info =
+        vk::ApplicationInfo { api_version: vk::make_api_version(0, 1, 3, 0), ..Default::default() };
     let instance = entry.create_instance(
         &vk::InstanceCreateInfo::builder().application_info(&app_info),
         //.enabled_layer_names(&[b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8]),
@@ -124,12 +122,10 @@ unsafe fn vulkan_square() -> anyhow::Result<()> {
     if phys_features_12.buffer_device_address == 0 {
         panic!("buffer_device_address missing");
     }
-    let mut enabled_features_13 = vk::PhysicalDeviceVulkan13Features::builder()
-        .synchronization2(true)
-        .build();
-    let mut enabled_features_12 = vk::PhysicalDeviceVulkan12Features::builder()
-        .buffer_device_address(true)
-        .build();
+    let mut enabled_features_13 =
+        vk::PhysicalDeviceVulkan13Features::builder().synchronization2(true).build();
+    let mut enabled_features_12 =
+        vk::PhysicalDeviceVulkan12Features::builder().buffer_device_address(true).build();
     let enabled_features = vk::PhysicalDeviceFeatures2::builder()
         .push_next(&mut enabled_features_13)
         .push_next(&mut enabled_features_12)
@@ -256,12 +252,7 @@ unsafe fn vulkan_square() -> anyhow::Result<()> {
 
     // oh my god fucking do the thing already
     let cmd = bufs[0];
-    dev.begin_command_buffer(
-        cmd,
-        &vk::CommandBufferBeginInfo {
-            ..Default::default()
-        },
-    )?;
+    dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo { ..Default::default() })?;
     dev.cmd_copy_buffer(
         cmd,
         stage_buf,
@@ -395,11 +386,7 @@ impl CudaContext {
         let device = cuda_result_call(|x| cuda.cuDeviceGet(x, device_index))?;
         let context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
         cuda_result_call(|x| cuda.cuCtxPopCurrent_v2(x)).expect("cuCtxPopCurrent_v2 failed");
-        Ok(Self {
-            cuda,
-            device,
-            context,
-        })
+        Ok(Self { cuda, device, context })
     }
 }
 
@@ -590,11 +577,7 @@ unsafe fn cuda_square() -> anyhow::Result<()> {
     let capability = ScopedCudaContext::capability()?;
     let module = CudaModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
     let kernel = cuda_result_call(|x| {
-        cuda.cuModuleGetFunction(
-            x,
-            module.inner,
-            b"square_fp32_16x16\0".as_ptr() as *const i8,
-        )
+        cuda.cuModuleGetFunction(x, module.inner, b"square_fp32_16x16\0".as_ptr() as *const i8)
     })?;
     dbg!(kernel);
     let stream = cuda_result_call(|x| cuda.cuStreamCreate(x, 0))?;
@@ -685,12 +668,7 @@ fn hip_square() -> anyhow::Result<()> {
             shared_mem: 0,
             stream: Some(&stream),
         },
-        (
-            buf.ptr as *mut f32,
-            buf.ptr as *mut f32,
-            COLS as u32,
-            ROWS as u32,
-        ),
+        (buf.ptr as *mut f32, buf.ptr as *mut f32, COLS as u32, ROWS as u32),
     )?;
     stream.sync()?;
     buf.copy_to_slice(&mut stage_buf)?;
@@ -716,10 +694,7 @@ impl TensorLayout {
         assert_ne!(strides.len(), 0);
         assert!(dims.iter().all(|&x| x != 0));
         assert!(strides.iter().all(|&x| x != 0));
-        Self {
-            dims: dims.into(),
-            strides: strides.into(),
-        }
+        Self { dims: dims.into(), strides: strides.into() }
     }
 
     pub fn row_major(dims: &[usize]) -> Self {
@@ -775,10 +750,7 @@ impl TensorLayout {
             stride *= dim;
         }
         strides.reverse();
-        Self {
-            dims: mut_dims.iter().map(|x| *x as usize).collect(),
-            strides,
-        }
+        Self { dims: mut_dims.iter().map(|x| *x as usize).collect(), strides }
     }
 
     pub fn size(&self, dim: isize) -> usize {
@@ -863,11 +835,7 @@ impl<T: Copy + Default> Tensor<T> {
     pub fn new_cpu(dims: &[usize]) -> Self {
         let layout = TensorLayout::row_major(dims);
         let storage = TensorStorage::Cpu(vec![T::default(); layout.largest_address() + 1]);
-        Tensor {
-            storage,
-            layout,
-            _dead: PhantomData,
-        }
+        Tensor { storage, layout, _dead: PhantomData }
     }
 
     pub fn new_hip(dims: &[usize]) -> anyhow::Result<Self> {
@@ -881,20 +849,12 @@ impl<T: Copy + Default> Tensor<T> {
                 simt_hip_sys::library().hipMemset(buf.ptr as *mut _, 0, buf.size)
             })?;
         }
-        Ok(Tensor {
-            storage: TensorStorage::Hip(buf),
-            layout,
-            _dead: PhantomData,
-        })
+        Ok(Tensor { storage: TensorStorage::Hip(buf), layout, _dead: PhantomData })
     }
 
     pub fn from_vec(vec: Vec<T>, layout: TensorLayout) -> Self {
         assert!(vec.len() > layout.largest_address());
-        Tensor {
-            storage: TensorStorage::Cpu(vec),
-            layout,
-            _dead: PhantomData,
-        }
+        Tensor { storage: TensorStorage::Cpu(vec), layout, _dead: PhantomData }
     }
 
     pub fn into_hip(self) -> anyhow::Result<Self> {
@@ -957,12 +917,7 @@ pub struct ElidingRangeIterator {
 
 impl ElidingRangeIterator {
     pub fn new(n: usize, elide_threshold: usize, edge_items: usize) -> Self {
-        Self {
-            end: n,
-            current: 0,
-            threshold: elide_threshold,
-            edge_items,
-        }
+        Self { end: n, current: 0, threshold: elide_threshold, edge_items }
     }
 }
 
@@ -1070,19 +1025,11 @@ impl<'a, T> TensorView<'a, T> {
     }
 
     pub fn permute(&self, dim_order: &[usize]) -> Self {
-        Self {
-            ptr: self.ptr,
-            layout: self.layout.permute(dim_order),
-            _dead: PhantomData,
-        }
+        Self { ptr: self.ptr, layout: self.layout.permute(dim_order), _dead: PhantomData }
     }
 
     pub fn shape_cast(&self, shape: &[isize]) -> Self {
-        Self {
-            ptr: self.ptr,
-            layout: self.layout.shape_cast(shape),
-            _dead: PhantomData,
-        }
+        Self { ptr: self.ptr, layout: self.layout.shape_cast(shape), _dead: PhantomData }
     }
 }
 
@@ -1128,11 +1075,7 @@ impl<'a, T> TensorViewMut<'a, T> {
     }
 
     pub fn permute(&self, dim_order: &[usize]) -> Self {
-        Self {
-            ptr: self.ptr,
-            layout: self.layout.permute(dim_order),
-            _dead: PhantomData,
-        }
+        Self { ptr: self.ptr, layout: self.layout.permute(dim_order), _dead: PhantomData }
     }
 }
 
@@ -1176,19 +1119,8 @@ struct WhisperKernels {
         i32,
         i32,
     )>,
-    layer_norm: Kernel<(
-        *mut f16,
-        *const f16,
-        *const f16,
-        *const f16,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        f32,
-    )>,
+    layer_norm:
+        Kernel<(*mut f16, *const f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
     linear: Kernel<(
         *mut f16,
         *const f16,
@@ -1205,20 +1137,8 @@ struct WhisperKernels {
         i32,
         f32,
     )>,
-    elementwise_binary_2d_f16: Kernel<(
-        *mut f16,
-        *const f16,
-        *const f16,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
-        u32,
-    )>,
+    elementwise_binary_2d_f16:
+        Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
 }
 
 impl WhisperKernels {
@@ -1487,8 +1407,7 @@ impl WhisperContext {
             vec![Complex32::new(0.0, 0.0); self.mel_transform.complex_scratch_size(wave.len())];
         let mut real_scratch = vec![0.0; self.mel_transform.real_scratch_size(wave.len())];
         let mut mel_spec = vec![0.0; self.mel_transform.output_size(wave.len())];
-        self.mel_transform
-            .process(&mut mel_spec, wave, &mut complex_scratch, &mut real_scratch);
+        self.mel_transform.process(&mut mel_spec, wave, &mut complex_scratch, &mut real_scratch);
         let mut mels_half = vec![f16::from_f32(0.0); mel_spec.len()];
         for (l, r) in mels_half.iter_mut().zip(mel_spec.iter()) {
             *l = f16::from_f32(*r);
@@ -1527,10 +1446,8 @@ impl WhisperContext {
                 Conv1dActivation::GELU as i32,
             ),
         )?;
-        let mut conv2_out = Tensor::new_hip(&[
-            self.model.dims.n_audio_state as usize,
-            mels_half.size(-1) / 2,
-        ])?;
+        let mut conv2_out =
+            Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
         self.kernels.conv1d.launch(
             conv_params,
             (
@@ -1629,11 +1546,7 @@ impl WhisperContext {
             println!("value {:?}\n{:>+7.4?}", value.layout, value);
             let q_view = query
                 .as_view()
-                .shape_cast(&[
-                    query.size(-2) as isize,
-                    self.model.dims.n_audio_head as isize,
-                    -1,
-                ])
+                .shape_cast(&[query.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
                 .permute(&[1, 0, 2]);
             println!("q_view {:?}\n{:>+7.4?}", q_view.layout, q_view);
             todo!()
@@ -1653,14 +1566,10 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
 }
 
 fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tensor<f16>> {
-    let pickled_tensor = pickled
-        .tensors
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
-    let mut tensor = Tensor::new_hip_layout(TensorLayout::new(
-        &pickled_tensor.shape,
-        &pickled_tensor.stride,
-    ))?;
+    let pickled_tensor =
+        pickled.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
+    let mut tensor =
+        Tensor::new_hip_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
     match tensor.storage {
         TensorStorage::Hip(ref mut b) => {
             b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
@@ -1727,11 +1636,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "hip" {
         hip_square()?
     } else if args.len() >= 3 && args[1] == "load" {
-        let dict_path = if args.len() >= 4 {
-            Some(args[3].as_str())
-        } else {
-            None
-        };
+        let dict_path = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
         let model = PickledModel::load_file(&args[2], dict_path)?;
         println!("{:#?}", model.tensors);
     } else if args.len() >= 3 && args[1] == "load_whisper" {
