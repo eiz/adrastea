@@ -1068,8 +1068,12 @@ impl<'a, T> TensorViewMut<'a, T> {
         self.layout.stride(dim)
     }
 
-    pub fn permute(&self, dim_order: &[usize]) -> Self {
+    pub fn permute(&mut self, dim_order: &[usize]) -> Self {
         Self { ptr: self.ptr, layout: self.layout.permute(dim_order), _dead: PhantomData }
+    }
+
+    pub fn shape_cast(&mut self, shape: &[isize]) -> Self {
+        Self { ptr: self.ptr, layout: self.layout.shape_cast(shape), _dead: PhantomData }
     }
 }
 
@@ -1123,12 +1127,14 @@ enum MatmulStoreOp {
     IDENTITY = 0,
     GELU_BIAS = 1,
     BETA_GELU_BIAS = 2,
+    BETA_BIAS = 3,
 }
 
 enum MatmulStore<'a> {
     Identity,
     GeluBias(TensorView<'a, f16>),
     BetaGeluBias(f32, TensorView<'a, f16>),
+    BetaBias(f32, TensorView<'a, f16>),
 }
 
 impl<'a> MatmulStore<'a> {
@@ -1137,6 +1143,7 @@ impl<'a> MatmulStore<'a> {
             MatmulStore::Identity => MatmulStoreOp::IDENTITY,
             MatmulStore::GeluBias(_) => MatmulStoreOp::GELU_BIAS,
             MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BETA_GELU_BIAS,
+            MatmulStore::BetaBias(_, _) => MatmulStoreOp::BETA_BIAS,
         }
     }
 }
@@ -1199,6 +1206,7 @@ struct WhisperKernels {
     )>,
     elementwise_binary_2d_f16:
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
+    softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
 }
 
 impl WhisperKernels {
@@ -1236,14 +1244,16 @@ impl WhisperKernels {
         )?;
         Ok(())
     }
+
     pub fn matmul_f16(
-        &self, mut output: TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
+        &self, output: &mut TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
         load_op: MatmulLoad, store_op: MatmulStore,
     ) -> anyhow::Result<()> {
         let bias = match &store_op {
             MatmulStore::Identity => None,
             MatmulStore::GeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
+            MatmulStore::BetaBias(_, bias) => Some(bias),
         };
         let scale = match &load_op {
             MatmulLoad::Identity => 1.0,
@@ -1251,6 +1261,7 @@ impl WhisperKernels {
         };
         let beta = match &store_op {
             MatmulStore::BetaGeluBias(beta, _) => *beta,
+            MatmulStore::BetaBias(beta, _) => *beta,
             _ => 0.0,
         };
         let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
@@ -1287,6 +1298,38 @@ impl WhisperKernels {
                 scale,
                 store_op.lower() as u32,
                 load_op.lower() as u32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub fn softmax_rows(
+        &self, output: TensorViewMut<f16>, input: TensorView<f16>, temperature: f32,
+    ) -> anyhow::Result<()> {
+        todo!()
+        //
+    }
+
+    pub fn softmax_rows_inplace(
+        &self, mut output: TensorViewMut<f16>, temperature: f32,
+    ) -> anyhow::Result<()> {
+        self.softmax_rows.launch(
+            LaunchParams {
+                blocks: (
+                    output.size(-2) as u32,
+                    if output.layout.dims.len() > 2 { output.size(-3) as u32 } else { 1 },
+                    1,
+                ),
+                threads: (256, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                output.as_gpu_ptr(),
+                output.size(-2) as i32,
+                output.size(-1) as i32,
+                temperature,
             ),
         )?;
         Ok(())
@@ -1557,12 +1600,12 @@ impl WhisperContext {
                 Conv1dActivation::GELU as i32,
             ),
         )?;
-        let mut conv2_out =
+        let mut hidden_state =
             Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
         self.kernels.conv1d.launch(
             conv_params,
             (
-                conv2_out.as_mut_gpu_ptr(),
+                hidden_state.as_mut_gpu_ptr(),
                 conv_out.as_gpu_ptr(),
                 self.model.encoder.conv2.weight.as_gpu_ptr(),
                 self.model.encoder.conv2.bias.as_gpu_ptr(),
@@ -1576,12 +1619,12 @@ impl WhisperContext {
                 Conv1dActivation::GELU as i32,
             ),
         )?;
-        let mut conv2_out = conv2_out.as_view_mut().permute(&[1, 0]);
+        let mut hidden_state = hidden_state.as_view_mut().permute(&[1, 0]);
         self.kernels.elementwise_binary_2d_f16.launch(
             LaunchParams {
                 blocks: (
-                    ceil_div(conv2_out.size(-1) as u64, 16) as u32,
-                    ceil_div(conv2_out.size(-2) as u64, 16) as u32,
+                    ceil_div(hidden_state.size(-1) as u64, 16) as u32,
+                    ceil_div(hidden_state.size(-2) as u64, 16) as u32,
                     1,
                 ),
                 threads: (16, 16, 1),
@@ -1589,45 +1632,44 @@ impl WhisperContext {
                 stream: None,
             },
             (
-                conv2_out.as_mut_gpu_ptr(),
-                conv2_out.as_gpu_ptr(),
+                hidden_state.as_mut_gpu_ptr(),
+                hidden_state.as_gpu_ptr(),
                 self.model.encoder.position_embedding.as_gpu_ptr(),
-                conv2_out.size(-1) as i32,
-                conv2_out.size(-2) as i32,
-                conv2_out.stride(-1) as i32,
-                conv2_out.stride(-2) as i32,
-                conv2_out.stride(-1) as i32,
-                conv2_out.stride(-2) as i32,
+                hidden_state.size(-1) as i32,
+                hidden_state.size(-2) as i32,
+                hidden_state.stride(-1) as i32,
+                hidden_state.stride(-2) as i32,
+                hidden_state.stride(-1) as i32,
+                hidden_state.stride(-2) as i32,
                 self.model.encoder.position_embedding.stride(-1) as i32,
                 self.model.encoder.position_embedding.stride(-2) as i32,
                 BinaryOp::ADD as u32,
             ),
         )?;
-        println!("embedded {:?}\n{:>+7.4?}", conv2_out.layout, conv2_out);
+        println!("embedded {:?}\n{:>+7.4?}", hidden_state.layout, hidden_state);
         for layer in &self.model.encoder.layers {
-            let mut ln_out = Tensor::new_hip(&conv2_out.layout.dims)?;
+            let mut ln_out = Tensor::new_hip(&hidden_state.layout.dims)?;
             self.kernels.layer_norm.launch(
                 LaunchParams {
-                    blocks: (conv2_out.size(-2) as u32, 1, 1),
+                    blocks: (hidden_state.size(-2) as u32, 1, 1),
                     threads: (256, 1, 1),
                     shared_mem: 0,
                     stream: None,
                 },
                 (
                     ln_out.as_mut_gpu_ptr(),
-                    conv2_out.as_gpu_ptr(),
+                    hidden_state.as_gpu_ptr(),
                     layer.attn_ln.weight.as_gpu_ptr(),
                     layer.attn_ln.bias.as_gpu_ptr(),
                     ln_out.size(-1) as i32,
                     ln_out.size(-2) as i32,
                     ln_out.stride(-1) as i32,
                     ln_out.stride(-2) as i32,
-                    conv2_out.stride(-1) as i32,
-                    conv2_out.stride(-2) as i32,
+                    hidden_state.stride(-1) as i32,
+                    hidden_state.stride(-2) as i32,
                     1.0e-5,
                 ),
             )?;
-            println!("layer norm {:>+7.4?} {:?}", ln_out, ln_out.layout.strides);
             let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
             let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
             let mut value = Tensor::new_hip(&ln_out.layout.dims)?;
@@ -1638,7 +1680,6 @@ impl WhisperContext {
                 Some(layer.attn.query.bias.as_view()),
                 0.0,
             )?;
-            println!("query {:?}\n{:>+7.4?}", query.layout, query);
             self.kernels.linear(
                 key.as_view_mut(),
                 ln_out.as_view(),
@@ -1646,7 +1687,6 @@ impl WhisperContext {
                 None,
                 0.0,
             )?;
-            println!("key {:?}\n{:>+7.4?}", key.layout, key);
             self.kernels.linear(
                 value.as_view_mut(),
                 ln_out.as_view(),
@@ -1654,27 +1694,20 @@ impl WhisperContext {
                 Some(layer.attn.value.bias.as_view()),
                 0.0,
             )?;
-            println!("value {:?}\n{:>+7.4?}", value.layout, value);
+            let heads = self.model.dims.n_audio_head as isize;
             let q_view = query
                 .as_view()
-                .shape_cast(&[query.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
+                .shape_cast(&[query.size(-2) as isize, heads, -1])
                 .permute(&[1, 0, 2]);
-            let k_view = key
-                .as_view()
-                .shape_cast(&[key.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
-                .permute(&[1, 2, 0]);
+            let k_view =
+                key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
             let v_view = value
                 .as_view()
-                .shape_cast(&[value.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
+                .shape_cast(&[value.size(-2) as isize, heads, -1])
                 .permute(&[1, 0, 2]);
-            println!("q_view {:?}\n{:>+7.4?}", q_view.layout, q_view);
-            let mut qk = Tensor::new_hip(&[
-                self.model.dims.n_audio_head as usize,
-                q_view.size(-2),
-                k_view.size(-1),
-            ])?;
+            let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
             self.kernels.matmul_f16(
-                qk.as_view_mut(),
+                &mut qk.as_view_mut(),
                 q_view,
                 k_view,
                 MatmulLoad::Scale(
@@ -1683,8 +1716,31 @@ impl WhisperContext {
                 ),
                 MatmulStore::Identity,
             )?;
-            println!("qk {:?}\n{:>+7.4?}", qk.layout, qk);
-            todo!()
+            self.kernels.softmax_rows_inplace(qk.as_view_mut(), 1.0)?;
+            let mut qkv = Tensor::new_hip(&[
+                self.model.dims.n_audio_ctx as usize,
+                self.model.dims.n_audio_state as usize,
+            ])?;
+            let mut qkv_view = qkv
+                .as_view_mut()
+                .shape_cast(&[value.size(-2) as isize, heads, -1])
+                .permute(&[1, 0, 2]);
+            self.kernels.matmul_f16(
+                &mut qkv_view,
+                qk.as_view(),
+                v_view,
+                MatmulLoad::Identity,
+                MatmulStore::Identity,
+            )?;
+            self.kernels.matmul_f16(
+                &mut hidden_state,
+                qkv.as_view(),
+                layer.attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
+                MatmulLoad::Identity,
+                MatmulStore::BetaBias(1.0, layer.attn.out.bias.as_view()),
+            )?;
+            println!("hidden state {:?}\n{:>+7.4?}", hidden_state.layout, hidden_state);
+            todo!();
         }
         todo!();
     }
@@ -1725,12 +1781,14 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
     let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
     let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
+    let module_softmax_rows = HipModule::find(capability, adrastea_kernels::softmax_rows)?;
     let kernels = WhisperKernels {
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
         layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
         linear: Kernel::new(&module_matmul, "linear")?,
         matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
         elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
+        softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
     };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     let mut context = WhisperContext::new(Arc::new(model), Arc::new(kernels));

@@ -17,6 +17,7 @@ enum class MatmulStoreOp {
   IDENTITY = 0,
   GELU_BIAS = 1,
   BETA_GELU_BIAS = 2,
+  BETA_BIAS = 3,
 };
 
 template <typename T, typename O = T>
@@ -103,7 +104,7 @@ struct Beta {
                                           int stride_ox,
                                           int stride_oy) const {
     return op(value, output, x, y, stride_ox, stride_oy) +
-           beta * output[x * stride_oy + y * stride_ox];
+           beta * __half2float(output[x * stride_ox + y * stride_oy]);
   }
 
   T beta;
@@ -169,10 +170,32 @@ void __device__ __forceinline__ matmul_generic(T* const output,
                                                MatmulStoreOp store_op = MatmulStoreOp::IDENTITY,
                                                MatmulLoadOp load_op = MatmulLoadOp::IDENTITY) {
   switch (store_op) {
-    case MatmulStoreOp::GELU_BIAS: {
+    case MatmulStoreOp::BETA_GELU_BIAS: {
+      using bias_t = Bias<float, T, HalfToFloat<>>;
+      using gelu_t = Gelu<float, T, bias_t>;
+      using beta_t = Beta<float, T, gelu_t>;
       // TODO: half2float here breaks for other T
-      Gelu<float, T, Bias<float, T, HalfToFloat<>>> store_op{
-          Bias<float, T, HalfToFloat<>>(bias, HalfToFloat<>(Identity<T>()))};
+      beta_t store_op{beta, gelu_t(bias_t(bias, HalfToFloat<>(Identity<T>())))};
+      switch (load_op) {
+        case MatmulLoadOp::IDENTITY:
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
+          break;
+        case MatmulLoadOp::SCALE:
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
+                 Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
+          break;
+        default:
+          assert(false && "nyi");
+      }
+      break;
+    }
+    case MatmulStoreOp::BETA_BIAS: {
+      using bias_t = Bias<float, T, HalfToFloat<>>;
+      using beta_t = Beta<float, T, bias_t>;
+      // TODO: half2float here breaks for other T
+      beta_t store_op{beta, bias_t(bias, HalfToFloat<>(Identity<T>()))};
       switch (load_op) {
         case MatmulLoadOp::IDENTITY:
           matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
