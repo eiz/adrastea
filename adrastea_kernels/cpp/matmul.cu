@@ -118,15 +118,15 @@ void __device__ __forceinline__ matmul(T* output,
                                        int const m,
                                        int const k,
                                        int const n,
-                                       int const stride_oz,
                                        int const stride_ox,
                                        int const stride_oy,
-                                       int const stride_lz,
+                                       int const stride_oz,
                                        int const stride_lx,
                                        int const stride_ly,
-                                       int const stride_rz,
+                                       int const stride_lz,
                                        int const stride_rx,
                                        int const stride_ry,
+                                       int const stride_rz,
                                        InputOperator input_operator = {},
                                        OutputOperator output_operator = {}) {
   int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
@@ -154,15 +154,15 @@ void __device__ __forceinline__ matmul_generic(T* const output,
                                                int const m,
                                                int const k,
                                                int const n,
-                                               int const stride_oz,
                                                int const stride_ox,
                                                int const stride_oy,
-                                               int const stride_lz,
+                                               int const stride_oz,
                                                int const stride_lx,
                                                int const stride_ly,
-                                               int const stride_rz,
+                                               int const stride_lz,
                                                int const stride_rx,
                                                int const stride_ry,
+                                               int const stride_rz,
                                                T const* const bias,
                                                float const beta = 0.0f,
                                                float const scale = 1.0f,
@@ -175,12 +175,29 @@ void __device__ __forceinline__ matmul_generic(T* const output,
           Bias<float, T, HalfToFloat<>>(bias, HalfToFloat<>(Identity<T>()))};
       switch (load_op) {
         case MatmulLoadOp::IDENTITY:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_oz, stride_ox, stride_oy, stride_lz,
-                 stride_lx, stride_ly, stride_rz, stride_rx, stride_ry, {}, store_op);
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
           break;
         case MatmulLoadOp::SCALE:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_oz, stride_ox, stride_oy, stride_lz,
-                 stride_lx, stride_ly, stride_rz, stride_rx, stride_ry,
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
+                 Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
+          break;
+        default:
+          assert(false && "nyi");
+      }
+      break;
+    }
+    case MatmulStoreOp::IDENTITY: {
+      Identity<T> store_op;
+      switch (load_op) {
+        case MatmulLoadOp::IDENTITY:
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
+          break;
+        case MatmulLoadOp::SCALE:
+          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
                  Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
           break;
         default:
@@ -200,22 +217,26 @@ extern "C" __global__ void matmul_f16(__half* const output,
                                       int const m,
                                       int const k,
                                       int const n,
-                                      int const stride_oz,
+
                                       int const stride_ox,
                                       int const stride_oy,
-                                      int const stride_lz,
+                                      int const stride_oz,
+
                                       int const stride_lx,
                                       int const stride_ly,
-                                      int const stride_rz,
+                                      int const stride_lz,
+
                                       int const stride_rx,
                                       int const stride_ry,
+                                      int const stride_rz,
+
                                       __half const* const bias,
                                       float const beta = 0.0f,
                                       float const scale = 1.0f,
                                       MatmulStoreOp store_op = MatmulStoreOp::IDENTITY,
                                       MatmulLoadOp load_op = MatmulLoadOp::IDENTITY) {
-  matmul_generic(output, lhs, rhs, batches, m, k, n, stride_oz, stride_ox, stride_oy, stride_lz,
-                 stride_lx, stride_ly, stride_rz, stride_rx, stride_ry, bias, beta, scale, store_op,
+  matmul_generic(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
+                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, bias, beta, scale, store_op,
                  load_op);
 }
 

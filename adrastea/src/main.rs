@@ -62,8 +62,7 @@ unsafe fn find_compute_queue_family(instance: &ash::Instance, phys_dev: vk::Phys
 }
 
 unsafe fn find_memory_type(
-    reqs: &vk::MemoryRequirements,
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    reqs: &vk::MemoryRequirements, mem_props: &vk::PhysicalDeviceMemoryProperties,
     flags: vk::MemoryPropertyFlags,
 ) -> u32 {
     for i in 0..mem_props.memory_type_count {
@@ -473,9 +472,7 @@ impl CudaBuffer {
     }
 
     pub unsafe fn copy_from(
-        &mut self,
-        src: *const std::ffi::c_void,
-        size: usize,
+        &mut self, src: *const std::ffi::c_void, size: usize,
     ) -> anyhow::Result<()> {
         let ctx = ScopedCudaContext::get()?;
         cuda_call(|| ctx.cuda.cuMemcpyHtoD_v2(self.ptr, src, size))?;
@@ -944,10 +941,7 @@ impl Iterator for ElidingRangeIterator {
 }
 
 fn format_slice_with_layout<T: Debug + Copy>(
-    f: &mut Formatter<'_>,
-    slice: &[T],
-    dim: usize,
-    layout: &TensorLayout,
+    f: &mut Formatter<'_>, slice: &[T], dim: usize, layout: &TensorLayout,
 ) -> std::fmt::Result {
     let dims_right = layout.dims.len() - dim - 1;
     let mut first = true;
@@ -1085,6 +1079,14 @@ impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
     }
 }
 
+pub const WHISPER_SAMPLE_RATE: u32 = 16000;
+pub const WHISPER_N_FFT: usize = 400;
+pub const WHISPER_N_MELS: usize = 80;
+pub const WHISPER_HOP_LENGTH: usize = 160;
+pub const WHISPER_CHUNK_LENGTH: usize = 30;
+pub const WHISPER_CHUNK_FRAMES: usize =
+    WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
+
 #[repr(u32)]
 enum Conv1dActivation {
     None = 0,
@@ -1096,13 +1098,48 @@ enum BinaryOp {
     ADD = 1,
 }
 
-pub const WHISPER_SAMPLE_RATE: u32 = 16000;
-pub const WHISPER_N_FFT: usize = 400;
-pub const WHISPER_N_MELS: usize = 80;
-pub const WHISPER_HOP_LENGTH: usize = 160;
-pub const WHISPER_CHUNK_LENGTH: usize = 30;
-pub const WHISPER_CHUNK_FRAMES: usize =
-    WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
+#[repr(u32)]
+enum MatmulLoadOp {
+    IDENTITY = 0,
+    SCALE = 1,
+}
+
+enum MatmulLoad {
+    Identity,
+    Scale(f32),
+}
+
+impl MatmulLoad {
+    pub fn lower(&self) -> MatmulLoadOp {
+        match self {
+            MatmulLoad::Identity => MatmulLoadOp::IDENTITY,
+            MatmulLoad::Scale(_) => MatmulLoadOp::SCALE,
+        }
+    }
+}
+
+#[repr(u32)]
+enum MatmulStoreOp {
+    IDENTITY = 0,
+    GELU_BIAS = 1,
+    BETA_GELU_BIAS = 2,
+}
+
+enum MatmulStore<'a> {
+    Identity,
+    GeluBias(TensorView<'a, f16>),
+    BetaGeluBias(f32, TensorView<'a, f16>),
+}
+
+impl<'a> MatmulStore<'a> {
+    pub fn lower(&self) -> MatmulStoreOp {
+        match self {
+            MatmulStore::Identity => MatmulStoreOp::IDENTITY,
+            MatmulStore::GeluBias(_) => MatmulStoreOp::GELU_BIAS,
+            MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BETA_GELU_BIAS,
+        }
+    }
+}
 
 struct WhisperKernels {
     conv1d: Kernel<(
@@ -1137,18 +1174,37 @@ struct WhisperKernels {
         i32,
         f32,
     )>,
+    matmul_f16: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        *const f16,
+        f32,
+        f32,
+        u32,
+        u32,
+    )>,
     elementwise_binary_2d_f16:
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
 }
 
 impl WhisperKernels {
     pub fn linear(
-        &self,
-        mut output: TensorViewMut<f16>,
-        left: TensorView<f16>,
-        right: TensorView<f16>,
-        bias: Option<TensorView<f16>>,
-        beta: f32,
+        &self, mut output: TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
+        bias: Option<TensorView<f16>>, beta: f32,
     ) -> anyhow::Result<()> {
         self.linear.launch(
             LaunchParams {
@@ -1176,6 +1232,61 @@ impl WhisperKernels {
                 right.stride(-1) as i32,
                 right.stride(-2) as i32,
                 beta,
+            ),
+        )?;
+        Ok(())
+    }
+    pub fn matmul_f16(
+        &self, mut output: TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
+        load_op: MatmulLoad, store_op: MatmulStore,
+    ) -> anyhow::Result<()> {
+        let bias = match &store_op {
+            MatmulStore::Identity => None,
+            MatmulStore::GeluBias(bias) => Some(bias),
+            MatmulStore::BetaGeluBias(_, bias) => Some(bias),
+        };
+        let scale = match &load_op {
+            MatmulLoad::Identity => 1.0,
+            MatmulLoad::Scale(scale) => *scale,
+        };
+        let beta = match &store_op {
+            MatmulStore::BetaGeluBias(beta, _) => *beta,
+            _ => 0.0,
+        };
+        let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
+        self.matmul_f16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    if output.layout.dims.len() > 2 { output.size(-3) as u32 } else { 1 },
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                left.as_gpu_ptr(),
+                right.as_gpu_ptr(),
+                if output.layout.dims.len() > 2 { output.size(-3) as i32 } else { 1 },
+                left.size(-2) as i32,
+                left.size(-1) as i32,
+                right.size(-1) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                if output.layout.dims.len() > 2 { output.stride(-3) } else { 0 } as i32,
+                left.stride(-1) as i32,
+                left.stride(-2) as i32,
+                if left.layout.dims.len() > 2 { left.stride(-3) } else { 0 } as i32,
+                right.stride(-1) as i32,
+                right.stride(-2) as i32,
+                if right.layout.dims.len() > 2 { right.stride(-3) } else { 0 } as i32,
+                bias_ptr,
+                beta,
+                scale,
+                store_op.lower() as u32,
+                load_op.lower() as u32,
             ),
         )?;
         Ok(())
@@ -1548,7 +1659,31 @@ impl WhisperContext {
                 .as_view()
                 .shape_cast(&[query.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
                 .permute(&[1, 0, 2]);
+            let k_view = key
+                .as_view()
+                .shape_cast(&[key.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
+                .permute(&[1, 2, 0]);
+            let v_view = value
+                .as_view()
+                .shape_cast(&[value.size(-2) as isize, self.model.dims.n_audio_head as isize, -1])
+                .permute(&[1, 0, 2]);
             println!("q_view {:?}\n{:>+7.4?}", q_view.layout, q_view);
+            let mut qk = Tensor::new_hip(&[
+                self.model.dims.n_audio_head as usize,
+                q_view.size(-2),
+                k_view.size(-1),
+            ])?;
+            self.kernels.matmul_f16(
+                qk.as_view_mut(),
+                q_view,
+                k_view,
+                MatmulLoad::Scale(
+                    (self.model.dims.n_audio_state as f32 / self.model.dims.n_audio_head as f32)
+                        .powf(-0.25),
+                ),
+                MatmulStore::Identity,
+            )?;
+            println!("qk {:?}\n{:>+7.4?}", qk.layout, qk);
             todo!()
         }
         todo!();
@@ -1594,6 +1729,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
         layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
         linear: Kernel::new(&module_matmul, "linear")?,
+        matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
         elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
     };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
