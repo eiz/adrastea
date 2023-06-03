@@ -5,6 +5,7 @@ members = ["adrastea", "adrastea_kernels"]
 [patch.crates-io]
 serde-pickle = { git = "https://github.com/eiz/serde-pickle", branch = "mack/persid" }
 half = { git = "https://github.com/eiz/half-rs", branch = "mack/format-options-2.2.1" }
+tiktoken-rs = { git = "https://github.com/eiz/tiktoken-rs", branch = "mack/whisper" }
 
 [profile.release-lto]
 inherits = "release"

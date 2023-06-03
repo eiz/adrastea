@@ -16,10 +16,10 @@
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
-    fmt::{Debug, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
     marker::PhantomData,
 };
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 
 use alloc::sync::Arc;
 use anyhow::bail;
@@ -31,6 +31,7 @@ use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
 use smallvec::SmallVec;
+use tiktoken_rs::CoreBPE;
 
 use crate::pickle::{ModelState, PickledModel};
 
@@ -1207,6 +1208,7 @@ struct WhisperKernels {
     elementwise_binary_2d_f16:
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
+    embed: Kernel<(*mut f16, *const i32, i32, i32, *const f16)>,
 }
 
 impl WhisperKernels {
@@ -1358,6 +1360,29 @@ impl WhisperKernels {
                 output.size(-2) as i32,
                 output.size(-1) as i32,
                 temperature,
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub fn embed(
+        &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        assert_eq!(tokens.size(-1), output.size(-2));
+        assert_eq!(output.size(-1), embed.size(-1));
+        self.embed.launch(
+            LaunchParams {
+                blocks: (ceil_div(output.size(-2) as u64, 1024) as u32, 1, 1),
+                threads: (1024, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                tokens.as_gpu_ptr(),
+                output.size(-1) as i32,
+                output.size(-2) as i32,
+                embed.as_gpu_ptr(),
             ),
         )?;
         Ok(())
@@ -1526,11 +1551,21 @@ impl WhisperTextDecoder {
     }
 }
 
-#[derive(Debug)]
 pub struct WhisperModel {
     dims: WhisperDims,
     encoder: WhisperAudioEncoder,
     decoder: WhisperTextDecoder,
+    tokenizer: CoreBPE,
+}
+
+impl Debug for WhisperModel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WhisperModel")
+            .field("dims", &self.dims)
+            .field("encoder", &self.encoder)
+            .field("decoder", &self.decoder)
+            .finish()
+    }
 }
 
 impl WhisperModel {
@@ -1539,6 +1574,7 @@ impl WhisperModel {
             dims: pickle.metadata.clone(),
             encoder: WhisperAudioEncoder::new(pickle, "encoder")?,
             decoder: WhisperTextDecoder::new(pickle, "decoder")?,
+            tokenizer: tiktoken_rs::whisper()?,
         })
     }
 }
@@ -1563,16 +1599,21 @@ fn sinusoid_position_embedding(dims: &WhisperDims) -> Tensor<f16> {
     pos_embedding
 }
 
+struct WhisperContextCacheLayer {
+    key: Tensor<f16>,
+    value: Tensor<f16>,
+}
+
 struct WhisperContext {
     model: Arc<WhisperModel>,
     kernels: Arc<WhisperKernels>,
     mel_transform: mel::LogMelSpectrogramTransform,
+    kv_cache: Vec<WhisperContextCacheLayer>,
 }
 
 impl WhisperContext {
-    pub fn new(model: Arc<WhisperModel>, kernels: Arc<WhisperKernels>) -> Self {
-        Self {
-            model,
+    pub fn new(model: Arc<WhisperModel>, kernels: Arc<WhisperKernels>) -> anyhow::Result<Self> {
+        Ok(Self {
             kernels,
             mel_transform: mel::LogMelSpectrogramTransform::new(
                 WHISPER_N_FFT,
@@ -1580,7 +1621,124 @@ impl WhisperContext {
                 WHISPER_HOP_LENGTH,
                 WHISPER_SAMPLE_RATE as f32,
             ),
-        }
+            kv_cache: (0..model.dims.n_text_layer)
+                .map(|_| {
+                    Ok(WhisperContextCacheLayer {
+                        key: Tensor::new_hip(&[
+                            model.dims.n_text_ctx as usize,
+                            model.dims.n_text_state as usize,
+                        ])?,
+                        value: Tensor::new_hip(&[
+                            model.dims.n_text_ctx as usize,
+                            model.dims.n_text_state as usize,
+                        ])?,
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            model,
+        })
+    }
+
+    fn process_layer(
+        &self, layer: &WhisperTransformerBlock, hidden_state: &mut TensorViewMut<f16>,
+    ) -> anyhow::Result<()> {
+        let heads = self.model.dims.n_audio_head as isize;
+        let mut ln_out = Tensor::new_hip(&hidden_state.layout.dims)?;
+        let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
+        let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
+        let mut value = Tensor::new_hip(&ln_out.layout.dims)?;
+        let mut mlp_hidden = Tensor::new_hip(&[
+            self.model.dims.n_audio_ctx as usize,
+            self.model.dims.n_audio_state as usize * 4,
+        ])?;
+        let mut qkv = Tensor::new_hip(&[
+            self.model.dims.n_audio_ctx as usize,
+            self.model.dims.n_audio_state as usize,
+        ])?;
+        self.kernels.layer_norm(
+            &mut ln_out.as_view_mut(),
+            hidden_state.as_view(),
+            layer.attn_ln.weight.as_view(),
+            layer.attn_ln.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.kernels.linear(
+            query.as_view_mut(),
+            ln_out.as_view(),
+            layer.attn.query.weight.as_view(),
+            Some(layer.attn.query.bias.as_view()),
+            0.0,
+        )?;
+        self.kernels.linear(
+            key.as_view_mut(),
+            ln_out.as_view(),
+            layer.attn.key.as_view(),
+            None,
+            0.0,
+        )?;
+        self.kernels.linear(
+            value.as_view_mut(),
+            ln_out.as_view(),
+            layer.attn.value.weight.as_view(),
+            Some(layer.attn.value.bias.as_view()),
+            0.0,
+        )?;
+        let q_view =
+            query.as_view().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let k_view =
+            key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
+        let v_view =
+            value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        self.kernels.matmul_f16(
+            &mut qk.as_view_mut(),
+            q_view,
+            k_view,
+            MatmulLoad::Scale(
+                (self.model.dims.n_audio_state as f32 / self.model.dims.n_audio_head as f32)
+                    .powf(-0.25),
+            ),
+            MatmulStore::Identity,
+        )?;
+        self.kernels.softmax_rows_inplace(qk.as_view_mut(), 1.0)?;
+        let mut qkv_view =
+            qkv.as_view_mut().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        self.kernels.matmul_f16(
+            &mut qkv_view,
+            qk.as_view(),
+            v_view,
+            MatmulLoad::Identity,
+            MatmulStore::Identity,
+        )?;
+        self.kernels.matmul_f16(
+            hidden_state,
+            qkv.as_view(),
+            layer.attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
+            MatmulLoad::Identity,
+            MatmulStore::BetaBias(1.0, layer.attn.out.bias.as_view()),
+        )?;
+        self.kernels.layer_norm(
+            &mut ln_out.as_view_mut(),
+            hidden_state.as_view(),
+            layer.mlp_ln.weight.as_view(),
+            layer.mlp_ln.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.kernels.matmul_f16(
+            &mut mlp_hidden.as_view_mut(),
+            ln_out.as_view(),
+            layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
+            MatmulLoad::Identity,
+            MatmulStore::BetaGeluBias(0.0, layer.mlp_0.bias.as_view()),
+        )?;
+        self.kernels.matmul_f16(
+            hidden_state,
+            mlp_hidden.as_view(),
+            layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
+            MatmulLoad::Identity,
+            MatmulStore::BetaBias(1.0, layer.mlp_2.bias.as_view()),
+        )?;
+        Ok(())
     }
 
     pub fn encode(&mut self, wave: &[f32]) -> anyhow::Result<Tensor<f16>> {
@@ -1675,108 +1833,7 @@ impl WhisperContext {
             ),
         )?;
         for layer in &self.model.encoder.layers {
-            let mut ln_out = Tensor::new_hip(&hidden_state.layout.dims)?;
-            self.kernels.layer_norm(
-                &mut ln_out.as_view_mut(),
-                hidden_state.as_view(),
-                layer.attn_ln.weight.as_view(),
-                layer.attn_ln.bias.as_view(),
-                1.0e-5,
-            )?;
-            let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
-            let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
-            let mut value = Tensor::new_hip(&ln_out.layout.dims)?;
-            self.kernels.linear(
-                query.as_view_mut(),
-                ln_out.as_view(),
-                layer.attn.query.weight.as_view(),
-                Some(layer.attn.query.bias.as_view()),
-                0.0,
-            )?;
-            self.kernels.linear(
-                key.as_view_mut(),
-                ln_out.as_view(),
-                layer.attn.key.as_view(),
-                None,
-                0.0,
-            )?;
-            self.kernels.linear(
-                value.as_view_mut(),
-                ln_out.as_view(),
-                layer.attn.value.weight.as_view(),
-                Some(layer.attn.value.bias.as_view()),
-                0.0,
-            )?;
-            let heads = self.model.dims.n_audio_head as isize;
-            let q_view = query
-                .as_view()
-                .shape_cast(&[query.size(-2) as isize, heads, -1])
-                .permute(&[1, 0, 2]);
-            let k_view =
-                key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
-            let v_view = value
-                .as_view()
-                .shape_cast(&[value.size(-2) as isize, heads, -1])
-                .permute(&[1, 0, 2]);
-            let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
-            self.kernels.matmul_f16(
-                &mut qk.as_view_mut(),
-                q_view,
-                k_view,
-                MatmulLoad::Scale(
-                    (self.model.dims.n_audio_state as f32 / self.model.dims.n_audio_head as f32)
-                        .powf(-0.25),
-                ),
-                MatmulStore::Identity,
-            )?;
-            self.kernels.softmax_rows_inplace(qk.as_view_mut(), 1.0)?;
-            let mut qkv = Tensor::new_hip(&[
-                self.model.dims.n_audio_ctx as usize,
-                self.model.dims.n_audio_state as usize,
-            ])?;
-            let mut qkv_view = qkv
-                .as_view_mut()
-                .shape_cast(&[value.size(-2) as isize, heads, -1])
-                .permute(&[1, 0, 2]);
-            self.kernels.matmul_f16(
-                &mut qkv_view,
-                qk.as_view(),
-                v_view,
-                MatmulLoad::Identity,
-                MatmulStore::Identity,
-            )?;
-            self.kernels.matmul_f16(
-                &mut hidden_state,
-                qkv.as_view(),
-                layer.attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
-                MatmulLoad::Identity,
-                MatmulStore::BetaBias(1.0, layer.attn.out.bias.as_view()),
-            )?;
-            self.kernels.layer_norm(
-                &mut ln_out.as_view_mut(),
-                hidden_state.as_view(),
-                layer.mlp_ln.weight.as_view(),
-                layer.mlp_ln.bias.as_view(),
-                1.0e-5,
-            )?;
-            let mut mlp_hidden = Tensor::new_hip(&[
-                self.model.dims.n_audio_ctx as usize,
-                self.model.dims.n_audio_state as usize * 4,
-            ])?;
-            self.kernels.matmul_f16(
-                &mut mlp_hidden.as_view_mut(),
-                ln_out.as_view(),
-                layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
-                MatmulLoad::Identity,
-                MatmulStore::BetaGeluBias(0.0, layer.mlp_0.bias.as_view()),
-            )?;
-            self.kernels.matmul_f16(
-                &mut hidden_state,
-                mlp_hidden.as_view(),
-                layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
-                MatmulLoad::Identity,
-                MatmulStore::BetaBias(1.0, layer.mlp_2.bias.as_view()),
-            )?;
+            self.process_layer(layer, &mut hidden_state)?;
         }
         let mut features = Tensor::new_hip(&[
             self.model.dims.n_audio_ctx as usize,
@@ -1789,8 +1846,24 @@ impl WhisperContext {
             self.model.encoder.ln_post.bias.as_view(),
             1.0e-5,
         )?;
-        println!("features {:?}\n{:>+7.4?}", features.layout, features);
+        //println!("features {:?}\n{:>+7.4?}", features.layout, features);
         Ok(features)
+    }
+
+    // TODO(eiz): just sample tokens for now until irl decode logic is written
+    // need to figure out a proper streaming solution anyway
+    pub fn decode(
+        &mut self, features: TensorView<f16>, tokens: &[i32],
+    ) -> anyhow::Result<Tensor<f16>> {
+        let mut embedded = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_ctx as usize])?;
+        let tokens_gpu = Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()]));
+        self.kernels.embed(
+            &mut embedded.as_view_mut(),
+            tokens_gpu.as_view(),
+            self.model.decoder.token_embedding.as_view(),
+        )?;
+        todo!()
+        //
     }
 }
 
@@ -1830,6 +1903,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
     let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
     let module_softmax_rows = HipModule::find(capability, adrastea_kernels::softmax_rows)?;
+    let module_embed = HipModule::find(capability, adrastea_kernels::embed)?;
     let kernels = WhisperKernels {
         conv1d: Kernel::new(&module_conv1d, "conv1d")?,
         layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
@@ -1837,9 +1911,10 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
         elementwise_binary_2d_f16: Kernel::new(&module_elementwise, "elementwise_binary_2d_f16")?,
         softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
+        embed: Kernel::new(&module_embed, "embed")?,
     };
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
-    let mut context = WhisperContext::new(Arc::new(model), Arc::new(kernels));
+    let mut context = WhisperContext::new(Arc::new(model), Arc::new(kernels))?;
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -1866,7 +1941,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
-    context.encode(wave)?;
+    let _ = context.encode(wave)?;
     Ok(())
 }
 

@@ -15,18 +15,19 @@ adrastea_kernels = { path = "../adrastea_kernels" }
 anyhow = "1.0.71"
 ash = { version = "0.37.2", features = ["loaded"] }
 half = "2"
+matrixmultiply = { version = "0.3.7", features = ["threading"] }
 memmap2 = "0.6.1"
+rustfft = "6.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde-pickle = "1.1.1"
 simt_cuda_sys = "0.1.1"
 simt_hip = "0.1.6"
 simt_hip_sys = "0.1.2"
-zip = { version = "0.6.6", default-features = false, features = [] }
-wav = "1.0.0"
-rustfft = "6.1.0"
-matrixmultiply = { version = "0.3.7", features = ["threading"] }
 smallvec = "1.10.0"
+tiktoken-rs = "0.4.2"
+wav = "1.0.0"
+zip = { version = "0.6.6", default-features = false, features = [] }
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"
