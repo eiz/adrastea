@@ -49,8 +49,6 @@ fn main() {
         "layer_norm",
         "matmul",
         "matmul_nt_fp16u8",
-        "matmul_qk",
-        "matmul_qkv",
         "rms_norm",
         "rotary",
         "silu",

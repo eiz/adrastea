@@ -766,6 +766,34 @@ impl TensorLayout {
             self.strides[dim as usize]
         }
     }
+
+    pub fn skip(&self, sizes: &[isize]) -> (usize, Self) {
+        let mut offset = 0;
+        let mut new_dims = SmallVec::<[usize; 7]>::new();
+        let mut new_strides = SmallVec::<[usize; 7]>::new();
+        for ((dim, stride), size) in self.dims.iter().zip(self.strides.iter()).zip(sizes.iter()) {
+            let size = if *size == -1 { *dim as isize } else { *size };
+            assert!(size <= *dim as isize);
+            assert!(size >= 0);
+            offset += stride * size as usize;
+            new_dims.push(dim - size as usize);
+            new_strides.push(*stride);
+        }
+        (offset, Self::new(&new_dims, &new_strides))
+    }
+
+    pub fn take(&self, sizes: &[isize]) -> Self {
+        let mut new_dims = SmallVec::<[usize; 7]>::new();
+        let mut new_strides = SmallVec::<[usize; 7]>::new();
+        for ((dim, stride), size) in self.dims.iter().zip(self.strides.iter()).zip(sizes.iter()) {
+            let size = if *size == -1 { *dim as isize } else { *size };
+            assert!(size <= *dim as isize);
+            assert!(size >= 0);
+            new_dims.push(size as usize);
+            new_strides.push(*stride);
+        }
+        Self::new(&new_dims, &new_strides)
+    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -1241,6 +1269,38 @@ impl WhisperKernels {
                 stride,
                 padding,
                 activation as i32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    pub fn elementwise_binary_2d_f16_inplace(
+        &self, inout_left: &mut TensorViewMut<f16>, right: TensorView<f16>, op: BinaryOp,
+    ) -> anyhow::Result<()> {
+        self.elementwise_binary_2d_f16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(inout_left.size(-1) as u64, 16) as u32,
+                    ceil_div(inout_left.size(-2) as u64, 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                inout_left.as_mut_gpu_ptr(),
+                inout_left.as_gpu_ptr(),
+                right.as_gpu_ptr(),
+                inout_left.size(-1) as i32,
+                inout_left.size(-2) as i32,
+                inout_left.stride(-1) as i32,
+                inout_left.stride(-2) as i32,
+                inout_left.stride(-1) as i32,
+                inout_left.stride(-2) as i32,
+                right.stride(-1) as i32,
+                right.stride(-2) as i32,
+                op as u32,
             ),
         )?;
         Ok(())
@@ -1820,31 +1880,11 @@ impl WhisperContext {
             Conv1dActivation::GELU,
         )?;
         let mut hidden_state = hidden_state.as_view_mut().permute(&[1, 0]);
-        self.kernels.elementwise_binary_2d_f16.launch(
-            LaunchParams {
-                blocks: (
-                    ceil_div(hidden_state.size(-1) as u64, 16) as u32,
-                    ceil_div(hidden_state.size(-2) as u64, 16) as u32,
-                    1,
-                ),
-                threads: (16, 16, 1),
-                shared_mem: 0,
-                stream: None,
-            },
-            (
-                hidden_state.as_mut_gpu_ptr(),
-                hidden_state.as_gpu_ptr(),
-                self.model.encoder.position_embedding.as_gpu_ptr(),
-                hidden_state.size(-1) as i32,
-                hidden_state.size(-2) as i32,
-                hidden_state.stride(-1) as i32,
-                hidden_state.stride(-2) as i32,
-                hidden_state.stride(-1) as i32,
-                hidden_state.stride(-2) as i32,
-                self.model.encoder.position_embedding.stride(-1) as i32,
-                self.model.encoder.position_embedding.stride(-2) as i32,
-                BinaryOp::ADD as u32,
-            ),
+        // TODO this can be fused
+        self.kernels.elementwise_binary_2d_f16_inplace(
+            &mut hidden_state,
+            self.model.encoder.position_embedding.as_view(),
+            BinaryOp::ADD,
         )?;
         for layer in &self.model.encoder.layers {
             self.process_layer(layer, &mut hidden_state)?;
@@ -1869,14 +1909,23 @@ impl WhisperContext {
     pub fn decode(
         &mut self, features: TensorView<f16>, tokens: &[i32],
     ) -> anyhow::Result<Tensor<f16>> {
-        let mut embedded = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
+        let mut hidden_state =
+            Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
         self.kernels.embed(
-            &mut embedded.as_view_mut(),
+            &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),
             self.model.decoder.token_embedding.as_view(),
         )?;
+        self.kernels.elementwise_binary_2d_f16_inplace(
+            &mut hidden_state.as_view_mut(),
+            self.model.decoder.positional_embedding.as_view(),
+            BinaryOp::ADD,
+        )?;
+        for layer in &self.model.decoder.layers {
+            self.process_layer(layer, &mut hidden_state.as_view_mut())?;
+        }
         todo!()
         //
     }
@@ -1965,7 +2014,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         .map(|x| *x as i32)
         .collect::<Vec<_>>();
     println!("initial tokens {:?}", tokens);
-    println!("features {:>10.4?}", features);
+    println!("features {:>7.4?}", features);
     let _logits = context.decode(features.as_view(), &tokens)?;
     Ok(())
 }
