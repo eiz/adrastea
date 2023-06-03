@@ -13,6 +13,7 @@ struct GeluActivation {
 };
 
 // literally the slowest possible conv1d implementation. reference.
+// TODO fix the strides/dimensions convention on this thing
 template <typename Activation>
 __device__ void conv1d(__half* output,
                        __half* input,

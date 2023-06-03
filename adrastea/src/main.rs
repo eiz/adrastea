@@ -1212,6 +1212,40 @@ struct WhisperKernels {
 }
 
 impl WhisperKernels {
+    pub fn conv1d(
+        &self, output: &mut TensorViewMut<f16>, input: TensorView<f16>, weight: TensorView<f16>,
+        bias: TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.conv1d.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(input.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                input.as_gpu_ptr(),
+                weight.as_gpu_ptr(),
+                bias.as_gpu_ptr(),
+                input.size(-2) as i32,
+                output.size(-2) as i32,
+                kernel_size,
+                input.size(-1) as i32,
+                output.size(-1) as i32,
+                stride,
+                padding,
+                activation as i32,
+            ),
+        )?;
+        Ok(())
+    }
+
     pub fn linear(
         &self, mut output: TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
         bias: Option<TensorView<f16>>, beta: f32,
@@ -1763,51 +1797,27 @@ impl WhisperContext {
         .into_hip()?;
         let mut conv_out =
             Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1)])?;
-        let conv_params = LaunchParams {
-            blocks: (
-                ceil_div(mels_half.size(-1) as u64, 16) as u32,
-                ceil_div(self.model.dims.n_audio_state as u64, 16) as u32,
-                1,
-            ),
-            threads: (16, 16, 1),
-            shared_mem: 0,
-            stream: None,
-        };
-        self.kernels.conv1d.launch(
-            conv_params.clone(),
-            (
-                conv_out.as_mut_gpu_ptr(),
-                mels_half.as_gpu_ptr(),
-                self.model.encoder.conv1.weight.as_gpu_ptr(),
-                self.model.encoder.conv1.bias.as_gpu_ptr(),
-                WHISPER_N_MELS as i32,
-                self.model.dims.n_audio_state,
-                3,
-                mels_half.size(-1) as i32,
-                mels_half.size(-1) as i32,
-                1,
-                1,
-                Conv1dActivation::GELU as i32,
-            ),
-        )?;
         let mut hidden_state =
             Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
-        self.kernels.conv1d.launch(
-            conv_params,
-            (
-                hidden_state.as_mut_gpu_ptr(),
-                conv_out.as_gpu_ptr(),
-                self.model.encoder.conv2.weight.as_gpu_ptr(),
-                self.model.encoder.conv2.bias.as_gpu_ptr(),
-                self.model.dims.n_audio_state,
-                self.model.dims.n_audio_state,
-                3,
-                mels_half.size(-1) as i32,
-                mels_half.size(-1) as i32 / 2,
-                2,
-                1,
-                Conv1dActivation::GELU as i32,
-            ),
+        self.kernels.conv1d(
+            &mut conv_out.as_view_mut(),
+            mels_half.as_view(),
+            self.model.encoder.conv1.weight.as_view(),
+            self.model.encoder.conv1.bias.as_view(),
+            3,
+            1,
+            1,
+            Conv1dActivation::GELU,
+        )?;
+        self.kernels.conv1d(
+            &mut hidden_state.as_view_mut(),
+            conv_out.as_view(),
+            self.model.encoder.conv2.weight.as_view(),
+            self.model.encoder.conv2.bias.as_view(),
+            3,
+            2,
+            1,
+            Conv1dActivation::GELU,
         )?;
         let mut hidden_state = hidden_state.as_view_mut().permute(&[1, 0]);
         self.kernels.elementwise_binary_2d_f16.launch(
@@ -1955,6 +1965,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         .map(|x| *x as i32)
         .collect::<Vec<_>>();
     println!("initial tokens {:?}", tokens);
+    println!("features {:>10.4?}", features);
     let _logits = context.decode(features.as_view(), &tokens)?;
     Ok(())
 }
