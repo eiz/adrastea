@@ -1245,6 +1245,34 @@ impl WhisperKernels {
         Ok(())
     }
 
+    pub fn layer_norm(
+        &self, output: &mut TensorViewMut<f16>, input: TensorView<f16>, weight: TensorView<f16>,
+        bias: TensorView<f16>, eps: f32,
+    ) -> anyhow::Result<()> {
+        self.layer_norm.launch(
+            LaunchParams {
+                blocks: (input.size(-2) as u32, 1, 1),
+                threads: (256, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                input.as_gpu_ptr(),
+                weight.as_gpu_ptr(),
+                bias.as_gpu_ptr(),
+                output.size(-1) as i32,
+                output.size(-2) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                input.stride(-1) as i32,
+                input.stride(-2) as i32,
+                eps,
+            ),
+        )?;
+        Ok(())
+    }
+
     pub fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: TensorView<f16>, right: TensorView<f16>,
         load_op: MatmulLoad, store_op: MatmulStore,
@@ -1646,29 +1674,14 @@ impl WhisperContext {
                 BinaryOp::ADD as u32,
             ),
         )?;
-        println!("embedded {:?}\n{:>+7.4?}", hidden_state.layout, hidden_state);
         for layer in &self.model.encoder.layers {
             let mut ln_out = Tensor::new_hip(&hidden_state.layout.dims)?;
-            self.kernels.layer_norm.launch(
-                LaunchParams {
-                    blocks: (hidden_state.size(-2) as u32, 1, 1),
-                    threads: (256, 1, 1),
-                    shared_mem: 0,
-                    stream: None,
-                },
-                (
-                    ln_out.as_mut_gpu_ptr(),
-                    hidden_state.as_gpu_ptr(),
-                    layer.attn_ln.weight.as_gpu_ptr(),
-                    layer.attn_ln.bias.as_gpu_ptr(),
-                    ln_out.size(-1) as i32,
-                    ln_out.size(-2) as i32,
-                    ln_out.stride(-1) as i32,
-                    ln_out.stride(-2) as i32,
-                    hidden_state.stride(-1) as i32,
-                    hidden_state.stride(-2) as i32,
-                    1.0e-5,
-                ),
+            self.kernels.layer_norm(
+                &mut ln_out.as_view_mut(),
+                hidden_state.as_view(),
+                layer.attn_ln.weight.as_view(),
+                layer.attn_ln.bias.as_view(),
+                1.0e-5,
             )?;
             let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
             let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
@@ -1739,10 +1752,45 @@ impl WhisperContext {
                 MatmulLoad::Identity,
                 MatmulStore::BetaBias(1.0, layer.attn.out.bias.as_view()),
             )?;
-            println!("hidden state {:?}\n{:>+7.4?}", hidden_state.layout, hidden_state);
-            todo!();
+            self.kernels.layer_norm(
+                &mut ln_out.as_view_mut(),
+                hidden_state.as_view(),
+                layer.mlp_ln.weight.as_view(),
+                layer.mlp_ln.bias.as_view(),
+                1.0e-5,
+            )?;
+            let mut mlp_hidden = Tensor::new_hip(&[
+                self.model.dims.n_audio_ctx as usize,
+                self.model.dims.n_audio_state as usize * 4,
+            ])?;
+            self.kernels.matmul_f16(
+                &mut mlp_hidden.as_view_mut(),
+                ln_out.as_view(),
+                layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
+                MatmulLoad::Identity,
+                MatmulStore::BetaGeluBias(0.0, layer.mlp_0.bias.as_view()),
+            )?;
+            self.kernels.matmul_f16(
+                &mut hidden_state,
+                mlp_hidden.as_view(),
+                layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
+                MatmulLoad::Identity,
+                MatmulStore::BetaBias(1.0, layer.mlp_2.bias.as_view()),
+            )?;
         }
-        todo!();
+        let mut features = Tensor::new_hip(&[
+            self.model.dims.n_audio_ctx as usize,
+            self.model.dims.n_audio_state as usize,
+        ])?;
+        self.kernels.layer_norm(
+            &mut features.as_view_mut(),
+            hidden_state.as_view(),
+            self.model.encoder.ln_post.weight.as_view(),
+            self.model.encoder.ln_post.bias.as_view(),
+            1.0e-5,
+        )?;
+        println!("features {:?}\n{:>+7.4?}", features.layout, features);
+        Ok(features)
     }
 }
 
