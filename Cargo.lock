@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "tiktoken-rs"
 version = "0.4.2"
-source = "git+https://github.com/eiz/tiktoken-rs?branch=mack/whisper#5c6d7e2846005f590c3a513f3f3f9a9b2adb32b5"
+source = "git+https://github.com/eiz/tiktoken-rs?branch=mack/whisper#c278c7ba28ff4d2423a3f356a4eec7040c4abc7d"
 dependencies = [
  "anyhow",
  "base64",

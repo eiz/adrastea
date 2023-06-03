@@ -1574,7 +1574,11 @@ impl WhisperModel {
             dims: pickle.metadata.clone(),
             encoder: WhisperAudioEncoder::new(pickle, "encoder")?,
             decoder: WhisperTextDecoder::new(pickle, "decoder")?,
-            tokenizer: tiktoken_rs::whisper()?,
+            tokenizer: if pickle.metadata.n_vocab == 51865 {
+                tiktoken_rs::whisper_multilingual()?
+            } else {
+                tiktoken_rs::whisper_gpt2()?
+            },
         })
     }
 }
@@ -1855,8 +1859,9 @@ impl WhisperContext {
     pub fn decode(
         &mut self, features: TensorView<f16>, tokens: &[i32],
     ) -> anyhow::Result<Tensor<f16>> {
-        let mut embedded = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_ctx as usize])?;
-        let tokens_gpu = Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()]));
+        let mut embedded = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
+        let tokens_gpu =
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
         self.kernels.embed(
             &mut embedded.as_view_mut(),
             tokens_gpu.as_view(),
@@ -1919,6 +1924,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
     println!("{:#?}", header);
+    println!("{:#?}", context.model.dims);
     let data_len = match &data {
         wav::BitDepth::Eight(v) => v.len(),
         wav::BitDepth::Sixteen(v) => v.len(),
@@ -1941,7 +1947,15 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
-    let _ = context.encode(wave)?;
+    let features = context.encode(wave)?;
+    let tokens = (context.model.tokenizer)
+        // language of glorious mother nation
+        .encode_with_special_tokens("<|startoftranscript|><|en|><|transcribe|>")
+        .iter()
+        .map(|x| *x as i32)
+        .collect::<Vec<_>>();
+    println!("initial tokens {:?}", tokens);
+    let _logits = context.decode(features.as_view(), &tokens)?;
     Ok(())
 }
 
