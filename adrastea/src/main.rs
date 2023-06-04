@@ -1121,23 +1121,23 @@ pub const WHISPER_CHUNK_FRAMES: usize =
     WHISPER_CHUNK_LENGTH * WHISPER_SAMPLE_RATE as usize / WHISPER_HOP_LENGTH;
 
 #[repr(u32)]
-enum Conv1dActivation {
+pub enum Conv1dActivation {
     None = 0,
     GELU = 1,
 }
 
 #[repr(u32)]
-enum BinaryOp {
+pub enum BinaryOp {
     ADD = 1,
 }
 
 #[repr(u32)]
-enum MatmulLoadOp {
+pub enum MatmulLoadOp {
     IDENTITY = 0,
     SCALE = 1,
 }
 
-enum MatmulLoad {
+pub enum MatmulLoad {
     Identity,
     Scale(f32),
 }
@@ -1152,14 +1152,14 @@ impl MatmulLoad {
 }
 
 #[repr(u32)]
-enum MatmulStoreOp {
+pub enum MatmulStoreOp {
     IDENTITY = 0,
     GELU_BIAS = 1,
     BETA_GELU_BIAS = 2,
     BETA_BIAS = 3,
 }
 
-enum MatmulStore<'a> {
+pub enum MatmulStore<'a> {
     Identity,
     GeluBias(TensorView<'a, f16>),
     BetaGeluBias(f32, TensorView<'a, f16>),
@@ -1174,6 +1174,39 @@ impl<'a> MatmulStore<'a> {
             MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BETA_GELU_BIAS,
             MatmulStore::BetaBias(_, _) => MatmulStoreOp::BETA_BIAS,
         }
+    }
+}
+
+#[repr(u32)]
+pub enum MatmulMask {
+    None = 0,
+    Causal = 1,
+}
+
+pub struct MatmulOptions<'a> {
+    pub load: MatmulLoad,
+    pub store: MatmulStore<'a>,
+    pub mask: MatmulMask,
+}
+
+impl<'a> MatmulOptions<'a> {
+    pub fn new() -> Self {
+        Self { load: MatmulLoad::Identity, store: MatmulStore::Identity, mask: MatmulMask::None }
+    }
+
+    pub fn load(mut self, load: MatmulLoad) -> Self {
+        self.load = load;
+        self
+    }
+
+    pub fn store(mut self, store: MatmulStore<'a>) -> Self {
+        self.store = store;
+        self
+    }
+
+    pub fn mask(mut self, mask: MatmulMask) -> Self {
+        self.mask = mask;
+        self
     }
 }
 
@@ -1230,6 +1263,7 @@ struct WhisperKernels {
         *const f16,
         f32,
         f32,
+        u32,
         u32,
         u32,
     )>,
@@ -1371,19 +1405,19 @@ impl WhisperKernels {
 
     pub fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
-        load_op: MatmulLoad, store_op: MatmulStore,
+        options: MatmulOptions,
     ) -> anyhow::Result<()> {
-        let bias = match &store_op {
+        let bias = match &options.store {
             MatmulStore::Identity => None,
             MatmulStore::GeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
             MatmulStore::BetaBias(_, bias) => Some(bias),
         };
-        let scale = match &load_op {
+        let scale = match &options.load {
             MatmulLoad::Identity => 1.0,
             MatmulLoad::Scale(scale) => *scale,
         };
-        let beta = match &store_op {
+        let beta = match &options.store {
             MatmulStore::BetaGeluBias(beta, _) => *beta,
             MatmulStore::BetaBias(beta, _) => *beta,
             _ => 0.0,
@@ -1420,8 +1454,9 @@ impl WhisperKernels {
                 bias_ptr,
                 beta,
                 scale,
-                store_op.lower() as u32,
-                load_op.lower() as u32,
+                options.store.lower() as u32,
+                options.load.lower() as u32,
+                options.mask as u32,
             ),
         )?;
         Ok(())
@@ -1749,8 +1784,8 @@ impl WhisperContext {
 
     fn process_layer(
         &self, layer: &WhisperTransformerBlock, hidden_state: &mut TensorViewMut<f16>,
+        features: Option<&TensorView<f16>>, mask: MatmulMask,
     ) -> anyhow::Result<()> {
-        let heads = self.model.dims.n_audio_head as isize;
         let mut ln_out = Tensor::new_hip(&hidden_state.layout.dims)?;
 
         let mut mlp_hidden = Tensor::new_hip(&[
@@ -1764,7 +1799,22 @@ impl WhisperContext {
             &layer.attn_ln.bias.as_view(),
             1.0e-5,
         )?;
-        self.attention(&ln_out.as_view(), layer, heads, hidden_state)?;
+        self.residual_attention(
+            hidden_state,
+            &ln_out.as_view(),
+            &ln_out.as_view(),
+            &layer.attn,
+            mask,
+        )?;
+        if let Some(cross_attn) = layer.cross_attn.as_ref() {
+            self.residual_attention(
+                hidden_state,
+                &ln_out.as_view(),
+                features.expect("encoded features expected for cross attention layer"),
+                cross_attn,
+                MatmulMask::None,
+            )?;
+        }
         self.kernels.layer_norm(
             &mut ln_out.as_view_mut(),
             &hidden_state.as_view(),
@@ -1776,23 +1826,22 @@ impl WhisperContext {
             &mut mlp_hidden.as_view_mut(),
             &ln_out.as_view(),
             &layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
-            MatmulLoad::Identity,
-            MatmulStore::BetaGeluBias(0.0, layer.mlp_0.bias.as_view()),
+            MatmulOptions::new().store(MatmulStore::BetaGeluBias(0.0, layer.mlp_0.bias.as_view())),
         )?;
         self.kernels.matmul_f16(
             hidden_state,
             &mlp_hidden.as_view(),
             &layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
-            MatmulLoad::Identity,
-            MatmulStore::BetaBias(1.0, layer.mlp_2.bias.as_view()),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, layer.mlp_2.bias.as_view())),
         )?;
         Ok(())
     }
 
-    fn attention(
-        &self, ln_out: &TensorView<f16>, layer: &WhisperTransformerBlock, heads: isize,
-        hidden_state: &mut TensorViewMut<f16>,
+    fn residual_attention(
+        &self, hidden_state: &mut TensorViewMut<f16>, ln_out: &TensorView<f16>,
+        kv_input: &TensorView<f16>, attn: &WhisperAttention, mask: MatmulMask,
     ) -> Result<(), anyhow::Error> {
+        let heads = self.model.dims.n_audio_head as isize;
         let mut query = Tensor::new_hip(&ln_out.layout.dims)?;
         let mut key = Tensor::new_hip(&ln_out.layout.dims)?;
         let mut value = Tensor::new_hip(&ln_out.layout.dims)?;
@@ -1803,22 +1852,16 @@ impl WhisperContext {
         self.kernels.linear(
             &mut query.as_view_mut(),
             ln_out,
-            &layer.attn.query.weight.as_view(),
-            Some(&layer.attn.query.bias.as_view()),
+            &attn.query.weight.as_view(),
+            Some(&attn.query.bias.as_view()),
             0.0,
         )?;
-        self.kernels.linear(
-            &mut key.as_view_mut(),
-            ln_out,
-            &layer.attn.key.as_view(),
-            None,
-            0.0,
-        )?;
+        self.kernels.linear(&mut key.as_view_mut(), kv_input, &attn.key.as_view(), None, 0.0)?;
         self.kernels.linear(
             &mut value.as_view_mut(),
-            ln_out,
-            &layer.attn.value.weight.as_view(),
-            Some(&layer.attn.value.bias.as_view()),
+            kv_input,
+            &attn.value.weight.as_view(),
+            Some(&attn.value.bias.as_view()),
             0.0,
         )?;
         let q_view =
@@ -1832,28 +1875,22 @@ impl WhisperContext {
             &mut qk.as_view_mut(),
             &q_view,
             &k_view,
-            MatmulLoad::Scale(
-                (self.model.dims.n_audio_state as f32 / self.model.dims.n_audio_head as f32)
-                    .powf(-0.25),
-            ),
-            MatmulStore::Identity,
+            MatmulOptions::new()
+                .load(MatmulLoad::Scale(
+                    (self.model.dims.n_audio_state as f32 / self.model.dims.n_audio_head as f32)
+                        .powf(-0.25),
+                ))
+                .mask(mask),
         )?;
         self.kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
         let mut qkv_view =
             qkv.as_view_mut().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        self.kernels.matmul_f16(
-            &mut qkv_view,
-            &qk.as_view(),
-            &v_view,
-            MatmulLoad::Identity,
-            MatmulStore::Identity,
-        )?;
+        self.kernels.matmul_f16(&mut qkv_view, &qk.as_view(), &v_view, MatmulOptions::new())?;
         self.kernels.matmul_f16(
             hidden_state,
             &qkv.as_view(),
-            &layer.attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
-            MatmulLoad::Identity,
-            MatmulStore::BetaBias(1.0, layer.attn.out.bias.as_view()),
+            &attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, attn.out.bias.as_view())),
         )?;
         Ok(())
     }
@@ -1906,7 +1943,7 @@ impl WhisperContext {
             BinaryOp::ADD,
         )?;
         for layer in &self.model.encoder.layers {
-            self.process_layer(layer, &mut hidden_state)?;
+            self.process_layer(layer, &mut hidden_state, None, MatmulMask::None)?;
         }
         let mut features = Tensor::new_hip(&[
             self.model.dims.n_audio_ctx as usize,
@@ -1930,6 +1967,7 @@ impl WhisperContext {
     ) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state =
             Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
+        let mut ln_out = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
         self.kernels.embed(
@@ -1943,10 +1981,28 @@ impl WhisperContext {
             BinaryOp::ADD,
         )?;
         for layer in &self.model.decoder.layers {
-            self.process_layer(layer, &mut hidden_state.as_view_mut())?;
+            self.process_layer(
+                layer,
+                &mut hidden_state.as_view_mut(),
+                Some(&features),
+                MatmulMask::Causal,
+            )?;
         }
-        todo!()
-        //
+        self.kernels.layer_norm(
+            &mut ln_out.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.model.decoder.ln.weight.as_view(),
+            &self.model.decoder.ln.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.kernels.matmul_f16(
+            &mut hidden_state.as_view_mut(),
+            &ln_out.as_view(),
+            &self.model.decoder.token_embedding.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        println!("logits {:>7.4?}", hidden_state);
+        Ok(hidden_state)
     }
 }
 

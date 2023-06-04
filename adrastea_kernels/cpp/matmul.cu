@@ -2,13 +2,19 @@
 
 #include <cassert>
 
+// A matrix multiply operator which supports various handy op fusions.
+// TODO: this is currently the fully unoptimized version. implement loop
+// tiling, shared memory, double buffering / async load, warp mma instructions.
+
 // input operators:
 //  - half to float
 //  - scale by constant
 // output operators:
 //  - gelu activation
-//  - bias add
+//  - (row-wise) bias add
 //  - beta
+// masking:
+//  - causal (upper right triangle of the output is replaced with -inf)
 //
 // order is uhhh beta(gelu(bias))
 
@@ -19,6 +25,7 @@ enum class MatmulStoreOp {
   BETA_GELU_BIAS = 2,
   BETA_BIAS = 3,
 };
+enum class MatmulMaskOp { NONE = 0, CAUSAL = 1 };
 
 template <typename T, typename O = T>
 struct Identity {
@@ -111,25 +118,31 @@ struct Beta {
   Operator op;
 };
 
-template <typename T, typename InputOperator = Identity<T>, typename OutputOperator = Identity<T>>
-void __device__ __forceinline__ matmul(T* output,
-                                       T const* lhs,
-                                       T const* rhs,
-                                       int const batches,
-                                       int const m,
-                                       int const k,
-                                       int const n,
-                                       int const stride_ox,
-                                       int const stride_oy,
-                                       int const stride_oz,
-                                       int const stride_lx,
-                                       int const stride_ly,
-                                       int const stride_lz,
-                                       int const stride_rx,
-                                       int const stride_ry,
-                                       int const stride_rz,
-                                       InputOperator input_operator = {},
-                                       OutputOperator output_operator = {}) {
+struct NoMask {
+  __device__ __forceinline__ bool operator()(int x, int y) const { return false; }
+};
+
+struct CausalMask {
+  __device__ __forceinline__ bool operator()(int x, int y) const { return x > y; }
+};
+
+#define MATMUL_COMMON_PARAMS(T)                                                                    \
+  T *output, T const *lhs, T const *rhs, int const batches, int const m, int const k, int const n, \
+      int const stride_ox, int const stride_oy, int const stride_oz, int const stride_lx,          \
+      int const stride_ly, int const stride_lz, int const stride_rx, int const stride_ry,          \
+      int const stride_rz
+#define MATMUL_COMMON_ARGS()                                                                 \
+  output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx, stride_ly, \
+      stride_lz, stride_rx, stride_ry, stride_rz
+
+template <typename T,
+          typename InputOperator = Identity<T>,
+          typename OutputOperator = Identity<T>,
+          typename MaskOperator = NoMask>
+void __device__ matmul(MATMUL_COMMON_PARAMS(T),
+                       InputOperator input_operator = {},
+                       OutputOperator output_operator = {},
+                       MaskOperator mask_operator = {}) {
   int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
   int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
   int b = BLOCK_IDX_Z * BLOCK_DIM_Z + THREAD_IDX_Z;
@@ -137,6 +150,11 @@ void __device__ __forceinline__ matmul(T* output,
   lhs += b * stride_lz;
   rhs += b * stride_rz;
   if (r < m && c < n) {
+    if (mask_operator(c, r)) {
+      output[r * stride_oy + c * stride_ox] = -CUDART_INF_F;
+      return;
+    }
+
     T sum = 0;
     for (int i = 0; i < k; i++) {
       sum += input_operator(lhs[r * stride_ly + i * stride_lx]) *
@@ -147,120 +165,83 @@ void __device__ __forceinline__ matmul(T* output,
   }
 }
 
+#define MATMUL_GENERIC_MASK_OP()                                     \
+  switch (mask) {                                                    \
+    case MatmulMaskOp::NONE: {                                       \
+      matmul(MATMUL_COMMON_ARGS(), load_op, store_op, NoMask());     \
+      break;                                                         \
+    }                                                                \
+    case MatmulMaskOp::CAUSAL: {                                     \
+      matmul(MATMUL_COMMON_ARGS(), load_op, store_op, CausalMask()); \
+      break;                                                         \
+    }                                                                \
+    default:                                                         \
+      assert(false && "nyi");                                        \
+  }
+
+#define MATMUL_GENERIC_LOAD_OP()                                                       \
+  switch (load) {                                                                      \
+    case MatmulLoadOp::IDENTITY: {                                                     \
+      Identity<T> load_op;                                                             \
+      MATMUL_GENERIC_MASK_OP()                                                         \
+      break;                                                                           \
+    }                                                                                  \
+    case MatmulLoadOp::SCALE: {                                                        \
+      auto load_op = Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())); \
+      MATMUL_GENERIC_MASK_OP()                                                         \
+      break;                                                                           \
+    }                                                                                  \
+    default:                                                                           \
+      assert(false && "nyi");                                                          \
+      break;                                                                           \
+  }
+
+// TODO: half2float here breaks for other T
+#define MATMUL_GENERIC_STORE_OP()                                                \
+  switch (store) {                                                               \
+    case MatmulStoreOp::IDENTITY: {                                              \
+      Identity<T> store_op;                                                      \
+      MATMUL_GENERIC_LOAD_OP()                                                   \
+      break;                                                                     \
+    }                                                                            \
+    case MatmulStoreOp::BETA_GELU_BIAS: {                                        \
+      using bias_t = Bias<float, T, HalfToFloat<>>;                              \
+      using gelu_t = Gelu<float, T, bias_t>;                                     \
+      using beta_t = Beta<float, T, gelu_t>;                                     \
+      beta_t store_op{beta, gelu_t(bias_t(bias, HalfToFloat<>(Identity<T>())))}; \
+      MATMUL_GENERIC_LOAD_OP()                                                   \
+      break;                                                                     \
+    }                                                                            \
+    case MatmulStoreOp::BETA_BIAS: {                                             \
+      using bias_t = Bias<float, T, HalfToFloat<>>;                              \
+      using beta_t = Beta<float, T, bias_t>;                                     \
+      beta_t store_op{beta, bias_t(bias, HalfToFloat<>(Identity<T>()))};         \
+      MATMUL_GENERIC_LOAD_OP()                                                   \
+      break;                                                                     \
+    }                                                                            \
+    default:                                                                     \
+      assert(false && "nyi");                                                    \
+  }
+
 template <typename T>
-void __device__ __forceinline__ matmul_generic(T* const output,
-                                               T const* const lhs,
-                                               T const* const rhs,
-                                               int const batches,
-                                               int const m,
-                                               int const k,
-                                               int const n,
-                                               int const stride_ox,
-                                               int const stride_oy,
-                                               int const stride_oz,
-                                               int const stride_lx,
-                                               int const stride_ly,
-                                               int const stride_lz,
-                                               int const stride_rx,
-                                               int const stride_ry,
-                                               int const stride_rz,
+void __device__ __forceinline__ matmul_generic(MATMUL_COMMON_PARAMS(T),
                                                T const* const bias,
                                                float const beta = 0.0f,
                                                float const scale = 1.0f,
-                                               MatmulStoreOp store_op = MatmulStoreOp::IDENTITY,
-                                               MatmulLoadOp load_op = MatmulLoadOp::IDENTITY) {
-  switch (store_op) {
-    case MatmulStoreOp::BETA_GELU_BIAS: {
-      using bias_t = Bias<float, T, HalfToFloat<>>;
-      using gelu_t = Gelu<float, T, bias_t>;
-      using beta_t = Beta<float, T, gelu_t>;
-      // TODO: half2float here breaks for other T
-      beta_t store_op{beta, gelu_t(bias_t(bias, HalfToFloat<>(Identity<T>())))};
-      switch (load_op) {
-        case MatmulLoadOp::IDENTITY:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
-          break;
-        case MatmulLoadOp::SCALE:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
-                 Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
-          break;
-        default:
-          assert(false && "nyi");
-      }
-      break;
-    }
-    case MatmulStoreOp::BETA_BIAS: {
-      using bias_t = Bias<float, T, HalfToFloat<>>;
-      using beta_t = Beta<float, T, bias_t>;
-      // TODO: half2float here breaks for other T
-      beta_t store_op{beta, bias_t(bias, HalfToFloat<>(Identity<T>()))};
-      switch (load_op) {
-        case MatmulLoadOp::IDENTITY:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
-          break;
-        case MatmulLoadOp::SCALE:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
-                 Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
-          break;
-        default:
-          assert(false && "nyi");
-      }
-      break;
-    }
-    case MatmulStoreOp::IDENTITY: {
-      Identity<T> store_op;
-      switch (load_op) {
-        case MatmulLoadOp::IDENTITY:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, {}, store_op);
-          break;
-        case MatmulLoadOp::SCALE:
-          matmul(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz,
-                 Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())), store_op);
-          break;
-        default:
-          assert(false && "nyi");
-      }
-      break;
-    }
-    default:
-      assert(false && "nyi");
-  }
+                                               MatmulStoreOp store = MatmulStoreOp::IDENTITY,
+                                               MatmulLoadOp load = MatmulLoadOp::IDENTITY,
+                                               MatmulMaskOp mask = MatmulMaskOp::NONE) {
+  MATMUL_GENERIC_STORE_OP()
 }
 
-extern "C" __global__ void matmul_f16(__half* const output,
-                                      __half const* const lhs,
-                                      __half const* const rhs,
-                                      int const batches,
-                                      int const m,
-                                      int const k,
-                                      int const n,
-
-                                      int const stride_ox,
-                                      int const stride_oy,
-                                      int const stride_oz,
-
-                                      int const stride_lx,
-                                      int const stride_ly,
-                                      int const stride_lz,
-
-                                      int const stride_rx,
-                                      int const stride_ry,
-                                      int const stride_rz,
-
+extern "C" __global__ void matmul_f16(MATMUL_COMMON_PARAMS(__half),
                                       __half const* const bias,
                                       float const beta = 0.0f,
                                       float const scale = 1.0f,
-                                      MatmulStoreOp store_op = MatmulStoreOp::IDENTITY,
-                                      MatmulLoadOp load_op = MatmulLoadOp::IDENTITY) {
-  matmul_generic(output, lhs, rhs, batches, m, k, n, stride_ox, stride_oy, stride_oz, stride_lx,
-                 stride_ly, stride_lz, stride_rx, stride_ry, stride_rz, bias, beta, scale, store_op,
-                 load_op);
+                                      MatmulStoreOp store = MatmulStoreOp::IDENTITY,
+                                      MatmulLoadOp load = MatmulLoadOp::IDENTITY,
+                                      MatmulMaskOp mask = MatmulMaskOp::NONE) {
+  matmul_generic(MATMUL_COMMON_ARGS(), bias, beta, scale, store, load, mask);
 }
 
 // output = lhs * rhs^T + bias + output * beta; lhs = (m, k); rhs = (n, k); output = (m, n)
