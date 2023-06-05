@@ -1,3 +1,18 @@
+/*
+ * This file is part of Adrastea.
+ *
+ * Adrastea is free software: you can redistribute it and/or modify it under the
+ * terms of the GNU Affero General Public License as published by the Free Software
+ * Foundation, version 3.
+ *
+ * Adrastea is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+ * PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License along
+ * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 pub struct ElidingRangeIterator {
     end: usize,
     current: usize,
@@ -31,4 +46,8 @@ impl Iterator for ElidingRangeIterator {
             None
         }
     }
+}
+
+pub fn ceil_div(a: u64, b: u64) -> u64 {
+    (a + b - 1) / b
 }
