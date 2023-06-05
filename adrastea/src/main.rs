@@ -16,8 +16,7 @@
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
-    fmt::{self, Debug, Display, Formatter},
-    marker::PhantomData,
+    fmt::{self, Debug, Formatter},
 };
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 
@@ -30,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use simt_hip::{
     HipBuffer, HipDevice, HipModule, HipPhysicalDevice, HipStream, Kernel, LaunchParams,
 };
-use smallvec::SmallVec;
 use tensor::TensorStorage;
 use tiktoken_rs::CoreBPE;
 
@@ -696,18 +694,18 @@ pub const WHISPER_CHUNK_FRAMES: usize =
 #[repr(u32)]
 pub enum Conv1dActivation {
     None = 0,
-    GELU = 1,
+    Gelu = 1,
 }
 
 #[repr(u32)]
 pub enum BinaryOp {
-    ADD = 1,
+    Add = 1,
 }
 
 #[repr(u32)]
 pub enum MatmulLoadOp {
-    IDENTITY = 0,
-    SCALE = 1,
+    Identity = 0,
+    Scale = 1,
 }
 
 pub enum MatmulLoad {
@@ -718,18 +716,18 @@ pub enum MatmulLoad {
 impl MatmulLoad {
     pub fn lower(&self) -> MatmulLoadOp {
         match self {
-            MatmulLoad::Identity => MatmulLoadOp::IDENTITY,
-            MatmulLoad::Scale(_) => MatmulLoadOp::SCALE,
+            MatmulLoad::Identity => MatmulLoadOp::Identity,
+            MatmulLoad::Scale(_) => MatmulLoadOp::Scale,
         }
     }
 }
 
 #[repr(u32)]
 pub enum MatmulStoreOp {
-    IDENTITY = 0,
-    GELU_BIAS = 1,
-    BETA_GELU_BIAS = 2,
-    BETA_BIAS = 3,
+    Identity = 0,
+    GeluBias = 1,
+    BetaGeluBias = 2,
+    BetaBias = 3,
 }
 
 pub enum MatmulStore<'a> {
@@ -742,10 +740,10 @@ pub enum MatmulStore<'a> {
 impl<'a> MatmulStore<'a> {
     pub fn lower(&self) -> MatmulStoreOp {
         match self {
-            MatmulStore::Identity => MatmulStoreOp::IDENTITY,
-            MatmulStore::GeluBias(_) => MatmulStoreOp::GELU_BIAS,
-            MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BETA_GELU_BIAS,
-            MatmulStore::BetaBias(_, _) => MatmulStoreOp::BETA_BIAS,
+            MatmulStore::Identity => MatmulStoreOp::Identity,
+            MatmulStore::GeluBias(_) => MatmulStoreOp::GeluBias,
+            MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BetaGeluBias,
+            MatmulStore::BetaBias(_, _) => MatmulStoreOp::BetaBias,
         }
     }
 }
@@ -986,13 +984,6 @@ impl WhisperKernels {
             ),
         )?;
         Ok(())
-    }
-
-    pub fn softmax_rows(
-        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, temperature: f32,
-    ) -> anyhow::Result<()> {
-        todo!()
-        //
     }
 
     pub fn softmax_rows_inplace(
@@ -1462,7 +1453,7 @@ impl WhisperContext {
             3,
             1,
             1,
-            Conv1dActivation::GELU,
+            Conv1dActivation::Gelu,
         )?;
         self.kernels.conv1d(
             &mut hidden_state.as_view_mut(),
@@ -1472,14 +1463,14 @@ impl WhisperContext {
             3,
             2,
             1,
-            Conv1dActivation::GELU,
+            Conv1dActivation::Gelu,
         )?;
         let mut hidden_state = hidden_state.as_view_mut().permute(&[1, 0]);
         // TODO this can be fused
         self.kernels.elementwise_binary_2d_f16_inplace(
             &mut hidden_state,
             &self.model.encoder.position_embedding.as_view(),
-            BinaryOp::ADD,
+            BinaryOp::Add,
         )?;
         for layer in &self.model.encoder.layers {
             self.process_layer(layer, &mut hidden_state, None, MatmulMask::None)?;
@@ -1517,7 +1508,7 @@ impl WhisperContext {
         self.kernels.elementwise_binary_2d_f16_inplace(
             &mut hidden_state.as_view_mut(),
             &self.model.decoder.positional_embedding.as_view(),
-            BinaryOp::ADD,
+            BinaryOp::Add,
         )?;
         for layer in &self.model.decoder.layers {
             self.process_layer(
