@@ -27,6 +27,13 @@ enum class MatmulStoreOp {
 };
 enum class MatmulMaskOp { NONE = 0, CAUSAL = 1 };
 
+__device__ __forceinline__ float to_float(float value) {
+  return value;
+}
+__device__ __forceinline__ float to_float(__half value) {
+  return __half2float(value);
+}
+
 template <typename T, typename O = T>
 struct Identity {
  public:
@@ -143,25 +150,24 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
                        InputOperator input_operator = {},
                        OutputOperator output_operator = {},
                        MaskOperator mask_operator = {}) {
-  int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
-  int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
+  int x = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
+  int y = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
   int b = BLOCK_IDX_Z * BLOCK_DIM_Z + THREAD_IDX_Z;
   output += b * stride_oz;
   lhs += b * stride_lz;
   rhs += b * stride_rz;
-  if (r < m && c < n) {
-    if (mask_operator(c, r)) {
-      output[r * stride_oy + c * stride_ox] = -CUDART_INF_F;
+  if (y < m && x < n) {
+    if (mask_operator(x, y)) {
+      output[y * stride_oy + x * stride_ox] = -CUDART_INF_F;
       return;
     }
-
-    T sum = 0;
+    float sum = 0;
     for (int i = 0; i < k; i++) {
-      sum += input_operator(lhs[r * stride_ly + i * stride_lx]) *
-             input_operator(rhs[i * stride_ry + c * stride_rx]);
+      sum += to_float(input_operator(lhs[y * stride_ly + i * stride_lx]) *
+                      input_operator(rhs[i * stride_ry + x * stride_rx]));
     }
-    output[r * stride_oy + c * stride_ox] =
-        output_operator(sum, output, c, r, stride_ox, stride_oy);
+    output[y * stride_oy + x * stride_ox] =
+        output_operator(sum, output, x, y, stride_ox, stride_oy);
   }
 }
 
@@ -223,17 +229,6 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
       assert(false && "nyi");                                                    \
   }
 
-template <typename T>
-void __device__ __forceinline__ matmul_generic(MATMUL_COMMON_PARAMS(T),
-                                               T const* const bias,
-                                               float const beta = 0.0f,
-                                               float const scale = 1.0f,
-                                               MatmulStoreOp store = MatmulStoreOp::IDENTITY,
-                                               MatmulLoadOp load = MatmulLoadOp::IDENTITY,
-                                               MatmulMaskOp mask = MatmulMaskOp::NONE) {
-  MATMUL_GENERIC_STORE_OP()
-}
-
 extern "C" __global__ void matmul_f16(MATMUL_COMMON_PARAMS(__half),
                                       __half const* const bias,
                                       float const beta = 0.0f,
@@ -241,35 +236,6 @@ extern "C" __global__ void matmul_f16(MATMUL_COMMON_PARAMS(__half),
                                       MatmulStoreOp store = MatmulStoreOp::IDENTITY,
                                       MatmulLoadOp load = MatmulLoadOp::IDENTITY,
                                       MatmulMaskOp mask = MatmulMaskOp::NONE) {
-  matmul_generic(MATMUL_COMMON_ARGS(), bias, beta, scale, store, load, mask);
-}
-
-// output = lhs * rhs^T + bias + output * beta; lhs = (m, k); rhs = (n, k); output = (m, n)
-// this only exists as a trivial reference point for optimized kernels.
-extern "C" __global__ void linear(__half* const output,
-                                  __half const* const lhs,
-                                  __half const* const rhs,
-                                  __half const* const bias,
-                                  int const m,
-                                  int const k,
-                                  int const n,
-                                  int const stride_ox,
-                                  int const stride_oy,
-                                  int const stride_lx,
-                                  int const stride_ly,
-                                  int const stride_rx,
-                                  int const stride_ry,
-                                  float const beta = 0.0f) {
-  int c = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
-  int r = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
-  if (r < m && c < n) {
-    float sum = 0;
-    for (int i = 0; i < k; i++) {
-      sum += __half2float(lhs[r * stride_ly + i * stride_lx]) *
-             __half2float(rhs[c * stride_ry + i * stride_rx]);
-    }
-    output[r * stride_oy + c * stride_ox] =
-        sum + __half2float(bias ? bias[c] : __half(0.0)) +
-        beta * __half2float(output[r * stride_oy + c * stride_ox]);
-  }
+  using T = __half;
+  MATMUL_GENERIC_STORE_OP()
 }
