@@ -155,6 +155,36 @@ pub enum TensorStorage<T> {
     Hip(HipBuffer),
 }
 
+impl<T> TensorStorage<T> {
+    pub fn as_cpu(&self) -> &Vec<T> {
+        match self {
+            TensorStorage::Cpu(v) => v,
+            _ => panic!("tensor storage not resident on cpu"),
+        }
+    }
+
+    pub fn as_mut_cpu(&mut self) -> &mut Vec<T> {
+        match self {
+            TensorStorage::Cpu(v) => v,
+            _ => panic!("tensor storage not resident on cpu"),
+        }
+    }
+
+    pub fn as_hip(&self) -> &HipBuffer {
+        match self {
+            TensorStorage::Hip(b) => b,
+            _ => panic!("tensor storage not resident on gpu"),
+        }
+    }
+
+    pub fn as_mut_hip(&mut self) -> &mut HipBuffer {
+        match self {
+            TensorStorage::Hip(b) => b,
+            _ => panic!("tensor storage not resident on gpu"),
+        }
+    }
+}
+
 pub struct Tensor<T> {
     storage: TensorStorage<T>,
     layout: TensorLayout,
@@ -223,6 +253,21 @@ impl<T: Copy + Default> Tensor<T> {
                 })
             }
             TensorStorage::Hip(_) => Ok(self),
+        }
+    }
+
+    pub fn into_cpu(self) -> anyhow::Result<Self> {
+        match self.storage {
+            TensorStorage::Cpu(_) => Ok(self),
+            TensorStorage::Hip(b) => {
+                let mut v = vec![T::default(); b.size / std::mem::size_of::<T>()];
+                b.copy_to_slice(&mut v)?;
+                Ok(Tensor {
+                    storage: TensorStorage::Cpu(v),
+                    layout: self.layout,
+                    _dead: PhantomData,
+                })
+            }
         }
     }
 

@@ -1612,16 +1612,33 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
     let features = context.encode(wave)?;
-    let tokens = (context.model.tokenizer)
+    let mut tokens = (context.model.tokenizer)
         // language of glorious mother nation
         .encode_with_special_tokens("<|startoftranscript|><|en|><|transcribe|>")
         .iter()
         .map(|x| *x as i32)
         .collect::<Vec<_>>();
+    let end_of_text = context.model.tokenizer.encode_with_special_tokens("<|endoftext|>")[0];
     println!("initial tokens {:?}", tokens);
     println!("features {:>7.4?}", features);
-    let logits = context.decode(features.as_view(), &tokens)?;
-    println!("logits {:>7.4?}", logits);
+    for _i in 0..50 {
+        let logits = context.decode(features.as_view(), &tokens)?.into_cpu()?;
+        let logits_vec = logits.storage().as_cpu();
+        let last_logits = &logits_vec[logits_vec.len() - context.model.dims.n_vocab as usize..];
+        let argmax = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        println!("token {:>7.4?}", argmax);
+        tokens.push(argmax as i32);
+        let detok = context.model.tokenizer.decode(tokens.iter().map(|x| *x as usize).collect());
+        println!("text {:?}", detok);
+        if argmax as usize == end_of_text {
+            break;
+        }
+    }
     Ok(())
 }
 
