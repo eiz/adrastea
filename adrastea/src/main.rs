@@ -1611,7 +1611,9 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let mut wave = wav2float_mono(&data);
     wave.extend(std::iter::repeat(0.0).take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH));
     let wave = &wave[0..WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH];
+    let start = Instant::now();
     let features = context.encode(wave)?;
+    println!("encode time: {:?}", start.elapsed());
     let mut tokens = (context.model.tokenizer)
         // language of glorious mother nation
         .encode_with_special_tokens("<|startoftranscript|><|en|><|transcribe|>")
@@ -1621,6 +1623,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let end_of_text = context.model.tokenizer.encode_with_special_tokens("<|endoftext|>")[0];
     println!("initial tokens {:?}", tokens);
     println!("features {:>7.4?}", features);
+    let start = Instant::now();
     for _i in 0..50 {
         let logits = context.decode(features.as_view(), &tokens)?.into_cpu()?;
         let logits_vec = logits.storage().as_cpu();
@@ -1639,6 +1642,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
             break;
         }
     }
+    println!("decode time: {:?}", start.elapsed());
     Ok(())
 }
 
