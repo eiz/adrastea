@@ -780,19 +780,46 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
-fn bench<F: FnMut() -> anyhow::Result<()>>(name: &str, mut f: F) -> anyhow::Result<()> {
+fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::Result<()> {
     let mut runs = vec![];
     let test_start = Instant::now();
-    f()?; // warmup
+    let _ = f()?; // warmup
     while test_start.elapsed().as_secs_f32() < 10.0 && runs.len() < 100000 {
         let start = Instant::now();
-        f()?;
-        runs.push(start.elapsed());
+        let ops = f()?;
+        runs.push((ops, start.elapsed()));
     }
-    let avg = runs.iter().sum::<Duration>() / runs.len() as u32;
-    let min = runs.iter().min().unwrap();
-    let max = runs.iter().max().unwrap();
-    println!("{}: avg {:?} min {:?} max {:?}", name, avg, min, max);
+    let (avg_ops, avg_elapsed) =
+        runs.iter().fold((0, Duration::from_secs(0)), |(acc_ops, acc_elapsed), (ops, elapsed)| {
+            (acc_ops + ops, acc_elapsed + *elapsed)
+        });
+    let avg_elapsed = avg_elapsed.as_secs_f32() / runs.len() as f32;
+    let avg_ops = avg_ops as f32 / runs.len() as f32;
+    let (min_ops, min_elapsed) = runs.iter().fold(
+        (std::usize::MAX, Duration::MAX),
+        |(acc_ops, acc_elapsed), (ops, elapsed)| {
+            if *elapsed < acc_elapsed {
+                (*ops, *elapsed)
+            } else {
+                (acc_ops, acc_elapsed)
+            }
+        },
+    );
+    let (max_ops, max_elapsed) =
+        runs.iter().fold((0, Duration::from_secs(0)), |(acc_ops, acc_elapsed), (ops, elapsed)| {
+            if *elapsed > acc_elapsed {
+                (*ops, *elapsed)
+            } else {
+                (acc_ops, acc_elapsed)
+            }
+        });
+    let avg_per_sec = avg_ops / avg_elapsed;
+    let min_per_sec = min_ops as f32 / min_elapsed.as_secs_f32();
+    let max_per_sec = max_ops as f32 / max_elapsed.as_secs_f32();
+    println!(
+        "{}: {} ops, {:.2} ops/s (avg), {:.2} ops/s (fastest), {:.2} ops/s (slowest)",
+        name, avg_ops, avg_per_sec, min_per_sec, max_per_sec
+    );
     Ok(())
 }
 
@@ -829,7 +856,7 @@ fn microbenchmark() -> anyhow::Result<()> {
             (0,),
         )?;
         sync()?;
-        Ok(())
+        Ok(1)
     })?;
 
     if let Ok(wmma_loop) = wmma_loop {
@@ -844,7 +871,7 @@ fn microbenchmark() -> anyhow::Result<()> {
                 (10000,),
             )?;
             sync()?;
-            Ok(())
+            Ok(2 * 16 * 16 * 16 * 10000 * 48 * 4)
         })?;
     }
     Ok(())
