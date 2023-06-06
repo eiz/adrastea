@@ -1,7 +1,5 @@
 #include "compat.h"
 
-#include <cassert>
-
 // A matrix multiply operator which supports various handy op fusions.
 // TODO: this is currently the fully unoptimized version. implement loop
 // tiling, shared memory, double buffering / async load, warp mma instructions.
@@ -17,6 +15,13 @@
 //  - causal (upper right triangle of the output is replaced with -inf)
 //
 // order is uhhh beta(gelu(bias))
+
+#ifdef __gfx1100__
+#define NYI() asm volatile("s_trap 2")
+#else
+#include <cassert>
+#define NYI() assert(false && "nyi")
+#endif
 
 enum class MatmulLoadOp { IDENTITY = 0, SCALE = 1 };
 enum class MatmulStoreOp {
@@ -182,24 +187,24 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
       break;                                                         \
     }                                                                \
     default:                                                         \
-      assert(false && "nyi");                                        \
+      NYI();                                                         \
   }
 
-#define MATMUL_GENERIC_LOAD_OP()                                                       \
-  switch (load) {                                                                      \
-    case MatmulLoadOp::IDENTITY: {                                                     \
-      Identity<T> load_op;                                                             \
-      MATMUL_GENERIC_MASK_OP()                                                         \
-      break;                                                                           \
-    }                                                                                  \
-    case MatmulLoadOp::SCALE: {                                                        \
-      auto load_op = Scale<float, HalfToFloat<>>(scale, HalfToFloat<>(Identity<T>())); \
-      MATMUL_GENERIC_MASK_OP()                                                         \
-      break;                                                                           \
-    }                                                                                  \
-    default:                                                                           \
-      assert(false && "nyi");                                                          \
-      break;                                                                           \
+#define MATMUL_GENERIC_LOAD_OP()                       \
+  switch (load) {                                      \
+    case MatmulLoadOp::IDENTITY: {                     \
+      Identity<T> load_op;                             \
+      MATMUL_GENERIC_MASK_OP()                         \
+      break;                                           \
+    }                                                  \
+    case MatmulLoadOp::SCALE: {                        \
+      auto load_op = Scale<T, Identity<T>>(scale, {}); \
+      MATMUL_GENERIC_MASK_OP()                         \
+      break;                                           \
+    }                                                  \
+    default:                                           \
+      NYI();                                           \
+      break;                                           \
   }
 
 // TODO: half2float here breaks for other T
@@ -226,7 +231,7 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
       break;                                                                     \
     }                                                                            \
     default:                                                                     \
-      assert(false && "nyi");                                                    \
+      NYI();                                                                     \
   }
 
 extern "C" __global__ void matmul_f16(MATMUL_COMMON_PARAMS(__half),
