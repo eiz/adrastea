@@ -18,6 +18,7 @@ use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
     fmt::Debug,
+    time::Duration,
 };
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 
@@ -30,9 +31,10 @@ use simt_hip::{
 
 use crate::{
     pickle::{ModelState, PickledModel},
+    tensor::Tensor,
     whisper::{
-        WhisperContext, WhisperKernels, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH,
-        WHISPER_SAMPLE_RATE,
+        MatmulOptions, WhisperContext, WhisperKernels, WhisperModel, WhisperModelState,
+        WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
     },
 };
 
@@ -63,8 +65,7 @@ unsafe fn find_compute_queue_family(instance: &ash::Instance, phys_dev: vk::Phys
 }
 
 unsafe fn find_memory_type(
-    reqs: &vk::MemoryRequirements,
-    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    reqs: &vk::MemoryRequirements, mem_props: &vk::PhysicalDeviceMemoryProperties,
     flags: vk::MemoryPropertyFlags,
 ) -> u32 {
     for i in 0..mem_props.memory_type_count {
@@ -474,9 +475,7 @@ impl CudaBuffer {
     }
 
     pub unsafe fn copy_from(
-        &mut self,
-        src: *const std::ffi::c_void,
-        size: usize,
+        &mut self, src: *const std::ffi::c_void, size: usize,
     ) -> anyhow::Result<()> {
         let ctx = ScopedCudaContext::get()?;
         cuda_call(|| ctx.cuda.cuMemcpyHtoD_v2(self.ptr, src, size))?;
@@ -698,11 +697,11 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
-    let kernels = WhisperKernels::new(phys.capability()?)?;
+    let kernels = Arc::new(WhisperKernels::new(phys.capability()?)?);
     let start = Instant::now();
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     println!("model load time: {:?}", start.elapsed());
-    let mut context = WhisperContext::new(Arc::new(model), Arc::new(kernels))?;
+    let mut context = WhisperContext::new(Arc::new(model), kernels.clone())?;
     let mut fp = File::open(path)?;
     // TODO: 'wav' eager loads everything =/
     let (header, data) = wav::read(&mut fp)?;
@@ -763,11 +762,55 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         }
     }
     println!("decode time: {:?}", start.elapsed());
+    let left = Tensor::new_hip(&[2048, 4096])?;
+    let right = Tensor::new_hip(&[4096, 4096])?;
+    let mut out = Tensor::new_hip(&[2048, 4096])?;
+    let start = Instant::now();
+    kernels.matmul_f16(
+        &mut out.as_view_mut(),
+        &left.as_view(),
+        &right.as_view(),
+        MatmulOptions::new(),
+    )?;
+    unsafe {
+        simt_hip_sys::library().hipDeviceSynchronize();
+    }
+    println!("matmul time: {:?}", start.elapsed());
+    println!("tflops: {}", 2.0 * 2048.0 * 4096.0 * 4096.0 / start.elapsed().as_secs_f32() / 1e12);
+    Ok(())
+}
+
+fn bench<F: FnMut() -> anyhow::Result<()>>(name: &str, mut f: F) -> anyhow::Result<()> {
+    let mut runs = vec![];
+    let test_start = Instant::now();
+    f()?; // warmup
+    while test_start.elapsed().as_secs_f32() < 10.0 && runs.len() < 100000 {
+        let start = Instant::now();
+        f()?;
+        runs.push(start.elapsed());
+    }
+    let avg = runs.iter().sum::<Duration>() / runs.len() as u32;
+    let min = runs.iter().min().unwrap();
+    let max = runs.iter().max().unwrap();
+    println!("{}: avg {:?} min {:?} max {:?}", name, avg, min, max);
     Ok(())
 }
 
 fn microbenchmark() -> anyhow::Result<()> {
-    todo!()
+    let phys = HipPhysicalDevice::get(0)?;
+    let device = Arc::new(HipDevice::new(phys)?);
+    let _scope = device.lock()?;
+    let module_microbench = HipModule::find(phys.capability()?, adrastea_kernels::microbench)?;
+    let empty_kernel: Kernel<(i32,)> = Kernel::new(&module_microbench, "empty_kernel")?;
+
+    bench("empty_kernel", || {
+        empty_kernel.launch(
+            LaunchParams { blocks: (1, 1, 1), threads: (1, 1, 1), shared_mem: 0, stream: None },
+            (0,),
+        )?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
