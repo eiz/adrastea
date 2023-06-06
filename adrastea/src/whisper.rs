@@ -13,9 +13,9 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
+use alloc::sync::Arc;
 use core::fmt::{self, Debug, Formatter};
 
-use alloc::sync::Arc;
 use half::f16;
 use rustfft::num_complex::Complex32;
 use serde::Deserialize;

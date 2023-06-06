@@ -13,6 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
+use alloc::sync::Arc;
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
@@ -20,7 +21,6 @@ use core::{
 };
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 
-use alloc::sync::Arc;
 use anyhow::bail;
 use ash::{vk, Entry};
 use serde::{Deserialize, Serialize};
@@ -766,6 +766,10 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
+fn microbenchmark() -> anyhow::Result<()> {
+    todo!()
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -785,6 +789,8 @@ fn main() -> anyhow::Result<()> {
         wav_test(&args[2], &args[3])?;
     } else if args.len() >= 2 && args[1] == "vulkan" {
         unsafe { vulkan_square()? }
+    } else if args.len() >= 2 && args[1] == "microbenchmark" {
+        microbenchmark()?;
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }

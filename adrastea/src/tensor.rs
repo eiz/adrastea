@@ -2,6 +2,7 @@ use core::{
     fmt::{Debug, Display, Formatter},
     marker::PhantomData,
 };
+
 use simt_hip::HipBuffer;
 use smallvec::SmallVec;
 
@@ -320,7 +321,10 @@ pub struct TensorView<'a, T> {
 }
 
 fn format_slice_with_layout<T: Debug + Copy>(
-    f: &mut Formatter<'_>, slice: &[T], dim: usize, layout: &TensorLayout,
+    f: &mut Formatter<'_>,
+    slice: &[T],
+    dim: usize,
+    layout: &TensorLayout,
 ) -> std::fmt::Result {
     let dims_right = layout.dims.len() - dim - 1;
     let mut first = true;
