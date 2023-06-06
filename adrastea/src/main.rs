@@ -796,20 +796,57 @@ fn bench<F: FnMut() -> anyhow::Result<()>>(name: &str, mut f: F) -> anyhow::Resu
     Ok(())
 }
 
+fn sync() -> anyhow::Result<()> {
+    unsafe {
+        simt_hip_sys::library().hipDeviceSynchronize();
+    }
+    Ok(())
+}
+
 fn microbenchmark() -> anyhow::Result<()> {
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
     let module_microbench = HipModule::find(phys.capability()?, adrastea_kernels::microbench)?;
     let empty_kernel: Kernel<(i32,)> = Kernel::new(&module_microbench, "empty_kernel")?;
+    let wmma_loop: Result<Kernel<(i32,)>, simt_hip::Error> =
+        Kernel::new(&module_microbench, "wmma_loop");
+
+    unsafe {
+        let fukfuks = simt_hip::hip_result_call(|x| {
+            simt_hip_sys::library().hipDeviceGetAttribute(
+                x,
+                simt_hip_sys::hipDeviceAttribute_t::hipDeviceAttributeMultiprocessorCount,
+                phys.index(),
+            )
+        })?;
+        println!("num fukfuks {:?}", fukfuks);
+    }
 
     bench("empty_kernel", || {
         empty_kernel.launch(
             LaunchParams { blocks: (1, 1, 1), threads: (1, 1, 1), shared_mem: 0, stream: None },
             (0,),
         )?;
+        sync()?;
         Ok(())
     })?;
+
+    if let Ok(wmma_loop) = wmma_loop {
+        bench("wmma_loop", || {
+            wmma_loop.launch(
+                LaunchParams {
+                    blocks: (48, 1, 1),
+                    threads: (32, 4, 1),
+                    shared_mem: 0,
+                    stream: None,
+                },
+                (10000,),
+            )?;
+            sync()?;
+            Ok(())
+        })?;
+    }
     Ok(())
 }
 

@@ -27,6 +27,7 @@ simt_kernels! {
         layer_norm,
         matmul,
         matmul_nt_fp16u8,
+        microbench,
         rms_norm,
         rotary,
         silu,
