@@ -37,6 +37,18 @@ fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
         if !status.success() {
             panic!("failed to compile {}", kernel);
         }
+        let status = Command::new("hipcc")
+            .arg("--genco")
+            .arg(format!("--offload-arch={}", arch))
+            .arg("-S")
+            .arg("-o")
+            .arg(out_path.join(arch).join(format!("{}.S", kernel)))
+            .arg(format!("cpp/{}.cu", kernel))
+            .status()
+            .unwrap();
+        if !status.success() {
+            panic!("failed to compile {}", kernel);
+        }
     }
 }
 
