@@ -906,8 +906,6 @@ impl WhisperContext {
         Ok(features)
     }
 
-    // TODO(eiz): just sample tokens for now until irl decode logic is written
-    // need to figure out a proper streaming solution anyway
     pub fn decode(
         &mut self,
         features: TensorView<f16>,
