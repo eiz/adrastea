@@ -892,60 +892,6 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
 
     println!("{:>32} {:>15} {:>15} {:>15} {:>15}", "name", "ops", "avg", "fast", "slow");
 
-    let blas = simt_rocblas_sys::rocblas::new("librocblas.so")?;
-    let blas_handle = rocblas_result_call(|x| blas.rocblas_create_handle(x))?;
-    let left = Tensor::new_hip(&[2048, 4096])?;
-    let right = Tensor::new_hip(&[4096, 4096])?;
-    let mut out = Tensor::new_hip(&[2048, 4096])?;
-    let one = simt_rocblas_sys::rocblas_half { data: f16::from_f32(1.0).to_bits() };
-    let zero = simt_rocblas_sys::rocblas_half { data: f16::from_f32(0.0).to_bits() };
-
-    bench("hgemm_f16_2048_4096_4096", || {
-        rocblas_call(|| {
-            blas.rocblas_hgemm(
-                blas_handle,
-                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
-                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
-                2048,
-                4096,
-                4096,
-                &one,
-                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
-                2048,
-                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
-                4096,
-                &zero,
-                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
-                2048,
-            )
-        })?;
-        sync()?;
-        Ok(2 * 2048 * 4096 * 4096)
-    })?;
-
-    bench("hgemm_f16_2048_4096_4096_nt", || {
-        rocblas_call(|| {
-            blas.rocblas_hgemm(
-                blas_handle,
-                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
-                simt_rocblas_sys::rocblas_operation::rocblas_operation_transpose,
-                2048,
-                4096,
-                4096,
-                &one,
-                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
-                2048,
-                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
-                4096,
-                &zero,
-                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
-                2048,
-            )
-        })?;
-        sync()?;
-        Ok(2 * 2048 * 4096 * 4096)
-    })?;
-
     bench("empty_kernel", || {
         empty_kernel.launch(
             LaunchParams { blocks: (1, 1, 1), threads: (1, 1, 1), shared_mem: 0, stream: None },
@@ -955,6 +901,9 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Ok(1)
     })?;
 
+    let left = Tensor::new_hip(&[2048, 4096])?;
+    let right = Tensor::new_hip(&[4096, 4096])?;
+    let mut out = Tensor::new_hip(&[2048, 4096])?;
     if let Ok(wmma_loop) = wmma_loop_f16_f16 {
         bench("wmma_loop_f16_f16", || {
             wmma_loop.launch(
@@ -1004,6 +953,60 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
             &right.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+
+    // Warning: running these tests first instead of last made the entire GPU driver crash
+    // on Linux 6.3.6-arch1-1 for me, 100% repro. Does not seem to happen this way. I'm
+    // assuming some kind of state corruption is happening but not sure where yet.
+    let blas = simt_rocblas_sys::rocblas::new("librocblas.so")?;
+    let blas_handle = rocblas_result_call(|x| blas.rocblas_create_handle(x))?;
+    let one = simt_rocblas_sys::rocblas_half { data: f16::from_f32(1.0).to_bits() };
+    let zero = simt_rocblas_sys::rocblas_half { data: f16::from_f32(0.0).to_bits() };
+
+    bench("hgemm_f16_2048_4096_4096", || {
+        rocblas_call(|| {
+            blas.rocblas_hgemm(
+                blas_handle,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                2048,
+                4096,
+                4096,
+                &one,
+                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                2048,
+                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                4096,
+                &zero,
+                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
+                2048,
+            )
+        })?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+
+    bench("hgemm_f16_2048_4096_4096_nt", || {
+        rocblas_call(|| {
+            blas.rocblas_hgemm(
+                blas_handle,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_transpose,
+                2048,
+                4096,
+                4096,
+                &one,
+                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                2048,
+                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                4096,
+                &zero,
+                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
+                2048,
+            )
+        })?;
         sync()?;
         Ok(2 * 2048 * 4096 * 4096)
     })?;
