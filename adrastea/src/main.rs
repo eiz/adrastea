@@ -17,9 +17,10 @@ use alloc::sync::Arc;
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
-    fmt::Debug,
+    fmt::{Debug, Display, Formatter},
     time::Duration,
 };
+use half::f16;
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 
 use anyhow::bail;
@@ -762,28 +763,35 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         }
     }
     println!("decode time: {:?}", start.elapsed());
-    let left = Tensor::new_hip(&[2048, 4096])?;
-    let right = Tensor::new_hip(&[4096, 4096])?;
-    let mut out = Tensor::new_hip(&[2048, 4096])?;
-    let start = Instant::now();
-    kernels.matmul_f16(
-        &mut out.as_view_mut(),
-        &left.as_view(),
-        &right.as_view(),
-        MatmulOptions::new(),
-    )?;
-    unsafe {
-        simt_hip_sys::library().hipDeviceSynchronize();
-    }
-    println!("matmul time: {:?}", start.elapsed());
-    println!("tflops: {}", 2.0 * 2048.0 * 4096.0 * 4096.0 / start.elapsed().as_secs_f32() / 1e12);
     Ok(())
+}
+
+struct Flops(f64);
+
+impl Display for Flops {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut flops = self.0;
+        let mut units = 0;
+        while flops > 1000.0 {
+            flops /= 1000.0;
+            units += 1;
+        }
+        let unit = match units {
+            0 => " op/s",
+            1 => "Kop/s",
+            2 => "Mop/s",
+            3 => "Gop/s",
+            4 => "Top/s",
+            _ => "Pop/s",
+        };
+        write!(f, "{:>7.4} {}", flops, unit)
+    }
 }
 
 fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::Result<()> {
     let mut runs = vec![];
+    let ops = f()?; // warmup
     let test_start = Instant::now();
-    let _ = f()?; // warmup
     while test_start.elapsed().as_secs_f32() < 10.0 && runs.len() < 100000 {
         let start = Instant::now();
         let ops = f()?;
@@ -793,8 +801,8 @@ fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::R
         runs.iter().fold((0, Duration::from_secs(0)), |(acc_ops, acc_elapsed), (ops, elapsed)| {
             (acc_ops + ops, acc_elapsed + *elapsed)
         });
-    let avg_elapsed = avg_elapsed.as_secs_f32() / runs.len() as f32;
-    let avg_ops = avg_ops as f32 / runs.len() as f32;
+    let avg_elapsed = avg_elapsed.as_secs_f64() / runs.len() as f64;
+    let avg_ops = avg_ops as f64 / runs.len() as f64;
     let (min_ops, min_elapsed) = runs.iter().fold(
         (std::usize::MAX, Duration::MAX),
         |(acc_ops, acc_elapsed), (ops, elapsed)| {
@@ -814,11 +822,15 @@ fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::R
             }
         });
     let avg_per_sec = avg_ops / avg_elapsed;
-    let min_per_sec = min_ops as f32 / min_elapsed.as_secs_f32();
-    let max_per_sec = max_ops as f32 / max_elapsed.as_secs_f32();
+    let min_per_sec = min_ops as f64 / min_elapsed.as_secs_f64();
+    let max_per_sec = max_ops as f64 / max_elapsed.as_secs_f64();
     println!(
-        "{}: {} ops, {:.2} ops/s (avg), {:.2} ops/s (fastest), {:.2} ops/s (slowest)",
-        name, avg_ops, avg_per_sec, min_per_sec, max_per_sec
+        "{:>32} {:>15} {:>15} {:>15} {:>15}",
+        name,
+        format!("{}", ops),
+        format!("{}", Flops(avg_per_sec)),
+        format!("{}", Flops(min_per_sec)),
+        format!("{}", Flops(max_per_sec))
     );
     Ok(())
 }
@@ -830,14 +842,42 @@ fn sync() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn microbenchmark() -> anyhow::Result<()> {
+#[inline(always)]
+pub unsafe fn rocblas_call<F: FnOnce() -> simt_rocblas_sys::rocblas_status>(
+    cb: F,
+) -> anyhow::Result<()> {
+    let res = cb();
+    if res == simt_rocblas_sys::rocblas_status::rocblas_status_success {
+        Ok(())
+    } else {
+        bail!("rocblas error {:?}", res);
+    }
+}
+
+#[inline(always)]
+pub unsafe fn rocblas_result_call<T, F: FnOnce(*mut T) -> simt_rocblas_sys::rocblas_status>(
+    cb: F,
+) -> anyhow::Result<T> {
+    let mut out = std::mem::MaybeUninit::uninit();
+    let res = cb(out.as_mut_ptr());
+    if res == simt_rocblas_sys::rocblas_status::rocblas_status_success {
+        Ok(out.assume_init())
+    } else {
+        bail!("rocblas error {:?}", res);
+    }
+}
+
+unsafe fn microbenchmark() -> anyhow::Result<()> {
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
+    let kernels = WhisperKernels::new(phys.capability()?)?;
     let module_microbench = HipModule::find(phys.capability()?, adrastea_kernels::microbench)?;
     let empty_kernel: Kernel<(i32,)> = Kernel::new(&module_microbench, "empty_kernel")?;
-    let wmma_loop: Result<Kernel<(i32,)>, simt_hip::Error> =
-        Kernel::new(&module_microbench, "wmma_loop");
+    let wmma_loop_f16_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
+        Kernel::new(&module_microbench, "wmma_loop_f16_f16");
+    let wmma_loop_f32_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
+        Kernel::new(&module_microbench, "wmma_loop_f32_f16");
 
     unsafe {
         let fukfuks = simt_hip::hip_result_call(|x| {
@@ -850,6 +890,62 @@ fn microbenchmark() -> anyhow::Result<()> {
         println!("num fukfuks {:?}", fukfuks);
     }
 
+    println!("{:>32} {:>15} {:>15} {:>15} {:>15}", "name", "ops", "avg", "fast", "slow");
+
+    let blas = simt_rocblas_sys::rocblas::new("librocblas.so")?;
+    let blas_handle = rocblas_result_call(|x| blas.rocblas_create_handle(x))?;
+    let left = Tensor::new_hip(&[2048, 4096])?;
+    let right = Tensor::new_hip(&[4096, 4096])?;
+    let mut out = Tensor::new_hip(&[2048, 4096])?;
+    let one = simt_rocblas_sys::rocblas_half { data: f16::from_f32(1.0).to_bits() };
+    let zero = simt_rocblas_sys::rocblas_half { data: f16::from_f32(0.0).to_bits() };
+
+    bench("hgemm_f16_2048_4096_4096", || {
+        rocblas_call(|| {
+            blas.rocblas_hgemm(
+                blas_handle,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                2048,
+                4096,
+                4096,
+                &one,
+                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                2048,
+                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                4096,
+                &zero,
+                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
+                2048,
+            )
+        })?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+
+    bench("hgemm_f16_2048_4096_4096_nt", || {
+        rocblas_call(|| {
+            blas.rocblas_hgemm(
+                blas_handle,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_none,
+                simt_rocblas_sys::rocblas_operation::rocblas_operation_transpose,
+                2048,
+                4096,
+                4096,
+                &one,
+                left.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                2048,
+                right.as_gpu_ptr() as *const simt_rocblas_sys::rocblas_half,
+                4096,
+                &zero,
+                out.as_mut_gpu_ptr() as *mut simt_rocblas_sys::rocblas_half,
+                2048,
+            )
+        })?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+
     bench("empty_kernel", || {
         empty_kernel.launch(
             LaunchParams { blocks: (1, 1, 1), threads: (1, 1, 1), shared_mem: 0, stream: None },
@@ -859,8 +955,8 @@ fn microbenchmark() -> anyhow::Result<()> {
         Ok(1)
     })?;
 
-    if let Ok(wmma_loop) = wmma_loop {
-        bench("wmma_loop", || {
+    if let Ok(wmma_loop) = wmma_loop_f16_f16 {
+        bench("wmma_loop_f16_f16", || {
             wmma_loop.launch(
                 LaunchParams {
                     blocks: (48, 1, 1),
@@ -874,6 +970,43 @@ fn microbenchmark() -> anyhow::Result<()> {
             Ok(2 * 16 * 16 * 16 * 10000 * 48 * 4)
         })?;
     }
+
+    if let Ok(wmma_loop) = wmma_loop_f32_f16 {
+        bench("wmma_loop_f32_f16", || {
+            wmma_loop.launch(
+                LaunchParams {
+                    blocks: (48, 1, 1),
+                    threads: (32, 4, 1),
+                    shared_mem: 0,
+                    stream: None,
+                },
+                (10000,),
+            )?;
+            sync()?;
+            Ok(2 * 16 * 16 * 16 * 10000 * 48 * 4)
+        })?;
+    }
+
+    bench("matmul_f16_2048_4096_4096_rrr", || {
+        kernels.matmul_f16(
+            &mut out.as_view_mut(),
+            &left.as_view(),
+            &right.as_view(),
+            MatmulOptions::new(),
+        )?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+    bench("matmul_f16_2048_4096_4096_rrc", || {
+        kernels.matmul_f16(
+            &mut out.as_view_mut(),
+            &left.as_view(),
+            &right.as_view().permute(&[1, 0]),
+            MatmulOptions::new(),
+        )?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
     Ok(())
 }
 
@@ -897,7 +1030,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "vulkan" {
         unsafe { vulkan_square()? }
     } else if args.len() >= 2 && args[1] == "microbenchmark" {
-        microbenchmark()?;
+        unsafe { microbenchmark()? }
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }

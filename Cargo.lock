@@ -19,6 +19,7 @@ dependencies = [
  "simt_cuda_sys",
  "simt_hip",
  "simt_hip_sys",
+ "simt_rocblas_sys",
  "smallvec",
  "tiktoken-rs",
  "wav",
@@ -504,6 +505,15 @@ name = "simt_hip_sys"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a18509a2a8908506620d4c50a2879c89fd32bed2739c571cbcf90d1443dbc375"
+dependencies = [
+ "libloading 0.8.0",
+]
+
+[[package]]
+name = "simt_rocblas_sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "666b9e72e6861ef86a39ccf603f5200dfb35806368720b282b8b9b8259da002b"
 dependencies = [
  "libloading 0.8.0",
 ]

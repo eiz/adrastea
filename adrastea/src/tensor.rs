@@ -50,6 +50,16 @@ impl TensorLayout {
         Self::new(dims, &strides)
     }
 
+    pub fn column_major(dims: &[usize]) -> Self {
+        let mut rmaj = Self::row_major(dims);
+        let len = dims.len();
+        let cstride = rmaj.strides[rmaj.strides.len() - 2];
+        let rstride = rmaj.strides[rmaj.strides.len() - 1];
+        rmaj.strides[len - 2] = rstride;
+        rmaj.strides[len - 1] = cstride;
+        rmaj
+    }
+
     pub fn largest_address(&self) -> usize {
         let mut addr = 0;
         for (&dim, &stride) in self.dims.iter().zip(self.strides.iter()) {
@@ -336,10 +346,7 @@ pub struct TensorView<'a, T> {
 }
 
 fn format_slice_with_layout<T: Debug + Copy>(
-    f: &mut Formatter<'_>,
-    slice: &[T],
-    dim: usize,
-    layout: &TensorLayout,
+    f: &mut Formatter<'_>, slice: &[T], dim: usize, layout: &TensorLayout,
 ) -> std::fmt::Result {
     let dims_right = layout.dims.len() - dim - 1;
     let mut first = true;
