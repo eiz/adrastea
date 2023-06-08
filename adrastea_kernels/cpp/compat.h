@@ -21,12 +21,12 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_math_constants.h>
 #include <hip/hip_runtime.h>
-#define THREAD_IDX_X hipThreadIdx_x
-#define THREAD_IDX_Y hipThreadIdx_y
-#define THREAD_IDX_Z hipThreadIdx_z
-#define BLOCK_IDX_X hipBlockIdx_x
-#define BLOCK_IDX_Y hipBlockIdx_y
-#define BLOCK_IDX_Z hipBlockIdx_z
+#define THREAD_IDX_X __builtin_amdgcn_workitem_id_x()
+#define THREAD_IDX_Y __builtin_amdgcn_workitem_id_y()
+#define THREAD_IDX_Z __builtin_amdgcn_workitem_id_z()
+#define BLOCK_IDX_X __builtin_amdgcn_workgroup_id_x()
+#define BLOCK_IDX_Y __builtin_amdgcn_workgroup_id_y()
+#define BLOCK_IDX_Z __builtin_amdgcn_workgroup_id_z()
 #define BLOCK_DIM_X hipBlockDim_x
 #define BLOCK_DIM_Y hipBlockDim_y
 #define BLOCK_DIM_Z hipBlockDim_z

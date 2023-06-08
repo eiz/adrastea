@@ -170,6 +170,30 @@ pub struct WhisperKernels {
         u32,
         u32,
     )>,
+    matmul_f16_fast: Kernel<(
+        *mut f16,
+        *const f16,
+        *const f16,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+        *const f16,
+        f32,
+        f32,
+        u32,
+        u32,
+        u32,
+    )>,
     elementwise_binary_2d_f16:
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
@@ -188,6 +212,7 @@ impl WhisperKernels {
             conv1d: Kernel::new(&module_conv1d, "conv1d")?,
             layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
             matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
+            matmul_f16_fast: Kernel::new(&module_matmul, "matmul_f16_fast")?,
             elementwise_binary_2d_f16: Kernel::new(
                 &module_elementwise,
                 "elementwise_binary_2d_f16",
@@ -206,14 +231,8 @@ impl WhisperKernels {
         Ok(kernels)
     }
     pub fn conv1d(
-        &self,
-        output: &mut TensorViewMut<f16>,
-        input: &TensorView<f16>,
-        weight: &TensorView<f16>,
-        bias: &TensorView<f16>,
-        kernel_size: i32,
-        stride: i32,
-        padding: i32,
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
         activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
         self.conv1d.launch(
@@ -246,10 +265,7 @@ impl WhisperKernels {
     }
 
     pub fn elementwise_binary_2d_f16_inplace(
-        &self,
-        inout_left: &mut TensorViewMut<f16>,
-        right: &TensorView<f16>,
-        op: BinaryOp,
+        &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()> {
         self.elementwise_binary_2d_f16.launch(
             LaunchParams {
@@ -281,12 +297,8 @@ impl WhisperKernels {
     }
 
     pub fn layer_norm(
-        &self,
-        output: &mut TensorViewMut<f16>,
-        input: &TensorView<f16>,
-        weight: &TensorView<f16>,
-        bias: &TensorView<f16>,
-        eps: f32,
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, eps: f32,
     ) -> anyhow::Result<()> {
         self.layer_norm.launch(
             LaunchParams {
@@ -313,10 +325,7 @@ impl WhisperKernels {
     }
 
     pub fn matmul_f16(
-        &self,
-        output: &mut TensorViewMut<f16>,
-        left: &TensorView<f16>,
-        right: &TensorView<f16>,
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()> {
         assert_eq!(left.size(-1), right.size(-2)); // K
@@ -377,10 +386,70 @@ impl WhisperKernels {
         Ok(())
     }
 
+    pub fn matmul_f16_fast(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()> {
+        assert_eq!(left.size(-1), right.size(-2)); // K
+        assert_eq!(output.size(-2), left.size(-2)); // M
+        assert_eq!(output.size(-1), right.size(-1)); // N
+        let bias = match &options.store {
+            MatmulStore::Identity => None,
+            MatmulStore::GeluBias(bias) => Some(bias),
+            MatmulStore::BetaGeluBias(_, bias) => Some(bias),
+            MatmulStore::BetaBias(_, bias) => Some(bias),
+        };
+        let scale = match &options.load {
+            MatmulLoad::Identity => 1.0,
+            MatmulLoad::Scale(scale) => *scale,
+        };
+        let beta = match &options.store {
+            MatmulStore::BetaGeluBias(beta, _) => *beta,
+            MatmulStore::BetaBias(beta, _) => *beta,
+            _ => 0.0,
+        };
+        let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
+        self.matmul_f16_fast.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u64, 128) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    if output.layout().dims.len() > 2 { output.size(-3) as u32 } else { 1 },
+                ),
+                threads: (32, 4, 1),
+                shared_mem: 16 * 129 * 2 + 128 * 129 * 2,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                left.as_gpu_ptr(),
+                right.as_gpu_ptr(),
+                if output.layout().dims.len() > 2 { output.size(-3) as i32 } else { 1 },
+                left.size(-2) as i32,
+                left.size(-1) as i32,
+                right.size(-1) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                if output.layout().dims.len() > 2 { output.stride(-3) } else { 0 } as i32,
+                left.stride(-1) as i32,
+                left.stride(-2) as i32,
+                if left.layout().dims.len() > 2 { left.stride(-3) } else { 0 } as i32,
+                right.stride(-1) as i32,
+                right.stride(-2) as i32,
+                if right.layout().dims.len() > 2 { right.stride(-3) } else { 0 } as i32,
+                bias_ptr,
+                beta,
+                scale,
+                options.store.lower() as u32,
+                options.load.lower() as u32,
+                options.mask as u32,
+            ),
+        )?;
+        Ok(())
+    }
+
     pub fn softmax_rows_inplace(
-        &self,
-        output: &mut TensorViewMut<f16>,
-        temperature: f32,
+        &self, output: &mut TensorViewMut<f16>, temperature: f32,
     ) -> anyhow::Result<()> {
         self.softmax_rows.launch(
             LaunchParams {
@@ -405,10 +474,7 @@ impl WhisperKernels {
     }
 
     pub fn embed(
-        &self,
-        output: &mut TensorViewMut<f16>,
-        tokens: TensorView<i32>,
-        embed: TensorView<f16>,
+        &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
     ) -> anyhow::Result<()> {
         assert_eq!(tokens.size(-1), output.size(-2));
         assert_eq!(output.size(-1), embed.size(-1));
@@ -524,9 +590,7 @@ pub struct WhisperTransformerBlock {
 
 impl WhisperTransformerBlock {
     pub fn new(
-        pickle: &PickledModel<WhisperDims>,
-        prefix: &str,
-        has_cross_attn: bool,
+        pickle: &PickledModel<WhisperDims>, prefix: &str, has_cross_attn: bool,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             attn: WhisperAttention::new(pickle, &format!("{}.attn", prefix))?,
@@ -716,11 +780,8 @@ impl WhisperContext {
     }
 
     fn process_layer(
-        &self,
-        layer: &WhisperTransformerBlock,
-        hidden_state: &mut TensorViewMut<f16>,
-        features: Option<&TensorView<f16>>,
-        mask: MatmulMask,
+        &self, layer: &WhisperTransformerBlock, hidden_state: &mut TensorViewMut<f16>,
+        features: Option<&TensorView<f16>>, mask: MatmulMask,
     ) -> anyhow::Result<()> {
         let mut ln_out = Tensor::new_hip(&hidden_state.layout().dims)?;
         let mut mlp_hidden =
@@ -763,13 +824,13 @@ impl WhisperContext {
             &layer.mlp_ln.bias.as_view(),
             1.0e-5,
         )?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut mlp_hidden.as_view_mut(),
             &ln_out.as_view(),
             &layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
             MatmulOptions::new().store(MatmulStore::BetaGeluBias(0.0, &layer.mlp_0.bias.as_view())),
         )?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             hidden_state,
             &mlp_hidden.as_view(),
             &layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
@@ -779,12 +840,8 @@ impl WhisperContext {
     }
 
     fn residual_attention(
-        &self,
-        hidden_state: &mut TensorViewMut<f16>,
-        ln_out: &TensorView<f16>,
-        kv_input: &TensorView<f16>,
-        attn: &WhisperAttention,
-        mask: MatmulMask,
+        &self, hidden_state: &mut TensorViewMut<f16>, ln_out: &TensorView<f16>,
+        kv_input: &TensorView<f16>, attn: &WhisperAttention, mask: MatmulMask,
     ) -> Result<(), anyhow::Error> {
         // TODO this incidentally works but should reference the right hparam
         let heads = self.model.dims.n_audio_head as isize;
@@ -792,19 +849,19 @@ impl WhisperContext {
         let mut key = Tensor::new_hip(&kv_input.layout().dims)?;
         let mut value = Tensor::new_hip(&kv_input.layout().dims)?;
         let mut qkv = Tensor::new_hip(&ln_out.layout().dims)?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut query.as_view_mut(),
             ln_out,
             &attn.query.weight.as_view().permute(&[0, 1, 3, 2]),
             MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.query.bias.as_view())),
         )?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut key.as_view_mut(),
             kv_input,
             &attn.key.as_view().permute(&[0, 1, 3, 2]),
             MatmulOptions::new(),
         )?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut value.as_view_mut(),
             kv_input,
             &attn.value.weight.as_view().permute(&[0, 1, 3, 2]),
@@ -817,7 +874,7 @@ impl WhisperContext {
         let v_view =
             value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
         let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut qk.as_view_mut(),
             &q_view,
             &k_view,
@@ -832,8 +889,13 @@ impl WhisperContext {
         self.kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
         let mut qkv_view =
             qkv.as_view_mut().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        self.kernels.matmul_f16(&mut qkv_view, &qk.as_view(), &v_view, MatmulOptions::new())?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
+            &mut qkv_view,
+            &qk.as_view(),
+            &v_view,
+            MatmulOptions::new(),
+        )?;
+        self.kernels.matmul_f16_fast(
             hidden_state,
             &qkv.as_view(),
             &attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
@@ -907,9 +969,7 @@ impl WhisperContext {
     }
 
     pub fn decode(
-        &mut self,
-        features: TensorView<f16>,
-        tokens: &[i32],
+        &mut self, features: TensorView<f16>, tokens: &[i32],
     ) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state =
             Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
@@ -942,7 +1002,7 @@ impl WhisperContext {
             &self.model.decoder.ln.bias.as_view(),
             1.0e-5,
         )?;
-        self.kernels.matmul_f16(
+        self.kernels.matmul_f16_fast(
             &mut logits.as_view_mut(),
             &ln_out.as_view(),
             &self.model.decoder.token_embedding.as_view().permute(&[0, 1, 3, 2]),

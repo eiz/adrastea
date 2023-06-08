@@ -792,7 +792,7 @@ fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::R
     let mut runs = vec![];
     let ops = f()?; // warmup
     let test_start = Instant::now();
-    while test_start.elapsed().as_secs_f32() < 10.0 && runs.len() < 100000 {
+    while test_start.elapsed().as_secs_f32() < 5.0 && runs.len() < 100000 {
         let start = Instant::now();
         let ops = f()?;
         runs.push((ops, start.elapsed()));
@@ -879,17 +879,16 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     let wmma_loop_f32_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
         Kernel::new(&module_microbench, "wmma_loop_f32_f16");
 
-    unsafe {
-        let fukfuks = simt_hip::hip_result_call(|x| {
+    let wgp_count = unsafe {
+        simt_hip::hip_result_call(|x| {
             simt_hip_sys::library().hipDeviceGetAttribute(
                 x,
                 simt_hip_sys::hipDeviceAttribute_t::hipDeviceAttributeMultiprocessorCount,
                 phys.index(),
             )
-        })?;
-        println!("num fukfuks {:?}", fukfuks);
-    }
-
+        })? as u32
+    };
+    println!("WGPs: {}", wgp_count);
     println!("{:>32} {:>15} {:>15} {:>15} {:>15}", "name", "ops", "avg", "fast", "slow");
 
     bench("empty_kernel", || {
@@ -908,7 +907,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         bench("wmma_loop_f16_f16", || {
             wmma_loop.launch(
                 LaunchParams {
-                    blocks: (48, 1, 1),
+                    blocks: (wgp_count, 1, 1),
                     threads: (32, 4, 1),
                     shared_mem: 0,
                     stream: None,
@@ -916,7 +915,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
                 (10000,),
             )?;
             sync()?;
-            Ok(2 * 16 * 16 * 16 * 10000 * 48 * 4)
+            Ok(2 * 16 * 16 * 16 * 10000 * wgp_count as usize * 4)
         })?;
     }
 
@@ -924,7 +923,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         bench("wmma_loop_f32_f16", || {
             wmma_loop.launch(
                 LaunchParams {
-                    blocks: (48, 1, 1),
+                    blocks: (wgp_count, 1, 1),
                     threads: (32, 4, 1),
                     shared_mem: 0,
                     stream: None,
@@ -932,7 +931,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
                 (10000,),
             )?;
             sync()?;
-            Ok(2 * 16 * 16 * 16 * 10000 * 48 * 4)
+            Ok(2 * 16 * 16 * 16 * 10000 * wgp_count as usize * 4)
         })?;
     }
 
@@ -948,6 +947,26 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     })?;
     bench("matmul_f16_2048_4096_4096_rrc", || {
         kernels.matmul_f16(
+            &mut out.as_view_mut(),
+            &left.as_view(),
+            &right.as_view().permute(&[1, 0]),
+            MatmulOptions::new(),
+        )?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+    bench("matmul_f16_fast_2048_4096_4096_rrr", || {
+        kernels.matmul_f16_fast(
+            &mut out.as_view_mut(),
+            &left.as_view(),
+            &right.as_view(),
+            MatmulOptions::new(),
+        )?;
+        sync()?;
+        Ok(2 * 2048 * 4096 * 4096)
+    })?;
+    bench("matmul_f16_fast_2048_4096_4096_rrc", || {
+        kernels.matmul_f16_fast(
             &mut out.as_view_mut(),
             &left.as_view(),
             &right.as_view().permute(&[1, 0]),
