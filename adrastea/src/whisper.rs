@@ -408,16 +408,19 @@ impl WhisperKernels {
             MatmulStore::BetaBias(beta, _) => *beta,
             _ => 0.0,
         };
+        const K_TILE: u32 = 64;
+        const N_TILE: u32 = 128;
+        const M_TILE: u32 = 16;
         let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
         self.matmul_f16_fast.launch(
             LaunchParams {
                 blocks: (
-                    ceil_div(output.size(-1) as u64, 128) as u32,
-                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    ceil_div(output.size(-1) as u64, N_TILE as u64) as u32,
+                    ceil_div(output.size(-2) as u64, M_TILE as u64) as u32,
                     if output.layout().dims.len() > 2 { output.size(-3) as u32 } else { 1 },
                 ),
                 threads: (32, 4, 1),
-                shared_mem: 16 * 129 * 2 + 128 * 129 * 2,
+                shared_mem: M_TILE * (K_TILE + 1) * 2 + K_TILE * (N_TILE + 1) * 2,
                 stream: None,
             },
             (

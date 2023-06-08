@@ -184,10 +184,10 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
 // TODO not actually fast yet...
 template <typename T,
           int Mtile = 16,
-          int Ktile = 128,
+          int Ktile = 64,
           int Ntile = 128,
           int Warps = 4,
-          int SIMDWidth = 32,
+          int Lanes = 32,
           int AccumY = 4,
           int AccumX = 4,
           typename InputOperator = Identity<T>,
@@ -197,19 +197,18 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
                             InputOperator input_operator = {},
                             OutputOperator output_operator = {},
                             MaskOperator mask_operator = {}) {
-  static_assert((Mtile * Ntile) % (Warps * SIMDWidth) == 0,
-                "Mtile * Ntile must be divisible by Warps * SIMDWidth");
+  static_assert((Mtile * Ntile) % (Warps * Lanes) == 0,
+                "Mtile * Ntile must be divisible by Warps * Lanes");
   static_assert(Mtile % Warps == 0, "Mtile must be divisible by Warps");
-  static_assert(Ntile % SIMDWidth == 0, "Ntile must be divisible by SIMDWidth");
-  static_assert((Mtile * Ntile) / (Warps * SIMDWidth) == AccumY * AccumX,
-                "Invalid AccumY and AccumX");
+  static_assert(Ntile % Lanes == 0, "Ntile must be divisible by Lanes");
+  static_assert((Mtile * Ntile) / (Warps * Lanes) == AccumY * AccumX, "Invalid AccumY and AccumX");
   static_assert(AccumY == Mtile / Warps, "Invalid AccumY");
-  static_assert(AccumX == Ntile / SIMDWidth, "Invalid AccumX");
+  static_assert(AccumX == Ntile / Lanes, "Invalid AccumX");
   static_assert((Mtile % Warps) == 0, "Warps must divide Mtile");
-  static_assert((Ntile % SIMDWidth) == 0, "SIMDWidth must divide Ntile");
-  static_assert((Ktile % SIMDWidth) == 0, "SIMDWidth must divide Ktile");
+  static_assert((Ntile % Lanes) == 0, "Lanes must divide Ntile");
+  static_assert((Ktile % Lanes) == 0, "Lanes must divide Ktile");
   static_assert((Ktile % Warps) == 0, "Warps must divide Ktile");
-  if (N_LANES != SIMDWidth || N_WARPS != Warps) {
+  if (N_LANES != Lanes || N_WARPS != Warps) {
     return;
   }
   extern __shared__ void* sdata[];
@@ -218,7 +217,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
 #define SDATA(type, side, stride, d0, d1) \
   (((type*)sdata)[SDATA_BASE_##side + ((d0) * (stride)) + (d1)])
 #define LHS(d0, d1) SDATA(__half, LHS, Ktile + 1, d0, d1)
-#define RHS(d0, d1) SDATA(__half, RHS, Ktile + 1, d0, d1)
+#define RHS(d0, d1) SDATA(__half, RHS, Ntile + 1, d0, d1)
   int n_blocks_x = (n + Ntile - 1) / Ntile;
   int n_blocks_y = (m + Mtile - 1) / Mtile;
   int bx = BLOCK_IDX_X;
@@ -240,7 +239,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   while (k >= Ktile) {
     if (is_tail_block) {
       for (int y = 0; y < Mtile; y += Warps) {
-        for (int x = 0; x < Ktile; x += SIMDWidth) {
+        for (int x = 0; x < Ktile; x += Lanes) {
           if (y + WARP_ID >= tail_h) {
             LHS(y + WARP_ID, x + LANE_ID) = 0;
           } else {
@@ -250,7 +249,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
         }
       }
       for (int y = 0; y < Ktile; y += Warps) {
-        for (int x = 0; x < Ntile; x += SIMDWidth) {
+        for (int x = 0; x < Ntile; x += Lanes) {
           if (x + LANE_ID >= tail_w) {
             RHS(y + WARP_ID, x + LANE_ID) = 0;
           } else {
@@ -261,13 +260,13 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
       }
     } else {
       for (int y = 0; y < Mtile; y += Warps) {
-        for (int x = 0; x < Ktile; x += SIMDWidth) {
+        for (int x = 0; x < Ktile; x += Lanes) {
           LHS(y + WARP_ID, x + LANE_ID) =
               input_operator(lhs[(y + WARP_ID) * stride_ly + (x + LANE_ID) * stride_lx]);
         }
       }
       for (int y = 0; y < Ktile; y += Warps) {
-        for (int x = 0; x < Ntile; x += SIMDWidth) {
+        for (int x = 0; x < Ntile; x += Lanes) {
           RHS(y + WARP_ID, x + LANE_ID) =
               input_operator(rhs[(y + WARP_ID) * stride_ry + (x + LANE_ID) * stride_rx]);
         }
@@ -279,8 +278,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
       for (int y = 0; y < AccumY; ++y) {
 #pragma unroll
         for (int x = 0; x < AccumX; ++x) {
-          v_accum[y][x] +=
-              to_float(LHS(y * Warps + WARP_ID, kk) * RHS(kk, x * SIMDWidth + LANE_ID));
+          v_accum[y][x] += to_float(LHS(y * Warps + WARP_ID, kk) * RHS(kk, x * Lanes + LANE_ID));
         }
       }
     }
@@ -294,10 +292,10 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
     for (int y = 0; y < AccumY; ++y) {
       for (int x = 0; x < AccumX; ++x) {
         int warp_y = y * Warps + WARP_ID;
-        int lane_x = x * SIMDWidth + LANE_ID;
+        int lane_x = x * Lanes + LANE_ID;
         if (warp_y < tail_h && lane_x < tail_w) {
           v_accum[y][x] += to_float(input_operator(lhs[(y * Warps + WARP_ID) * stride_ly]) *
-                                    input_operator(rhs[(x * SIMDWidth + LANE_ID) * stride_rx]));
+                                    input_operator(rhs[(x * Lanes + LANE_ID) * stride_rx]));
         }
       }
     }
@@ -312,7 +310,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   for (int y = 0; y < AccumY; ++y) {
     for (int x = 0; x < AccumX; ++x) {
       int warp_y = y * Warps + WARP_ID;
-      int lane_x = x * SIMDWidth + LANE_ID;
+      int lane_x = x * Lanes + LANE_ID;
       int abs_y = warp_y + by * Mtile;
       int abs_x = lane_x + bx * Ntile;
       if (warp_y < tail_h && lane_x < tail_w) {
