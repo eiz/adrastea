@@ -30,6 +30,8 @@ fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
             .arg("--genco")
             .arg(format!("--offload-arch={}", arch))
             .arg("-O2")
+            .arg("-Wall")
+            .arg("-Werror")
             .arg("-o")
             .arg(out_path.join(arch).join(format!("{}.bin", kernel)))
             .arg(format!("cpp/{}.cu", kernel))

@@ -181,6 +181,12 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
 #define N_LANES BLOCK_DIM_X
 #define N_WARPS BLOCK_DIM_Y
 
+#ifdef __gfx1100__
+#define AS_SCALAR(x) __builtin_amdgcn_readfirstlane(x)
+#else
+#define AS_SCALAR(x) x
+#endif
+
 // TODO not actually fast yet...
 template <typename T,
           int Mtile = 16,
@@ -199,15 +205,13 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
                             MaskOperator mask_operator = {}) {
   static_assert((Mtile * Ntile) % (Warps * Lanes) == 0,
                 "Mtile * Ntile must be divisible by Warps * Lanes");
-  static_assert(Mtile % Warps == 0, "Mtile must be divisible by Warps");
-  static_assert(Ntile % Lanes == 0, "Ntile must be divisible by Lanes");
   static_assert((Mtile * Ntile) / (Warps * Lanes) == AccumY * AccumX, "Invalid AccumY and AccumX");
   static_assert(AccumY == Mtile / Warps, "Invalid AccumY");
   static_assert(AccumX == Ntile / Lanes, "Invalid AccumX");
-  static_assert((Mtile % Warps) == 0, "Warps must divide Mtile");
-  static_assert((Ntile % Lanes) == 0, "Lanes must divide Ntile");
-  static_assert((Ktile % Lanes) == 0, "Lanes must divide Ktile");
-  static_assert((Ktile % Warps) == 0, "Warps must divide Ktile");
+  static_assert(Mtile % Warps == 0, "Warps must divide Mtile");
+  static_assert(Ntile % Lanes == 0, "Lanes must divide Ntile");
+  static_assert(Ktile % Lanes == 0, "Lanes must divide Ktile");
+  static_assert(Ktile % Warps == 0, "Warps must divide Ktile");
   if (N_LANES != Lanes || N_WARPS != Warps) {
     return;
   }
@@ -218,15 +222,16 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   (((type*)sdata)[SDATA_BASE_##side + ((d0) * (stride)) + (d1)])
 #define LHS(d0, d1) SDATA(__half, LHS, Ktile + 1, d0, d1)
 #define RHS(d0, d1) SDATA(__half, RHS, Ntile + 1, d0, d1)
-  int n_blocks_x = (n + Ntile - 1) / Ntile;
-  int n_blocks_y = (m + Mtile - 1) / Mtile;
   int bx = BLOCK_IDX_X;
   int by = BLOCK_IDX_Y;
   int b = BLOCK_IDX_Z;
   float v_accum[AccumY][AccumX];
   int tail_h = m - by * Mtile;
+  int warp_tail_h = tail_h - int(WARP_ID);
   int tail_w = n - bx * Ntile;
+  int lane_tail_w = tail_w - int(LANE_ID);
   bool is_tail_block = (tail_h < Mtile) || (tail_w < Ntile);
+  bool is_right_row_major = stride_rx == 1;
   output += b * stride_oz;
   lhs += b * stride_lz + by * Mtile * stride_ly;
   rhs += b * stride_rz + bx * Ntile * stride_rx;
@@ -237,38 +242,56 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   }
 
   while (k >= Ktile) {
+    T const* l_lhs = lhs + WARP_ID * stride_ly + LANE_ID * stride_lx;
+    T const* l_rhs = rhs + WARP_ID * stride_ry + LANE_ID * stride_rx;
     if (is_tail_block) {
       for (int y = 0; y < Mtile; y += Warps) {
         for (int x = 0; x < Ktile; x += Lanes) {
-          if (y + WARP_ID >= tail_h) {
+          if (y >= warp_tail_h) {
             LHS(y + WARP_ID, x + LANE_ID) = 0;
           } else {
-            LHS(y + WARP_ID, x + LANE_ID) =
-                input_operator(lhs[(y + WARP_ID) * stride_ly + (x + LANE_ID) * stride_lx]);
+            LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
           }
         }
       }
-      for (int y = 0; y < Ktile; y += Warps) {
-        for (int x = 0; x < Ntile; x += Lanes) {
-          if (x + LANE_ID >= tail_w) {
-            RHS(y + WARP_ID, x + LANE_ID) = 0;
-          } else {
-            RHS(y + WARP_ID, x + LANE_ID) =
-                input_operator(rhs[(y + WARP_ID) * stride_ry + (x + LANE_ID) * stride_rx]);
+      if (is_right_row_major) {
+        for (int y = 0; y < Ktile; y += Warps) {
+          for (int x = 0; x < Ntile; x += Lanes) {
+            if (x >= lane_tail_w) {
+              RHS(y + WARP_ID, x + LANE_ID) = 0;
+            } else {
+              RHS(y + WARP_ID, x + LANE_ID) = input_operator(l_rhs[y * stride_ry + x]);
+            }
+          }
+        }
+      } else {
+        for (int y = 0; y < Ktile; y += Warps) {
+          for (int x = 0; x < Ntile; x += Lanes) {
+            if (x >= lane_tail_w) {
+              RHS(y + WARP_ID, x + LANE_ID) = 0;
+            } else {
+              RHS(y + WARP_ID, x + LANE_ID) = input_operator(l_rhs[y * stride_ry + x * stride_rx]);
+            }
           }
         }
       }
     } else {
       for (int y = 0; y < Mtile; y += Warps) {
         for (int x = 0; x < Ktile; x += Lanes) {
-          LHS(y + WARP_ID, x + LANE_ID) =
-              input_operator(lhs[(y + WARP_ID) * stride_ly + (x + LANE_ID) * stride_lx]);
+          LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
         }
       }
-      for (int y = 0; y < Ktile; y += Warps) {
-        for (int x = 0; x < Ntile; x += Lanes) {
-          RHS(y + WARP_ID, x + LANE_ID) =
-              input_operator(rhs[(y + WARP_ID) * stride_ry + (x + LANE_ID) * stride_rx]);
+      if (is_right_row_major) {
+        for (int y = 0; y < Ktile; y += Warps) {
+          for (int x = 0; x < Ntile; x += Lanes) {
+            RHS(y + WARP_ID, x + LANE_ID) = input_operator(l_rhs[y * stride_ry + x]);
+          }
+        }
+      } else {
+        for (int y = 0; y < Ktile; y += Warps) {
+          for (int x = 0; x < Ntile; x += Lanes) {
+            RHS(y + WARP_ID, x + LANE_ID) = input_operator(l_rhs[y * stride_ry + x * stride_rx]);
+          }
         }
       }
     }
@@ -401,4 +424,8 @@ extern "C" __global__ void matmul_f16_fast(MATMUL_COMMON_PARAMS(__half),
                                            MatmulMaskOp mask = MatmulMaskOp::NONE) {
   using T = __half;
   MATMUL_GENERIC_STORE_OP(matmul_fast)
+}
+
+extern "C" __global__ void matmul_f16_raw(MATMUL_COMMON_PARAMS(__half)) {
+  matmul_fast(MATMUL_COMMON_ARGS(), {}, {}, {});
 }
