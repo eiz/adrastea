@@ -190,12 +190,12 @@ void __device__ matmul(MATMUL_COMMON_PARAMS(T),
 // TODO not actually fast yet...
 template <typename T,
           int Mtile = 16,
-          int Ktile = 64,
-          int Ntile = 128,
+          int Ktile = 32,
+          int Ntile = 32,
           int Warps = 4,
           int Lanes = 32,
           int AccumY = 4,
-          int AccumX = 4,
+          int AccumX = 1,
           typename InputOperator = Identity<T>,
           typename OutputOperator = Identity<T>,
           typename MaskOperator = NoMask>
@@ -231,6 +231,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   int tail_w = n - bx * Ntile;
   int lane_tail_w = tail_w - int(LANE_ID);
   bool is_right_row_major = stride_rx == 1;
+  bool is_left_row_major = stride_lx == 1;
   output += b * stride_oz;
   lhs += b * stride_lz + by * Mtile * stride_ly;
   rhs += b * stride_rz + bx * Ntile * stride_rx;
@@ -239,27 +240,47 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
       v_accum[y][x] = 0;
     }
   }
-
   while (k >= Ktile) {
     T const* l_lhs = lhs + WARP_ID * stride_ly + LANE_ID * stride_lx;
     T const* l_rhs = rhs + WARP_ID * stride_ry + LANE_ID * stride_rx;
     if (tail_h < Mtile) {
-      for (int y = 0; y < Mtile; y += Warps) {
-        if (y >= warp_tail_h) {
-          for (int x = 0; x < Ktile; x += Lanes) {
-            LHS(y + WARP_ID, x + LANE_ID) = 0;
+      if (is_left_row_major) {
+        for (int y = 0; y < Mtile; y += Warps) {
+          if (y >= warp_tail_h) {
+            for (int x = 0; x < Ktile; x += Lanes) {
+              LHS(y + WARP_ID, x + LANE_ID) = 0;
+            }
+          } else {
+            for (int x = 0; x < Ktile; x += Lanes) {
+              LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x]);
+            }
           }
-        } else {
-          for (int x = 0; x < Ktile; x += Lanes) {
-            LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
+        }
+      } else {
+        for (int y = 0; y < Mtile; y += Warps) {
+          if (y >= warp_tail_h) {
+            for (int x = 0; x < Ktile; x += Lanes) {
+              LHS(y + WARP_ID, x + LANE_ID) = 0;
+            }
+          } else {
+            for (int x = 0; x < Ktile; x += Lanes) {
+              LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
+            }
           }
         }
       }
-
     } else {
-      for (int y = 0; y < Mtile; y += Warps) {
-        for (int x = 0; x < Ktile; x += Lanes) {
-          LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
+      if (is_left_row_major) {
+        for (int y = 0; y < Mtile; y += Warps) {
+          for (int x = 0; x < Ktile; x += Lanes) {
+            LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x]);
+          }
+        }
+      } else {
+        for (int y = 0; y < Mtile; y += Warps) {
+          for (int x = 0; x < Ktile; x += Lanes) {
+            LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
+          }
         }
       }
     }
@@ -302,9 +323,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
     }
     __syncthreads();
     for (int kk = 0; kk < Ktile; ++kk) {
-#pragma unroll
       for (int y = 0; y < AccumY; ++y) {
-#pragma unroll
         for (int x = 0; x < AccumX; ++x) {
           v_accum[y][x] += to_float(LHS(y * Warps + WARP_ID, kk) * RHS(kk, x * Lanes + LANE_ID));
         }
@@ -316,6 +335,7 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
     __syncthreads();
   }
 
+  // trash case. don't hit this.
   while (k > 0) {
     for (int y = 0; y < AccumY; ++y) {
       for (int x = 0; x < AccumX; ++x) {
