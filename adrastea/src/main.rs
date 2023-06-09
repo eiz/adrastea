@@ -31,16 +31,17 @@ use simt_hip::{
 };
 
 use crate::{
+    kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
     pickle::{ModelState, PickledModel},
     tensor::Tensor,
     whisper::{
-        CommonKernels, MatmulOptions, MatmulTracer, WhisperContext, WhisperKernels, WhisperModel,
-        WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
+        WhisperContext, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
     },
 };
 
 extern crate alloc;
 
+pub mod kernels;
 pub mod mel;
 pub mod pickle;
 pub mod stft;
@@ -698,7 +699,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
-    let kernels = Arc::new(MatmulTracer::new(WhisperKernels::new(phys.capability()?)?));
+    let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
     let start = Instant::now();
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     println!("model load time: {:?}", start.elapsed());
@@ -880,7 +881,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
-    let kernels = WhisperKernels::new(phys.capability()?)?;
+    let kernels = GpuKernels::new(phys.capability()?)?;
     let module_microbench = HipModule::find(phys.capability()?, adrastea_kernels::microbench)?;
     let empty_kernel: Kernel<(i32,)> = Kernel::new(&module_microbench, "empty_kernel")?;
     let wmma_loop_f16_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
