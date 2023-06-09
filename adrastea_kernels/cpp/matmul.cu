@@ -217,11 +217,11 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   }
   extern __shared__ void* sdata[];
   const int SDATA_BASE_LHS = 0;
-  const int SDATA_BASE_RHS = Mtile * (Ktile + 1);
+  const int SDATA_BASE_RHS = Mtile * (Ktile + 2);
 #define SDATA(type, side, stride, d0, d1) \
   (((type*)sdata)[SDATA_BASE_##side + ((d0) * (stride)) + (d1)])
-#define LHS(d0, d1) SDATA(__half, LHS, Ktile + 1, d0, d1)
-#define RHS(d0, d1) SDATA(__half, RHS, Ntile + 1, d0, d1)
+#define LHS(d0, d1) SDATA(__half, LHS, Ktile + 2, d0, d1)
+#define RHS(d0, d1) SDATA(__half, RHS, Ntile + 2, d0, d1)
   int bx = BLOCK_IDX_X;
   int by = BLOCK_IDX_Y;
   int b = BLOCK_IDX_Z;
@@ -230,7 +230,6 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   int warp_tail_h = tail_h - int(WARP_ID);
   int tail_w = n - bx * Ntile;
   int lane_tail_w = tail_w - int(LANE_ID);
-  bool is_tail_block = (tail_h < Mtile) || (tail_w < Ntile);
   bool is_right_row_major = stride_rx == 1;
   output += b * stride_oz;
   lhs += b * stride_lz + by * Mtile * stride_ly;
@@ -244,16 +243,27 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   while (k >= Ktile) {
     T const* l_lhs = lhs + WARP_ID * stride_ly + LANE_ID * stride_lx;
     T const* l_rhs = rhs + WARP_ID * stride_ry + LANE_ID * stride_rx;
-    if (is_tail_block) {
+    if (tail_h < Mtile) {
       for (int y = 0; y < Mtile; y += Warps) {
-        for (int x = 0; x < Ktile; x += Lanes) {
-          if (y >= warp_tail_h) {
+        if (y >= warp_tail_h) {
+          for (int x = 0; x < Ktile; x += Lanes) {
             LHS(y + WARP_ID, x + LANE_ID) = 0;
-          } else {
+          }
+        } else {
+          for (int x = 0; x < Ktile; x += Lanes) {
             LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
           }
         }
       }
+
+    } else {
+      for (int y = 0; y < Mtile; y += Warps) {
+        for (int x = 0; x < Ktile; x += Lanes) {
+          LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
+        }
+      }
+    }
+    if (tail_w < Ntile) {
       if (is_right_row_major) {
         for (int y = 0; y < Ktile; y += Warps) {
           for (int x = 0; x < Ntile; x += Lanes) {
@@ -276,11 +286,6 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
         }
       }
     } else {
-      for (int y = 0; y < Mtile; y += Warps) {
-        for (int x = 0; x < Ktile; x += Lanes) {
-          LHS(y + WARP_ID, x + LANE_ID) = input_operator(l_lhs[y * stride_ly + x * stride_lx]);
-        }
-      }
       if (is_right_row_major) {
         for (int y = 0; y < Ktile; y += Warps) {
           for (int x = 0; x < Ntile; x += Lanes) {

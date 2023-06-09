@@ -772,7 +772,7 @@ impl Display for Flops {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut flops = self.0;
         let mut units = 0;
-        while flops > 1000.0 {
+        while flops > 1000.0 && units < 5 {
             flops /= 1000.0;
             units += 1;
         }
@@ -825,11 +825,11 @@ fn bench<F: FnMut() -> anyhow::Result<usize>>(name: &str, mut f: F) -> anyhow::R
     let min_per_sec = min_ops as f64 / min_elapsed.as_secs_f64();
     let max_per_sec = max_ops as f64 / max_elapsed.as_secs_f64();
     println!(
-        "{:>32} {:>15} {:>15} {:>15} {:>15}",
+        "{:40} {:>15} {:>15} {:>15} {:>15}",
         name,
         format!("{}", ops),
-        format!("{}", Flops(avg_per_sec)),
         format!("{}", Flops(min_per_sec)),
+        format!("{}", Flops(avg_per_sec)),
         format!("{}", Flops(max_per_sec))
     );
     Ok(())
@@ -889,7 +889,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         })? as u32
     };
     println!("WGPs: {}", wgp_count);
-    println!("{:>32} {:>15} {:>15} {:>15} {:>15}", "name", "ops", "avg", "fast", "slow");
+    println!("{:40} {:>15} {:>15} {:>15} {:>15}", "name", "ops", "fast", "avg", "slow");
 
     bench("empty_kernel", || {
         empty_kernel.launch(

@@ -420,7 +420,7 @@ impl WhisperKernels {
                     if output.layout().dims.len() > 2 { output.size(-3) as u32 } else { 1 },
                 ),
                 threads: (32, 4, 1),
-                shared_mem: M_TILE * (K_TILE + 1) * 2 + K_TILE * (N_TILE + 1) * 2,
+                shared_mem: M_TILE * (K_TILE + 2) * 2 + K_TILE * (N_TILE + 2) * 2,
                 stream: None,
             },
             (
