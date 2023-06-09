@@ -12,6 +12,7 @@ dependencies = [
  "half",
  "matrixmultiply",
  "memmap2",
+ "parking_lot",
  "rustfft",
  "serde",
  "serde-pickle",

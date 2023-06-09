@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::util::ElidingRangeIterator;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TensorLayout {
     pub dims: SmallVec<[usize; 7]>,
     pub strides: SmallVec<[usize; 7]>,

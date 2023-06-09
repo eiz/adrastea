@@ -15,6 +15,8 @@
 
 use alloc::sync::Arc;
 use core::fmt::{self, Debug, Formatter};
+use parking_lot::Mutex;
+use std::collections::HashSet;
 
 use half::f16;
 use rustfft::num_complex::Complex32;
@@ -128,6 +130,113 @@ impl<'a> MatmulOptions<'a> {
     }
 }
 
+pub trait CommonKernels {
+    fn conv1d(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()>;
+    fn elementwise_binary_2d_f16_inplace(
+        &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
+    ) -> anyhow::Result<()>;
+    fn layer_norm(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, eps: f32,
+    ) -> anyhow::Result<()>;
+    fn matmul_f16(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()>;
+    fn matmul_f16_fast(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()>;
+    fn softmax_rows_inplace(
+        &self, output: &mut TensorViewMut<f16>, temperature: f32,
+    ) -> anyhow::Result<()>;
+    fn embed(
+        &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
+    ) -> anyhow::Result<()>;
+}
+
+pub struct MatmulTracer {
+    kernels: WhisperKernels,
+    shape_set: Mutex<HashSet<(TensorLayout, TensorLayout, TensorLayout)>>,
+}
+
+impl MatmulTracer {
+    pub fn new(kernels: WhisperKernels) -> Self {
+        Self { kernels, shape_set: Mutex::new(HashSet::new()) }
+    }
+
+    pub fn clear(&self) {
+        self.shape_set.lock().clear();
+    }
+
+    pub fn shapes(&self) -> Vec<(TensorLayout, TensorLayout, TensorLayout)> {
+        self.shape_set.lock().iter().cloned().collect()
+    }
+}
+
+impl CommonKernels for MatmulTracer {
+    fn conv1d(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.kernels.conv1d(output, input, weight, bias, kernel_size, stride, padding, activation)
+    }
+    fn elementwise_binary_2d_f16_inplace(
+        &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
+    ) -> anyhow::Result<()> {
+        self.kernels.elementwise_binary_2d_f16_inplace(inout_left, right, op)
+    }
+    fn layer_norm(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, eps: f32,
+    ) -> anyhow::Result<()> {
+        self.kernels.layer_norm(output, input, weight, bias, eps)
+    }
+    fn matmul_f16(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()> {
+        let left_layout = left.layout();
+        let right_layout = right.layout();
+        let output_layout = output.layout();
+        self.shape_set.lock().insert((
+            left_layout.clone(),
+            right_layout.clone(),
+            output_layout.clone(),
+        ));
+        self.kernels.matmul_f16(output, left, right, options)
+    }
+    fn matmul_f16_fast(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()> {
+        let left_layout = left.layout();
+        let right_layout = right.layout();
+        let output_layout = output.layout();
+        self.shape_set.lock().insert((
+            left_layout.clone(),
+            right_layout.clone(),
+            output_layout.clone(),
+        ));
+        self.kernels.matmul_f16_fast(output, left, right, options)
+    }
+    fn softmax_rows_inplace(
+        &self, output: &mut TensorViewMut<f16>, temperature: f32,
+    ) -> anyhow::Result<()> {
+        self.kernels.softmax_rows_inplace(output, temperature)
+    }
+    fn embed(
+        &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        self.kernels.embed(output, tokens, embed)
+    }
+}
+
 pub struct WhisperKernels {
     _modules: Vec<HipModule>,
     conv1d: Kernel<(
@@ -230,7 +339,10 @@ impl WhisperKernels {
         };
         Ok(kernels)
     }
-    pub fn conv1d(
+}
+
+impl CommonKernels for WhisperKernels {
+    fn conv1d(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
         activation: Conv1dActivation,
@@ -264,7 +376,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn elementwise_binary_2d_f16_inplace(
+    fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()> {
         self.elementwise_binary_2d_f16.launch(
@@ -296,7 +408,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn layer_norm(
+    fn layer_norm(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, eps: f32,
     ) -> anyhow::Result<()> {
@@ -324,7 +436,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn matmul_f16(
+    fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()> {
@@ -386,7 +498,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn matmul_f16_fast(
+    fn matmul_f16_fast(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()> {
@@ -451,7 +563,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn softmax_rows_inplace(
+    fn softmax_rows_inplace(
         &self, output: &mut TensorViewMut<f16>, temperature: f32,
     ) -> anyhow::Result<()> {
         self.softmax_rows.launch(
@@ -476,7 +588,7 @@ impl WhisperKernels {
         Ok(())
     }
 
-    pub fn embed(
+    fn embed(
         &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
     ) -> anyhow::Result<()> {
         assert_eq!(tokens.size(-1), output.size(-2));
@@ -745,13 +857,13 @@ struct WhisperContextCacheLayer {
 
 pub struct WhisperContext {
     model: Arc<WhisperModel>,
-    kernels: Arc<WhisperKernels>,
+    kernels: Arc<dyn CommonKernels>,
     mel_transform: mel::LogMelSpectrogramTransform,
     kv_cache: Vec<WhisperContextCacheLayer>,
 }
 
 impl WhisperContext {
-    pub fn new(model: Arc<WhisperModel>, kernels: Arc<WhisperKernels>) -> anyhow::Result<Self> {
+    pub fn new(model: Arc<WhisperModel>, kernels: Arc<dyn CommonKernels>) -> anyhow::Result<Self> {
         Ok(Self {
             kernels,
             mel_transform: mel::LogMelSpectrogramTransform::new(

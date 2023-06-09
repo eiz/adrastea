@@ -34,8 +34,8 @@ use crate::{
     pickle::{ModelState, PickledModel},
     tensor::Tensor,
     whisper::{
-        MatmulOptions, WhisperContext, WhisperKernels, WhisperModel, WhisperModelState,
-        WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
+        CommonKernels, MatmulOptions, MatmulTracer, WhisperContext, WhisperKernels, WhisperModel,
+        WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
     },
 };
 
@@ -698,7 +698,7 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
-    let kernels = Arc::new(WhisperKernels::new(phys.capability()?)?);
+    let kernels = Arc::new(MatmulTracer::new(WhisperKernels::new(phys.capability()?)?));
     let start = Instant::now();
     let model = WhisperModel::new(&WhisperModelState::load(model_path, ())?)?;
     println!("model load time: {:?}", start.elapsed());
@@ -743,7 +743,8 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     println!("initial tokens {:?}", tokens);
     println!("features {:>7.4?}", features);
     let start = Instant::now();
-    for _i in 0..50 {
+    let mut total_generated = 0;
+    for _i in 0..context.model().dims().n_text_ctx {
         let logits = context.decode(features.as_view(), &tokens)?.into_cpu()?;
         let logits_vec = logits.storage().as_cpu();
         let last_logits = &logits_vec[logits_vec.len() - context.model().dims().n_vocab as usize..];
@@ -758,11 +759,19 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
         let detok =
             context.model().tokenizer().decode(tokens.iter().map(|x| *x as usize).collect());
         println!("text {:?}", detok);
+        total_generated += 1;
         if argmax as usize == end_of_text {
             break;
         }
     }
-    println!("decode time: {:?}", start.elapsed());
+    println!(
+        "decode time: {:?} ({:.4}s/tok)",
+        start.elapsed(),
+        start.elapsed().as_secs_f32() / total_generated as f32
+    );
+    for shape in kernels.shapes() {
+        println!("{:?}", shape);
+    }
     Ok(())
 }
 

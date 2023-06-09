@@ -354,7 +354,6 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
   }
 
   // output
-
   for (int y = 0; y < AccumY; ++y) {
     for (int x = 0; x < AccumX; ++x) {
       int warp_y = y * Warps + WARP_ID;
