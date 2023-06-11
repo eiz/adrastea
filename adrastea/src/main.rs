@@ -41,6 +41,7 @@ use crate::{
 
 extern crate alloc;
 
+pub mod audio;
 pub mod kernels;
 pub mod mel;
 pub mod pickle;
@@ -888,7 +889,6 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Kernel::new(&module_microbench, "wmma_loop_f16_f16");
     let wmma_loop_f32_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
         Kernel::new(&module_microbench, "wmma_loop_f32_f16");
-
     let wgp_count = unsafe {
         simt_hip::hip_result_call(|x| {
             simt_hip_sys::library().hipDeviceGetAttribute(
@@ -1063,6 +1063,8 @@ fn main() -> anyhow::Result<()> {
         unsafe { vulkan_square()? }
     } else if args.len() >= 2 && args[1] == "microbenchmark" {
         unsafe { microbenchmark()? }
+    } else if args.len() >= 2 && args[1] == "audio" {
+        unsafe { audio::test()? }
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }

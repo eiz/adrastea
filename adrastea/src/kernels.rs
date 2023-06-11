@@ -101,6 +101,7 @@ impl<'a> MatmulOptions<'a> {
 }
 
 pub trait CommonKernels {
+    // TODO: replace with conv2d, lol
     fn conv1d(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
