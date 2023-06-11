@@ -14,6 +14,7 @@
  */
 
 use core::{cell::UnsafeCell, ffi::c_void};
+use std::f64::consts::PI;
 
 use alloc::sync::Arc;
 use libspa_sys::{
@@ -21,7 +22,6 @@ use libspa_sys::{
     SPA_PARAM_EnumFormat, SPA_AUDIO_FORMAT_F32,
 };
 use pipewire::{
-    buffer::Buffer,
     properties,
     spa::Direction,
     stream::{ListenerBuilderT, Stream, StreamFlags},
@@ -39,6 +39,7 @@ struct RealTimeEngine {
 }
 
 struct AudioControlThreadInner {
+    // must only be accessed in process callbacks or otherwise on the pw_data_loop
     rt: UnsafeCell<RealTimeEngine>,
 }
 
@@ -48,9 +49,9 @@ struct AudioControlThread {
 
 fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
     for i in 0..buf.len() / n_channels {
-        *last += std::f64::consts::PI * 2.0 * 440.0 / SAMPLE_RATE as f64;
-        if *last > std::f64::consts::PI * 2.0 {
-            *last -= std::f64::consts::PI * 2.0;
+        *last += PI * 2.0 * 440.0 / SAMPLE_RATE as f64;
+        if *last > PI * 2.0 {
+            *last -= PI * 2.0;
         }
         let val = (*last).sin() as f32 * VOLUME;
         for j in 0..n_channels {
@@ -80,7 +81,7 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
             *pipewire::keys::MEDIA_TYPE => "Audio",
             *pipewire::keys::MEDIA_CATEGORY => "Capture",
             *pipewire::keys::MEDIA_ROLE => "Communication",
-            *pipewire::keys::NODE_LATENCY => "448/48000",
+            *pipewire::keys::NODE_LATENCY => "480/48000",
         },
     )?;
     let mut render_stream: Stream<()> = Stream::new(
@@ -90,7 +91,7 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
             *pipewire::keys::MEDIA_TYPE => "Audio",
             *pipewire::keys::MEDIA_CATEGORY => "Playback",
             *pipewire::keys::MEDIA_ROLE => "Communication",
-            *pipewire::keys::NODE_LATENCY => "448/48000",
+            *pipewire::keys::NODE_LATENCY => "480/48000",
         },
     )?;
     let mut builder: spa_pod_builder = std::mem::zeroed();
@@ -130,7 +131,7 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
             .state_changed(|old, new| {
                 println!("capture state changed {:?} {:?} {:?}", std::thread::current(), old, new);
             })
-            .register()
+            .register()?
     };
     let _render_listener = render_stream
         .add_local_listener()
@@ -138,19 +139,19 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
             let state = state.clone();
             move |stream, ()| {
                 let rt = &mut *state.rt.get();
+                // TODO we're using raw buffers here due to some limitations in
+                // the safe rust bindings, namely, the lack of access to
+                // 'requested'
                 let raw_buffer = stream.dequeue_raw_buffer();
-
                 if raw_buffer.is_null() {
                     return;
                 }
-
                 let requested = (*raw_buffer).requested as usize;
+                assert!((*(*raw_buffer).buffer).n_datas > 0);
                 let data0 = &mut *(*(*raw_buffer).buffer).datas;
-
                 if data0.data.is_null() {
                     return;
                 }
-
                 let stride = NUM_CHANNELS * std::mem::size_of::<f32>();
                 let data_buf = std::slice::from_raw_parts_mut(
                     data0.data as *mut f32,
@@ -161,7 +162,6 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
                 (*data0.chunk).offset = 0;
                 (*data0.chunk).stride = stride as i32;
                 (*data0.chunk).size = (data_buf.len() * std::mem::size_of::<f32>()) as u32;
-
                 if rt.did_thing && !rt.did_other_thing {
                     rt.did_other_thing = true;
                     println!("did other thing after doing thing");
@@ -208,7 +208,7 @@ impl Drop for AudioControlThread {
     }
 }
 
-pub unsafe fn test() -> anyhow::Result<()> {
+pub fn test() -> anyhow::Result<()> {
     let audio_control = AudioControlThread::new();
     Ok(())
 }

@@ -1064,7 +1064,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "microbenchmark" {
         unsafe { microbenchmark()? }
     } else if args.len() >= 2 && args[1] == "audio" {
-        unsafe { audio::test()? }
+        audio::test()?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }
