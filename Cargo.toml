@@ -6,6 +6,10 @@ members = ["adrastea", "adrastea_kernels"]
 serde-pickle = { git = "https://github.com/eiz/serde-pickle", branch = "mack/persid" }
 half = { git = "https://github.com/eiz/half-rs", branch = "mack/format-options-2.2.1" }
 tiktoken-rs = { git = "https://github.com/eiz/tiktoken-rs", branch = "mack/whisper" }
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", branch = "main" }
+pipewire-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", branch = "main" }
+libspa = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", branch = "main" }
+libspa-sys = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", branch = "main" }
 
 [profile.release-lto]
 inherits = "release"
