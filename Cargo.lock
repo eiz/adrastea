@@ -15,6 +15,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "pipewire",
+ "pipewire-sys",
  "rustfft",
  "serde",
  "serde-pickle",

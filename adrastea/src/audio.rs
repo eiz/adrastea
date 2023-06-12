@@ -17,16 +17,19 @@ use core::{cell::UnsafeCell, ffi::c_void};
 use std::f64::consts::PI;
 
 use alloc::sync::Arc;
+use anyhow::bail;
 use libspa_sys::{
     spa_audio_info_raw, spa_format_audio_raw_build, spa_pod_builder, spa_pod_builder_init,
     SPA_PARAM_EnumFormat, SPA_AUDIO_FORMAT_F32,
 };
 use pipewire::{
     properties,
-    spa::Direction,
+    spa::{spa_interface_call_method, Direction},
     stream::{ListenerBuilderT, Stream, StreamFlags},
-    Context, MainLoop,
+    Context, EventSource, IsSource, MainLoop,
 };
+
+use crate::util::{AtomicRing, AtomicRingWaiter, AtomicRingWriter};
 
 const SAMPLE_RATE: u32 = 48000;
 const NUM_CHANNELS: usize = 2;
@@ -43,8 +46,19 @@ struct AudioControlThreadInner {
     rt: UnsafeCell<RealTimeEngine>,
 }
 
+#[derive(Clone)]
+enum AudioControlThreadResponse {
+    Initialized { event_source: *mut libspa_sys::spa_source, pw_loop: *mut pipewire_sys::pw_loop },
+    InitializationFailed, // TODO wrap an error
+}
+
+unsafe impl Send for AudioControlThreadResponse {}
+
 struct AudioControlThread {
     thread: Option<std::thread::JoinHandle<()>>,
+    waiter: AtomicRingWaiter<AudioControlThreadResponse>,
+    event_source: *mut libspa_sys::spa_source,
+    pw_loop: *mut pipewire_sys::pw_loop,
 }
 
 fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
@@ -60,7 +74,10 @@ fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
     }
 }
 
-unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
+unsafe fn audio_control_thread_main(
+    tx: &mut AtomicRingWriter<AudioControlThreadResponse>,
+    waiter: AtomicRingWaiter<AudioControlThreadResponse>,
+) -> anyhow::Result<()> {
     let state = Arc::new(AudioControlThreadInner {
         rt: UnsafeCell::new(RealTimeEngine {
             accumulator: 0.0,
@@ -188,17 +205,60 @@ unsafe fn audio_control_thread_main() -> anyhow::Result<()> {
         StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         &mut [pod],
     )?;
+    let event_handler = main_loop.add_event(|| {
+        println!("event handler");
+    });
+
+    assert_eq!(
+        1,
+        tx.try_pushn(&[AudioControlThreadResponse::Initialized {
+            event_source: event_handler.as_ptr(),
+            pw_loop: main_loop.as_raw() as *const _ as *mut _
+        }])
+    );
+    waiter.alert();
     main_loop.run();
     Ok(())
 }
 
 impl AudioControlThread {
-    pub fn new() -> Self {
-        let thread = Some(std::thread::spawn(|| unsafe {
-            let _ = audio_control_thread_main(); // TODO handle error
+    pub fn new() -> anyhow::Result<Self> {
+        // single-slot mailbox for receiving responses back from the ACT
+        // prob not the ideal solution here but I had it handy and I'm sick of
+        // adding dependencies for this ... thing
+        let (act_rx, mut act_tx) = AtomicRing::new(1);
+        let waiter = AtomicRingWaiter::new(act_rx);
+        let thread = Some(std::thread::spawn({
+            let waiter = waiter.clone();
+            move || unsafe {
+                if let Err(_e) = audio_control_thread_main(&mut act_tx, waiter) {
+                    assert_eq!(
+                        1,
+                        act_tx.try_pushn(&[AudioControlThreadResponse::InitializationFailed])
+                    );
+                }
+            }
         }));
+        match waiter.wait_pop() {
+            AudioControlThreadResponse::Initialized { event_source, pw_loop } => {
+                Ok(Self { thread, waiter, event_source, pw_loop })
+            }
+            AudioControlThreadResponse::InitializationFailed => {
+                bail!("failed to initialize audio control thread")
+            }
+        }
+    }
 
-        Self { thread }
+    pub fn prove_we_can_send_events(&self) {
+        unsafe {
+            use libspa_sys as spa_sys;
+            spa_interface_call_method!(
+                &mut (*(*self.pw_loop).utils).iface as *mut libspa_sys::spa_interface,
+                spa_sys::spa_loop_utils_methods,
+                signal_event,
+                self.event_source
+            );
+        }
     }
 }
 
@@ -209,6 +269,14 @@ impl Drop for AudioControlThread {
 }
 
 pub fn test() -> anyhow::Result<()> {
-    let audio_control = AudioControlThread::new();
+    for _ in 0..100 {
+        std::thread::spawn(|| {
+            let _mainloop = pipewire::MainLoop::new().unwrap();
+        });
+    }
+
+    let audio_control = AudioControlThread::new()?;
+    println!("we got audio control");
+    audio_control.prove_we_can_send_events();
     Ok(())
 }

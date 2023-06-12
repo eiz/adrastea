@@ -21,6 +21,7 @@ use core::{
 };
 
 use alloc::{alloc::dealloc, sync::Arc};
+use parking_lot::{Condvar, Mutex};
 
 pub struct ElidingRangeIterator {
     end: usize,
@@ -177,5 +178,43 @@ impl<T: Send + Clone> AtomicRingWriter<T> {
 
         self.0.write_ptr.store(write_ptr.wrapping_add(copied), Ordering::Release);
         copied
+    }
+}
+
+pub struct AtomicRingWaiterInner<T: Send> {
+    ring: Mutex<AtomicRingReader<T>>,
+    cvar: Condvar,
+}
+
+#[derive(Clone)]
+pub struct AtomicRingWaiter<T: Send>(Arc<AtomicRingWaiterInner<T>>);
+
+impl<T: Send> AtomicRingWaiter<T> {
+    pub fn new(ring: AtomicRingReader<T>) -> Self {
+        Self(Arc::new(AtomicRingWaiterInner { ring: Mutex::new(ring), cvar: Condvar::new() }))
+    }
+
+    pub fn read_available(&self) -> usize {
+        self.0.ring.lock().read_available()
+    }
+
+    pub fn try_pop(&self) -> Option<T> {
+        self.0.ring.lock().try_pop()
+    }
+
+    pub fn wait_pop(&self) -> T {
+        let mut ring = self.0.ring.lock();
+
+        loop {
+            if let Some(value) = ring.try_pop() {
+                return value;
+            }
+
+            self.0.cvar.wait(&mut ring);
+        }
+    }
+
+    pub fn alert(&self) {
+        self.0.cvar.notify_one();
     }
 }
