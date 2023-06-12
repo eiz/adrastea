@@ -13,7 +13,12 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use core::{cell::UnsafeCell, ffi::c_void};
+use core::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use std::f64::consts::PI;
 
 use alloc::sync::Arc;
@@ -26,7 +31,7 @@ use pipewire::{
     properties,
     spa::{spa_interface_call_method, Direction},
     stream::{ListenerBuilderT, Stream, StreamFlags},
-    Context, EventSource, IsSource, MainLoop,
+    Context, IsSource, MainLoop,
 };
 
 use crate::util::{AtomicRing, AtomicRingWaiter, AtomicRingWriter};
@@ -48,7 +53,11 @@ struct AudioControlThreadInner {
 
 #[derive(Clone)]
 enum AudioControlThreadResponse {
-    Initialized { event_source: *mut libspa_sys::spa_source, pw_loop: *mut pipewire_sys::pw_loop },
+    Initialized {
+        control_event: *mut libspa_sys::spa_source,
+        quit_event: *mut libspa_sys::spa_source,
+        pw_loop: *mut pipewire_sys::pw_loop,
+    },
     InitializationFailed, // TODO wrap an error
 }
 
@@ -57,7 +66,8 @@ unsafe impl Send for AudioControlThreadResponse {}
 struct AudioControlThread {
     thread: Option<std::thread::JoinHandle<()>>,
     waiter: AtomicRingWaiter<AudioControlThreadResponse>,
-    event_source: *mut libspa_sys::spa_source,
+    control_event: *mut libspa_sys::spa_source,
+    quit_event: *mut libspa_sys::spa_source,
     pw_loop: *mut pipewire_sys::pw_loop,
 }
 
@@ -205,20 +215,46 @@ unsafe fn audio_control_thread_main(
         StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         &mut [pod],
     )?;
-    let event_handler = main_loop.add_event(|| {
+    let control_event = main_loop.add_event(|| {
         println!("event handler");
+    });
+    // Another API issue: add_event callbacks aren't FnMut
+    let received_quit = Arc::new(AtomicBool::new(false));
+    let quit_event = main_loop.add_event({
+        let main_loop = main_loop.clone();
+        let received_quit = received_quit.clone();
+        move || {
+            println!("quit event!");
+            received_quit.store(true, Ordering::SeqCst);
+            main_loop.quit();
+        }
     });
 
     assert_eq!(
         1,
         tx.try_pushn(&[AudioControlThreadResponse::Initialized {
-            event_source: event_handler.as_ptr(),
+            control_event: control_event.as_ptr(),
+            quit_event: quit_event.as_ptr(),
             pw_loop: main_loop.as_raw() as *const _ as *mut _
         }])
     );
     waiter.alert();
     main_loop.run();
+
+    if !received_quit.load(Ordering::SeqCst) {
+        panic!("pipewire main loop exited unexpectedly");
+    }
     Ok(())
+}
+
+unsafe fn signal_event(pw_loop: *mut pipewire_sys::pw_loop, event: *mut libspa_sys::spa_source) {
+    use libspa_sys as spa_sys;
+    spa_interface_call_method!(
+        &mut (*(*pw_loop).utils).iface as *mut libspa_sys::spa_interface,
+        spa_sys::spa_loop_utils_methods,
+        signal_event,
+        event
+    );
 }
 
 impl AudioControlThread {
@@ -240,8 +276,8 @@ impl AudioControlThread {
             }
         }));
         match waiter.wait_pop() {
-            AudioControlThreadResponse::Initialized { event_source, pw_loop } => {
-                Ok(Self { thread, waiter, event_source, pw_loop })
+            AudioControlThreadResponse::Initialized { control_event, quit_event, pw_loop } => {
+                Ok(Self { thread, waiter, control_event, quit_event, pw_loop })
             }
             AudioControlThreadResponse::InitializationFailed => {
                 bail!("failed to initialize audio control thread")
@@ -250,20 +286,13 @@ impl AudioControlThread {
     }
 
     pub fn prove_we_can_send_events(&self) {
-        unsafe {
-            use libspa_sys as spa_sys;
-            spa_interface_call_method!(
-                &mut (*(*self.pw_loop).utils).iface as *mut libspa_sys::spa_interface,
-                spa_sys::spa_loop_utils_methods,
-                signal_event,
-                self.event_source
-            );
-        }
+        unsafe { signal_event(self.pw_loop, self.control_event) }
     }
 }
 
 impl Drop for AudioControlThread {
     fn drop(&mut self) {
+        unsafe { signal_event(self.pw_loop, self.quit_event) }
         self.thread.take().unwrap().join().unwrap();
     }
 }
@@ -278,5 +307,6 @@ pub fn test() -> anyhow::Result<()> {
     let audio_control = AudioControlThread::new()?;
     println!("we got audio control");
     audio_control.prove_we_can_send_events();
+    std::thread::sleep(Duration::from_secs(5));
     Ok(())
 }
