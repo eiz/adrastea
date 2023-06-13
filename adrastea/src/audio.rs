@@ -14,18 +14,17 @@
  */
 
 use core::{
-    alloc::Layout,
-    cell::{RefCell, UnsafeCell},
+    cell::UnsafeCell,
     ffi::c_void,
     mem::MaybeUninit,
-    ptr::{self, NonNull},
+    ptr::{self},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use std::f64::consts::PI;
 
-use alloc::{collections::BTreeMap, rc::Rc, sync::Arc};
-use allocator_api2::{alloc::Allocator, boxed::Box};
+use alloc::{rc::Rc, sync::Arc};
+use allocator_api2::boxed::Box;
 use anyhow::bail;
 use libspa_sys::{
     spa_audio_info_raw, spa_format_audio_raw_build, spa_pod_builder, spa_pod_builder_init,
@@ -38,7 +37,10 @@ use pipewire::{
     Context, IsSource, MainLoop,
 };
 
-use crate::util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWriter};
+use crate::{
+    rt_alloc::RtObjectHeap,
+    util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWriter},
+};
 
 const SAMPLE_RATE: u32 = 48000;
 const NUM_CHANNELS: usize = 2;
@@ -50,184 +52,6 @@ struct RealTimeThreadState {
     did_thing: bool,
     did_other_thing: bool,
     capture_sinks: *mut RtCaptureSink,
-}
-
-struct RtObjectArena {
-    arena: *mut c_void,
-    size: u32,
-    free_map: BTreeMap<u32, u32>,
-}
-
-impl RtObjectArena {
-    pub fn new(size: u32) -> Self {
-        unsafe {
-            let ptr = libc::mmap64(
-                ptr::null_mut(),
-                size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-            if ptr == libc::MAP_FAILED {
-                panic!("rt_allocator: failed to alloc pages");
-            }
-            if libc::mlock(ptr, size as usize) < 0 {
-                panic!("rt_allocator: failed to lock pages");
-            }
-            let mut free_map = BTreeMap::new();
-            free_map.insert(0, size);
-            Self { arena: ptr, size, free_map }
-        }
-    }
-
-    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> *mut c_void {
-        let size = self.free_map.remove(&offset).expect("invariant: invalid allocation offset");
-        let size_lo = required_padding(offset, layout.align() as u32);
-        let data_base = offset + size_lo;
-        let upper_base = data_base + layout.size() as u32;
-        let size_hi = offset + size - upper_base;
-        assert!(upper_base + size_hi <= self.size);
-        unsafe {
-            let result = self.arena.add(data_base as usize);
-            if size_lo > 0 {
-                self.free_map.insert(offset, size_lo);
-            }
-            if size_hi > 0 {
-                self.free_map.insert(upper_base, size_hi);
-            }
-            result
-        }
-    }
-}
-
-impl Drop for RtObjectArena {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munlock(self.arena, self.size as usize);
-            libc::munmap(self.arena, self.size as usize);
-        }
-    }
-}
-
-struct RtObjectHeapInner {
-    arenas: Vec<RtObjectArena>,
-    arena_size: u32,
-    max_arenas: usize,
-}
-
-impl RtObjectHeapInner {
-    fn more_core(&mut self) -> usize {
-        if self.arenas.len() >= self.max_arenas {
-            panic!("rt_allocator: exhausted arena limit");
-        }
-        self.arenas.push(RtObjectArena::new(self.arena_size));
-        self.arenas.len() - 1
-    }
-}
-
-#[derive(Clone)]
-struct RtObjectHeap {
-    inner: Rc<RefCell<RtObjectHeapInner>>,
-}
-
-impl RtObjectHeap {
-    fn new(arena_size: u32, max_arenas: usize) -> Self {
-        Self {
-            inner: Rc::new(RefCell::new(RtObjectHeapInner {
-                arenas: Vec::new(),
-                arena_size,
-                max_arenas,
-            })),
-        }
-    }
-}
-
-fn required_padding(offset: u32, align: u32) -> u32 {
-    if offset % align == 0 {
-        0
-    } else {
-        align - (offset % align)
-    }
-}
-
-// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
-// and that was annoying
-// so i thought to myself
-// "BTreeMap"
-// 🤣
-// anyway its super jank nonsense
-unsafe impl Allocator for RtObjectHeap {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
-        unsafe {
-            let mut inner = self.inner.borrow_mut();
-            if layout.size() > u32::MAX as usize || layout.size() > inner.arena_size as usize {
-                panic!("rt_allocator: alloc size {} too large", layout.size());
-            }
-            let mut best = None;
-            for (i, arena) in &mut inner.arenas.iter().enumerate() {
-                for (&offset, &size) in &arena.free_map {
-                    let padding = required_padding(offset, layout.align() as u32);
-                    let total_size = layout.size() as u32 + padding;
-                    if total_size > size {
-                        continue;
-                    }
-                    match best {
-                        None => {
-                            best = Some((i, offset, size));
-                        }
-                        Some((_, _, best_size)) if size < best_size => {
-                            best = Some((i, offset, size));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            let data_ptr = if let Some((arena_idx, offset, _)) = best {
-                inner.arenas[arena_idx].split_and_allocate(offset, layout)
-            } else {
-                let idx = inner.more_core();
-                inner.arenas[idx].split_and_allocate(0, layout)
-            };
-            let ptr = NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
-                data_ptr as *mut u8,
-                layout.size(),
-            ));
-            Ok(ptr)
-        }
-    }
-
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        let mut inner = self.inner.borrow_mut();
-        let addr = ptr.as_ptr() as usize;
-
-        for arena in &mut inner.arenas {
-            let arena_base = arena.arena as usize;
-            let arena_end = arena_base + arena.size as usize;
-            if addr >= arena_base && addr < arena_end {
-                let addr = addr - arena_base;
-                let mut free_start = addr as u32;
-                let mut free_end = free_start + layout.size() as u32;
-                let first_below =
-                    arena.free_map.range(..addr as u32).next_back().map(|(k, v)| (*k, *v));
-                let first_above = arena.free_map.range(addr as u32..).next().map(|(k, v)| (*k, *v));
-                if let Some((below_offset, below_size)) = first_below {
-                    let below_end = below_offset + below_size;
-                    if below_end == addr as u32 {
-                        free_start = below_offset;
-                    }
-                    arena.free_map.remove(&below_offset);
-                }
-                if let Some((above_offset, above_size)) = first_above {
-                    if above_offset == free_end {
-                        free_end = above_offset + above_size;
-                    }
-                    arena.free_map.remove(&above_offset);
-                }
-                arena.free_map.insert(free_start, free_end - free_start);
-            }
-        }
-    }
 }
 
 // TODO I feel like I'm definitely dupe'ing SPA/pipewire infra here
@@ -369,7 +193,7 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                     let rt = &mut *state.rt.get();
                     rt.did_thing = true;
                     if let Some(mut buffer) = stream.dequeue_buffer() {
-                        for data in buffer.datas_mut() {
+                        for _data in buffer.datas_mut() {
                             //
                         }
                     } else {
@@ -446,14 +270,18 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
             let ct = &mut *state.ct.get();
             while let Some(request) = ct.request_rx.try_pop() {
                 match request {
-                    AudioControlThreadRequest::AddCaptureSink { interval, waiter, writer } => {
+                    AudioControlThreadRequest::AddCaptureSink {
+                        interval,
+                        waiter: _,
+                        writer: _,
+                    } => {
                         let rate = (SAMPLE_RATE as f32 * interval.as_secs_f32()) as usize;
                         let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
 
                         for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
                             let buf: Box<[MaybeUninit<f32>], RtObjectHeap> =
                                 Box::new_zeroed_slice_in(buf_len, ct.rt_heap.clone());
-                            let buf =
+                            let _buf =
                                 Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
 
                             todo!();
@@ -566,7 +394,7 @@ impl AudioControlThread {
             writer: response_tx,
         };
         self.try_send_request(request)?;
-        let response = self.waiter.wait_pop();
+        let _response = self.waiter.wait_pop();
         todo!();
     }
 }
@@ -587,7 +415,7 @@ pub fn test() -> anyhow::Result<()> {
 
     let mut audio_control = AudioControlThread::new()?;
     println!("we got audio control");
-    let audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
+    let _audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
     println!("we got capture stream");
     std::thread::sleep(Duration::from_secs(5));
     Ok(())

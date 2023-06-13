@@ -45,6 +45,7 @@ pub mod audio;
 pub mod kernels;
 pub mod mel;
 pub mod pickle;
+pub mod rt_alloc;
 pub mod stft;
 pub mod tensor;
 pub mod util;
