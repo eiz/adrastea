@@ -15,9 +15,10 @@
 
 use core::{
     alloc::Layout,
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{RefCell, UnsafeCell},
     ffi::c_void,
-    ptr,
+    mem::MaybeUninit,
+    ptr::{self, NonNull},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -68,15 +69,12 @@ impl RtObjectArena {
                 -1,
                 0,
             );
-
             if ptr == libc::MAP_FAILED {
-                panic!("RtObjectArena: failed to alloc pages");
+                panic!("rt_allocator: failed to alloc pages");
             }
-
             if libc::mlock(ptr, size as usize) < 0 {
-                panic!("RtObjectArena: failed to lock pages");
+                panic!("rt_allocator: failed to lock pages");
             }
-
             let mut free_map = BTreeMap::new();
             free_map.insert(0, size);
             Self { arena: ptr, size, free_map }
@@ -89,10 +87,7 @@ impl RtObjectArena {
         let data_base = offset + size_lo;
         let upper_base = data_base + layout.size() as u32;
         let size_hi = offset + size - upper_base;
-
-        assert!(upper_base + size_hi <= size);
         assert!(upper_base + size_hi <= self.size);
-
         unsafe {
             let result = self.arena.add(data_base as usize);
             if size_lo > 0 {
@@ -106,6 +101,15 @@ impl RtObjectArena {
     }
 }
 
+impl Drop for RtObjectArena {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munlock(self.arena, self.size as usize);
+            libc::munmap(self.arena, self.size as usize);
+        }
+    }
+}
+
 struct RtObjectHeapInner {
     arenas: Vec<RtObjectArena>,
     arena_size: u32,
@@ -113,24 +117,28 @@ struct RtObjectHeapInner {
 }
 
 impl RtObjectHeapInner {
-    fn more_core(&mut self) {
-        unsafe {
-            if self.arenas.len() >= self.max_arenas {
-                panic!("rt_allocator: exhausted arena limit");
-            }
-            self.arenas.push(RtObjectArena::new(self.arena_size));
+    fn more_core(&mut self) -> usize {
+        if self.arenas.len() >= self.max_arenas {
+            panic!("rt_allocator: exhausted arena limit");
         }
+        self.arenas.push(RtObjectArena::new(self.arena_size));
+        self.arenas.len() - 1
     }
 }
 
+#[derive(Clone)]
 struct RtObjectHeap {
-    inner: RefCell<RtObjectHeapInner>,
+    inner: Rc<RefCell<RtObjectHeapInner>>,
 }
 
 impl RtObjectHeap {
-    unsafe fn new(arena_size: u32, max_arenas: usize) -> Self {
+    fn new(arena_size: u32, max_arenas: usize) -> Self {
         Self {
-            inner: RefCell::new(RtObjectHeapInner { arenas: Vec::new(), arena_size, max_arenas }),
+            inner: Rc::new(RefCell::new(RtObjectHeapInner {
+                arenas: Vec::new(),
+                arena_size,
+                max_arenas,
+            })),
         }
     }
 }
@@ -148,20 +156,15 @@ fn required_padding(offset: u32, align: u32) -> u32 {
 // so i thought to myself
 // "BTreeMap"
 // 🤣
+// anyway its super jank nonsense
 unsafe impl Allocator for RtObjectHeap {
-    fn allocate(
-        &self, layout: Layout,
-    ) -> Result<ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         unsafe {
             let mut inner = self.inner.borrow_mut();
-            let layout = layout.align_to(8).unwrap().pad_to_align();
-
-            if layout.size() > u32::MAX as usize {
+            if layout.size() > u32::MAX as usize || layout.size() > inner.arena_size as usize {
                 panic!("rt_allocator: alloc size {} too large", layout.size());
             }
-
             let mut best = None;
-
             for (i, arena) in &mut inner.arenas.iter().enumerate() {
                 for (&offset, &size) in &arena.free_map {
                     let padding = required_padding(offset, layout.align() as u32);
@@ -180,18 +183,50 @@ unsafe impl Allocator for RtObjectHeap {
                     }
                 }
             }
-
-            if let Some((arena_idx, offset, _)) = best {
-                let data_ptr = inner.arenas[arena_idx].split_and_allocate(offset, layout.clone());
+            let data_ptr = if let Some((arena_idx, offset, _)) = best {
+                inner.arenas[arena_idx].split_and_allocate(offset, layout)
             } else {
-            }
-
-            todo!()
+                let idx = inner.more_core();
+                inner.arenas[idx].split_and_allocate(0, layout)
+            };
+            let ptr = NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
+                data_ptr as *mut u8,
+                layout.size(),
+            ));
+            Ok(ptr)
         }
     }
 
-    unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: std::alloc::Layout) {
-        todo!()
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let mut inner = self.inner.borrow_mut();
+        let addr = ptr.as_ptr() as usize;
+
+        for arena in &mut inner.arenas {
+            let arena_base = arena.arena as usize;
+            let arena_end = arena_base + arena.size as usize;
+            if addr >= arena_base && addr < arena_end {
+                let addr = addr - arena_base;
+                let mut free_start = addr as u32;
+                let mut free_end = free_start + layout.size() as u32;
+                let first_below =
+                    arena.free_map.range(..addr as u32).next_back().map(|(k, v)| (*k, *v));
+                let first_above = arena.free_map.range(addr as u32..).next().map(|(k, v)| (*k, *v));
+                if let Some((below_offset, below_size)) = first_below {
+                    let below_end = below_offset + below_size;
+                    if below_end == addr as u32 {
+                        free_start = below_offset;
+                    }
+                    arena.free_map.remove(&below_offset);
+                }
+                if let Some((above_offset, above_size)) = first_above {
+                    if above_offset == free_end {
+                        free_end = above_offset + above_size;
+                    }
+                    arena.free_map.remove(&above_offset);
+                }
+                arena.free_map.insert(free_start, free_end - free_start);
+            }
+        }
     }
 }
 
@@ -218,6 +253,7 @@ struct ControlThreadState {
     request_rx: AtomicRingReader<AudioControlThreadRequest>,
     response_tx: AtomicRingWriter<AudioControlThreadResponse>,
     response_waiter: AtomicRingWaiter<AudioControlThreadResponse>,
+    rt_heap: RtObjectHeap,
 }
 
 struct AudioControlThreadInner {
@@ -415,6 +451,11 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                         let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
 
                         for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
+                            let buf: Box<[MaybeUninit<f32>], RtObjectHeap> =
+                                Box::new_zeroed_slice_in(buf_len, ct.rt_heap.clone());
+                            let buf =
+                                Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
+
                             todo!();
                         }
                     }
@@ -485,6 +526,7 @@ impl AudioControlThread {
                         request_rx,
                         response_tx,
                         response_waiter: waiter,
+                        rt_heap: RtObjectHeap::new(1024 * 1024, 8),
                     }),
                 });
                 if let Err(_e) = audio_control_thread_main(state.clone()) {
@@ -543,8 +585,47 @@ pub fn test() -> anyhow::Result<()> {
         });
     }
 
-    let audio_control = AudioControlThread::new()?;
+    let mut audio_control = AudioControlThread::new()?;
     println!("we got audio control");
+    let audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
+    println!("we got capture stream");
     std::thread::sleep(Duration::from_secs(5));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use allocator_api2::vec::*;
+
+    #[test]
+    fn allocator_misc() {
+        struct Foo {
+            a: u32,
+            b: u32,
+        }
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                println!("dropping foo {} {}", self.a, self.b);
+            }
+        }
+        let rt_alloc = RtObjectHeap::new(1024 * 1024, 8);
+        let foo = Box::new_in(Foo { a: 1, b: 2 }, rt_alloc.clone());
+        let bar = Box::new_in(Foo { a: 3, b: 4 }, rt_alloc.clone());
+        for _t in 0..10 {
+            let mut test_vec = Vec::new_in(rt_alloc.clone());
+
+            for i in 0..1000 {
+                test_vec.push(i);
+            }
+            for (i, j) in test_vec.iter().enumerate() {
+                assert_eq!(i, *j);
+            }
+        }
+
+        assert_eq!(foo.a, 1);
+        assert_eq!(foo.b, 2);
+        assert_eq!(bar.a, 3);
+        assert_eq!(bar.b, 4);
+    }
 }
