@@ -135,14 +135,15 @@ impl<T: Send> AtomicRingReader<T> {
         self.0.read_ptr.store(read_ptr.wrapping_add(1), Ordering::Release);
         Some(result)
     }
+}
 
+impl<T: Send> AtomicRingWriter<T> {
     pub fn write_available(&self) -> usize {
         let read_ptr = self.0.read_ptr.load(Ordering::Relaxed);
         let write_ptr = self.0.write_ptr.load(Ordering::Acquire);
 
         self.0.length - (write_ptr - read_ptr)
     }
-
     pub fn try_push(&mut self, value: T) -> Option<T> {
         let read_ptr = self.0.read_ptr.load(Ordering::Relaxed);
         let write_ptr = self.0.write_ptr.load(Ordering::Acquire);
@@ -186,7 +187,6 @@ pub struct AtomicRingWaiterInner<T: Send> {
     cvar: Condvar,
 }
 
-#[derive(Clone)]
 pub struct AtomicRingWaiter<T: Send>(Arc<AtomicRingWaiterInner<T>>);
 
 impl<T: Send> AtomicRingWaiter<T> {
@@ -216,5 +216,11 @@ impl<T: Send> AtomicRingWaiter<T> {
 
     pub fn alert(&self) {
         self.0.cvar.notify_one();
+    }
+}
+
+impl<T: Send> Clone for AtomicRingWaiter<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }

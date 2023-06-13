@@ -7,9 +7,11 @@ name = "adrastea"
 version = "0.1.0"
 dependencies = [
  "adrastea_kernels",
+ "allocator-api2",
  "anyhow",
  "ash",
  "half",
+ "libc",
  "libspa-sys",
  "matrixmultiply",
  "memmap2",
@@ -43,6 +45,12 @@ checksum = "43f6cb1bf222025340178f382c426f13757b2960e89779dfcb319c32542a5a41"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "allocator-api2"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4f263788a35611fba42eb41ff811c5d0360c58b97402570312a350736e2542e"
 
 [[package]]
 name = "anyhow"

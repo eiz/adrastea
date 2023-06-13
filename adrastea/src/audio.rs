@@ -14,7 +14,8 @@
  */
 
 use core::{
-    cell::UnsafeCell,
+    alloc::Layout,
+    cell::{Cell, RefCell, UnsafeCell},
     ffi::c_void,
     ptr,
     sync::atomic::{AtomicBool, Ordering},
@@ -22,7 +23,8 @@ use core::{
 };
 use std::f64::consts::PI;
 
-use alloc::{rc::Rc, sync::Arc};
+use alloc::{collections::BTreeMap, rc::Rc, sync::Arc};
+use allocator_api2::{alloc::Allocator, boxed::Box};
 use anyhow::bail;
 use libspa_sys::{
     spa_audio_info_raw, spa_format_audio_raw_build, spa_pod_builder, spa_pod_builder_init,
@@ -40,12 +42,157 @@ use crate::util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWrit
 const SAMPLE_RATE: u32 = 48000;
 const NUM_CHANNELS: usize = 2;
 const VOLUME: f32 = 0.1;
+const CAPTURE_BUFFER_POOL_SIZE: usize = 10;
 
 struct RealTimeThreadState {
     accumulator: f64,
     did_thing: bool,
     did_other_thing: bool,
     capture_sinks: *mut RtCaptureSink,
+}
+
+struct RtObjectArena {
+    arena: *mut c_void,
+    size: u32,
+    free_map: BTreeMap<u32, u32>,
+}
+
+impl RtObjectArena {
+    pub fn new(size: u32) -> Self {
+        unsafe {
+            let ptr = libc::mmap64(
+                ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+
+            if ptr == libc::MAP_FAILED {
+                panic!("RtObjectArena: failed to alloc pages");
+            }
+
+            if libc::mlock(ptr, size as usize) < 0 {
+                panic!("RtObjectArena: failed to lock pages");
+            }
+
+            let mut free_map = BTreeMap::new();
+            free_map.insert(0, size);
+            Self { arena: ptr, size, free_map }
+        }
+    }
+
+    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> *mut c_void {
+        let size = self.free_map.remove(&offset).expect("invariant: invalid allocation offset");
+        let size_lo = required_padding(offset, layout.align() as u32);
+        let data_base = offset + size_lo;
+        let upper_base = data_base + layout.size() as u32;
+        let size_hi = offset + size - upper_base;
+
+        assert!(upper_base + size_hi <= size);
+        assert!(upper_base + size_hi <= self.size);
+
+        unsafe {
+            let result = self.arena.add(data_base as usize);
+            if size_lo > 0 {
+                self.free_map.insert(offset, size_lo);
+            }
+            if size_hi > 0 {
+                self.free_map.insert(upper_base, size_hi);
+            }
+            result
+        }
+    }
+}
+
+struct RtObjectHeapInner {
+    arenas: Vec<RtObjectArena>,
+    arena_size: u32,
+    max_arenas: usize,
+}
+
+impl RtObjectHeapInner {
+    fn more_core(&mut self) {
+        unsafe {
+            if self.arenas.len() >= self.max_arenas {
+                panic!("rt_allocator: exhausted arena limit");
+            }
+            self.arenas.push(RtObjectArena::new(self.arena_size));
+        }
+    }
+}
+
+struct RtObjectHeap {
+    inner: RefCell<RtObjectHeapInner>,
+}
+
+impl RtObjectHeap {
+    unsafe fn new(arena_size: u32, max_arenas: usize) -> Self {
+        Self {
+            inner: RefCell::new(RtObjectHeapInner { arenas: Vec::new(), arena_size, max_arenas }),
+        }
+    }
+}
+
+fn required_padding(offset: u32, align: u32) -> u32 {
+    if offset % align == 0 {
+        0
+    } else {
+        align - (offset % align)
+    }
+}
+
+// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
+// and that was annoying
+// so i thought to myself
+// "BTreeMap"
+// 🤣
+unsafe impl Allocator for RtObjectHeap {
+    fn allocate(
+        &self, layout: Layout,
+    ) -> Result<ptr::NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        unsafe {
+            let mut inner = self.inner.borrow_mut();
+            let layout = layout.align_to(8).unwrap().pad_to_align();
+
+            if layout.size() > u32::MAX as usize {
+                panic!("rt_allocator: alloc size {} too large", layout.size());
+            }
+
+            let mut best = None;
+
+            for (i, arena) in &mut inner.arenas.iter().enumerate() {
+                for (&offset, &size) in &arena.free_map {
+                    let padding = required_padding(offset, layout.align() as u32);
+                    let total_size = layout.size() as u32 + padding;
+                    if total_size > size {
+                        continue;
+                    }
+                    match best {
+                        None => {
+                            best = Some((i, offset, size));
+                        }
+                        Some((_, _, best_size)) if size < best_size => {
+                            best = Some((i, offset, size));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if let Some((arena_idx, offset, _)) = best {
+                let data_ptr = inner.arenas[arena_idx].split_and_allocate(offset, layout.clone());
+            } else {
+            }
+
+            todo!()
+        }
+    }
+
+    unsafe fn deallocate(&self, ptr: ptr::NonNull<u8>, layout: std::alloc::Layout) {
+        todo!()
+    }
 }
 
 // TODO I feel like I'm definitely dupe'ing SPA/pipewire infra here
@@ -57,6 +204,10 @@ struct RtBuffer {
 }
 
 unsafe impl Send for RtBuffer {}
+
+impl RtBuffer {
+    //TODO
+}
 
 struct RtCaptureSink {
     next: *mut RtCaptureSink,
@@ -84,10 +235,13 @@ struct AudioControlThreadInner {
 }
 
 enum AudioControlThreadRequest {
-    AddCaptureSink { waiter: AtomicRingWaiter<AudioPacket>, writer: AtomicRingWriter<AudioPacket> },
+    AddCaptureSink {
+        interval: Duration,
+        waiter: AtomicRingWaiter<AudioPacket>,
+        writer: AtomicRingWriter<AudioPacket>,
+    },
 }
 
-#[derive(Clone)]
 enum AudioControlThreadResponse {
     Initialized {
         control_event: *mut libspa_sys::spa_source,
@@ -95,6 +249,10 @@ enum AudioControlThreadResponse {
         pw_loop: *mut pipewire_sys::pw_loop,
     },
     InitializationFailed, // TODO wrap an error
+    CaptureStream {
+        free_buffers: AtomicRingWriter<RtBuffer>,
+        waiter: AtomicRingWaiter<RtBuffer>,
+    },
 }
 
 unsafe impl Send for AudioControlThreadResponse {}
@@ -246,8 +404,24 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
         StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         &mut [pod],
     )?;
-    let control_event = main_loop.add_event(|| {
-        println!("event handler");
+    let control_event = main_loop.add_event({
+        let state = state.clone();
+        move || {
+            let ct = &mut *state.ct.get();
+            while let Some(request) = ct.request_rx.try_pop() {
+                match request {
+                    AudioControlThreadRequest::AddCaptureSink { interval, waiter, writer } => {
+                        let rate = (SAMPLE_RATE as f32 * interval.as_secs_f32()) as usize;
+                        let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
+
+                        for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
+                            todo!();
+                        }
+                    }
+                }
+            }
+            println!("event handler");
+        }
     });
     // Another API issue: add_event callbacks aren't FnMut
     let received_quit = Arc::new(AtomicBool::new(false));
@@ -261,14 +435,14 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
         }
     });
 
-    assert_eq!(
-        1,
-        (*state.ct.get()).response_tx.try_pushn(&[AudioControlThreadResponse::Initialized {
+    assert!((*state.ct.get())
+        .response_tx
+        .try_push(AudioControlThreadResponse::Initialized {
             control_event: control_event.as_ptr(),
             quit_event: quit_event.as_ptr(),
             pw_loop: main_loop.as_raw() as *const _ as *mut _
-        }])
-    );
+        })
+        .is_none());
     (*state.ct.get()).response_waiter.alert();
     main_loop.run();
 
@@ -314,12 +488,10 @@ impl AudioControlThread {
                     }),
                 });
                 if let Err(_e) = audio_control_thread_main(state.clone()) {
-                    assert_eq!(
-                        1,
-                        (*state.ct.get())
-                            .response_tx
-                            .try_pushn(&[AudioControlThreadResponse::InitializationFailed])
-                    );
+                    assert!((*state.ct.get())
+                        .response_tx
+                        .try_push(AudioControlThreadResponse::InitializationFailed)
+                        .is_none());
                     (*state.ct.get()).response_waiter.alert();
                 }
             }
@@ -331,15 +503,29 @@ impl AudioControlThread {
             AudioControlThreadResponse::InitializationFailed => {
                 bail!("failed to initialize audio control thread")
             }
+            _ => unreachable!("invalid response"),
         }
     }
 
-    pub fn prove_we_can_send_events(&self) {
+    fn try_send_request(&mut self, request: AudioControlThreadRequest) -> anyhow::Result<()> {
+        if self.request_tx.try_push(request).is_some() {
+            bail!("failed to send request to audio control thread");
+        }
         unsafe { signal_event(self.pw_loop, self.control_event) }
+        Ok(())
     }
 
-    pub fn capture_audio_stream(&self, interval: Duration) -> anyhow::Result<AudioStream> {
-        todo!()
+    pub fn capture_audio_stream(&mut self, interval: Duration) -> anyhow::Result<AudioStream> {
+        let (response_rx, response_tx) = AtomicRing::new(64);
+        let response_waiter = AtomicRingWaiter::new(response_rx);
+        let request = AudioControlThreadRequest::AddCaptureSink {
+            interval,
+            waiter: response_waiter,
+            writer: response_tx,
+        };
+        self.try_send_request(request)?;
+        let response = self.waiter.wait_pop();
+        todo!();
     }
 }
 
@@ -359,7 +545,6 @@ pub fn test() -> anyhow::Result<()> {
 
     let audio_control = AudioControlThread::new()?;
     println!("we got audio control");
-    audio_control.prove_we_can_send_events();
     std::thread::sleep(Duration::from_secs(5));
     Ok(())
 }
