@@ -16,6 +16,7 @@
 use core::{
     cell::UnsafeCell,
     ffi::c_void,
+    fmt::Formatter,
     mem::MaybeUninit,
     ptr::{self},
     sync::atomic::{AtomicBool, Ordering},
@@ -45,7 +46,7 @@ use crate::{
 const SAMPLE_RATE: u32 = 48000;
 const NUM_CHANNELS: usize = 2;
 const VOLUME: f32 = 0.1;
-const CAPTURE_BUFFER_POOL_SIZE: usize = 10;
+const CAPTURE_BUFFER_POOL_SIZE: usize = 16;
 
 struct RealTimeThreadState {
     accumulator: f64,
@@ -53,6 +54,20 @@ struct RealTimeThreadState {
     did_other_thing: bool,
     capture_sinks: *mut RtCaptureSink,
 }
+
+struct RtPtr<T>(*mut T);
+impl<T> RtPtr<T> {
+    pub fn into_raw(self) -> *mut T {
+        self.0
+    }
+}
+unsafe impl<T> Send for RtPtr<T> {}
+impl<T> Clone for RtPtr<T> {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+impl<T> Copy for RtPtr<T> {}
 
 // TODO I feel like I'm definitely dupe'ing SPA/pipewire infra here
 // lets revisit this and see if there's a more congruent way to do everything. but xplat
@@ -89,6 +104,38 @@ struct AudioControlThreadInner {
     // So we're using the normally internal-to-cell-implementations UnsafeCell here.
     rt: UnsafeCell<RealTimeThreadState>,
     ct: UnsafeCell<ControlThreadState>,
+}
+
+impl AudioControlThreadInner {
+    pub fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
+    where
+        F: Fn(&mut RealTimeThreadState) + 'static + Send,
+    {
+        unsafe {
+            unsafe extern "C" fn invoke_data_loop_sync_trampoline<F>(
+                _loop: *mut libspa_sys::spa_loop, _is_async: bool, _seq: u32, _data: *const c_void,
+                _size: usize, user_data: *mut c_void,
+            ) -> i32
+            where
+                F: Fn(&mut RealTimeThreadState) + 'static + Send,
+            {
+                let (rt, f): &(*mut RealTimeThreadState, *const F) = &*(user_data as *const _);
+                (**f)(&mut **rt);
+                0
+            }
+            let data_loop = pipewire_sys::pw_context_get_data_loop(context.as_ptr());
+            let user_data = (self.rt.get(), &f as *const F);
+            pipewire_sys::pw_data_loop_invoke(
+                data_loop,
+                Some(invoke_data_loop_sync_trampoline::<F>),
+                0,
+                ptr::null_mut(),
+                0,
+                true,
+                &user_data as *const _ as *mut c_void,
+            );
+        }
+    }
 }
 
 enum AudioControlThreadRequest {
@@ -276,10 +323,10 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                         let rate = (SAMPLE_RATE as f32 * interval.as_secs_f32()) as usize;
                         let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
                         let (buf_rx, mut buf_tx) = AtomicRing::new(CAPTURE_BUFFER_POOL_SIZE);
-                        let mut capture_sink = Box::into_raw(Box::new_in(
+                        let capture_sink = RtPtr(Box::into_raw(Box::new_in(
                             RtCaptureSink { next: ptr::null_mut(), free_buffers: buf_rx },
                             ct.rt_heap.clone(),
-                        ));
+                        )));
 
                         for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
                             let buf: Box<[MaybeUninit<f32>], RtObjectHeap> =
@@ -288,11 +335,15 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                                 Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
                             let buf = RtBuffer(buf);
 
-                            buf_tx.try_push(buf).unwrap();
+                            assert!(buf_tx.try_push(buf).is_none());
                         }
 
-                        let context_raw = context.as_ptr();
-                        todo!();
+                        state.invoke_rt(&context, move |rt| {
+                            let capture_sink = capture_sink.into_raw();
+                            (*capture_sink).next = rt.capture_sinks;
+                            rt.capture_sinks = capture_sink;
+                            println!("we in there {:?} {:?}", std::thread::current(), capture_sink);
+                        });
                     }
                 }
             }
