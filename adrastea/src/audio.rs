@@ -21,7 +21,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use std::{f64::consts::PI, time::Instant};
+use std::{f64::consts::PI, fs::File, time::Instant};
 
 use alloc::{rc::Rc, sync::Arc};
 use allocator_api2::boxed::Box;
@@ -50,8 +50,8 @@ use crate::{
 // Overall, at the moment this file is basically a C program with Rust syntax. Proceed with
 // _extreme_ caution.
 
-const SAMPLE_RATE: u32 = 48000;
-const NUM_CHANNELS: usize = 2;
+const SAMPLE_RATE: u32 = 16000;
+const NUM_CHANNELS: usize = 1;
 const VOLUME: f32 = 0.1;
 const CAPTURE_BUFFER_POOL_SIZE: usize = 16;
 
@@ -121,10 +121,15 @@ impl RtCaptureSink {
 
 struct RealTimeThreadState {
     accumulator: f64,
+    next_object_id: u64,
     capture_sinks: *mut RtCaptureSink,
 }
 
 impl RealTimeThreadState {
+    pub fn new() -> Self {
+        Self { accumulator: 0.0, next_object_id: 0, capture_sinks: ptr::null_mut() }
+    }
+
     pub unsafe fn process_capture_stream(&mut self, data: &mut [f32]) {
         let mut capture_sink = self.capture_sinks;
         while !capture_sink.is_null() {
@@ -525,10 +530,7 @@ impl AudioControlThread {
             let waiter = waiter.clone();
             move || unsafe {
                 let state = Rc::new(AudioControlThreadState {
-                    rt: UnsafeCell::new(RealTimeThreadState {
-                        accumulator: 0.0,
-                        capture_sinks: ptr::null_mut(),
-                    }),
+                    rt: UnsafeCell::new(RealTimeThreadState::new()),
                     ct: UnsafeCell::new(ControlThreadState {
                         request_rx,
                         response_tx,
@@ -592,10 +594,17 @@ pub fn test() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
     println!("we got capture stream");
+    let mut all_samples = vec![];
     while start.elapsed() < Duration::from_secs(5) {
-        let mut samples = [0.0f32; 480 * 2];
+        let mut samples = [0.0f32; 160 * NUM_CHANNELS];
         audio_stream.next(&mut samples);
-        println!("samples: {:?}", samples);
+        all_samples.extend_from_slice(&samples);
     }
+    let mut out_file = File::create("out.wav")?;
+    wav::write(
+        wav::Header::new(wav::WAV_FORMAT_IEEE_FLOAT, NUM_CHANNELS as u16, SAMPLE_RATE, 32),
+        &wav::BitDepth::ThirtyTwoFloat(all_samples),
+        &mut out_file,
+    )?;
     Ok(())
 }
