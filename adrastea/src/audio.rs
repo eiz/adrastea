@@ -30,6 +30,7 @@ use libspa_sys::{
     spa_audio_info_raw, spa_format_audio_raw_build, spa_pod_builder, spa_pod_builder_init,
     SPA_PARAM_EnumFormat, SPA_AUDIO_FORMAT_F32,
 };
+use parking_lot::Mutex;
 use pipewire::{
     properties,
     spa::{spa_interface_call_method, Direction},
@@ -170,106 +171,6 @@ struct ControlThreadState {
     rt_heap: RtObjectHeap,
 }
 
-struct AudioControlThreadInner {
-    // Must only be accessed in process callbacks or otherwise on the pw_data_loop.
-    // I feel the need to defend this code a bit. Unfortunately, the pipewire rust
-    // bindings contain a number of soundness bugs, one of which is that the `process`
-    // callback does not require the closure to be Send, even though the callback
-    // can run on another thread (the RT thread). I could use RefCell here and just
-    // pinky swear that I won't actually access the RefCell on the wrong thread,
-    // but given that it's unsafe, I wanted to make it unsafe to get the reference.
-    //
-    // So we're using the normally internal-to-cell-implementations UnsafeCell here.
-    rt: UnsafeCell<RealTimeThreadState>,
-    ct: UnsafeCell<ControlThreadState>,
-}
-
-impl AudioControlThreadInner {
-    // blocking invoke to RT thread. the callback can access the real-time state.
-    // Unsafe for many reasons. You must ensure that invoke_rt is not re-entered,
-    // otherwise you'll create a non-unique &mut as Pipewire will run the callback
-    // directly on the invoking thread.
-    pub unsafe fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
-    where
-        F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
-    {
-        unsafe {
-            unsafe extern "C" fn trampoline<F>(
-                _loop: *mut libspa_sys::spa_loop, _is_async: bool, _seq: u32, _data: *const c_void,
-                _size: usize, user_data: *mut c_void,
-            ) -> i32
-            where
-                F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
-            {
-                let (rt, f): &mut (*mut RealTimeThreadState, Option<F>) =
-                    &mut *(user_data as *mut _);
-                (f.take().unwrap())(&mut **rt);
-                0
-            }
-            let data_loop = pipewire_sys::pw_context_get_data_loop(context.as_ptr());
-            let mut user_data = (self.rt.get(), Some(f));
-            pipewire_sys::pw_data_loop_invoke(
-                data_loop,
-                Some(trampoline::<F>),
-                0,
-                ptr::null_mut(),
-                0,
-                true,
-                &mut user_data as *mut _ as *mut c_void,
-            );
-        }
-    }
-}
-
-enum AudioControlThreadRequest {
-    AddCaptureSink {
-        interval: Duration,
-        waiter: AtomicRingWaiter<AudioPacket>,
-        writer: AtomicRingWriter<AudioPacket>,
-    },
-}
-
-enum AudioControlThreadResponse {
-    Initialized {
-        control_event: *mut libspa_sys::spa_source,
-        quit_event: *mut libspa_sys::spa_source,
-        pw_loop: *mut pipewire_sys::pw_loop,
-    },
-    InitializationFailed, // TODO wrap an error
-    CaptureStream {
-        free_buffers: AtomicRingWriter<RtBuffer>,
-    },
-}
-
-unsafe impl Send for AudioControlThreadResponse {}
-
-struct AudioPacket {
-    data: RtBuffer,
-}
-
-struct AudioStream {
-    free_buffers: AtomicRingWriter<RtBuffer>,
-    waiter: AtomicRingWaiter<AudioPacket>,
-}
-
-impl AudioStream {
-    pub fn next(&mut self, buf: &mut [f32]) {
-        let packet = self.waiter.wait_pop();
-        let data = packet.data.as_slice();
-        buf.copy_from_slice(data);
-        assert!(self.free_buffers.try_push(packet.data).is_none());
-    }
-}
-
-struct AudioControlThread {
-    thread: Option<std::thread::JoinHandle<()>>,
-    waiter: AtomicRingWaiter<AudioControlThreadResponse>,
-    request_tx: AtomicRingWriter<AudioControlThreadRequest>,
-    control_event: *mut libspa_sys::spa_source,
-    quit_event: *mut libspa_sys::spa_source,
-    pw_loop: *mut pipewire_sys::pw_loop,
-}
-
 fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
     for i in 0..buf.len() / n_channels {
         *last += PI * 2.0 * 440.0 / SAMPLE_RATE as f64;
@@ -297,7 +198,7 @@ fn data_as_f32_slice(data: &mut pipewire::spa::data::Data) -> Option<&mut [f32]>
     }
 }
 
-unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyhow::Result<()> {
+unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadState>) -> anyhow::Result<()> {
     let main_loop = MainLoop::new()?;
     let context = Rc::new(Context::new(&main_loop)?);
     let core = context.connect(None)?;
@@ -489,6 +390,128 @@ unsafe fn signal_event(pw_loop: *mut pipewire_sys::pw_loop, event: *mut libspa_s
     );
 }
 
+struct AudioControlThreadState {
+    // Must only be accessed in process callbacks or otherwise on the pw_data_loop.
+    // I feel the need to defend this code a bit. Unfortunately, the pipewire rust
+    // bindings contain a number of soundness bugs, one of which is that the `process`
+    // callback does not require the closure to be Send, even though the callback
+    // can run on another thread (the RT thread). I could use RefCell here and just
+    // pinky swear that I won't actually access the RefCell on the wrong thread,
+    // but given that it's unsafe, I wanted to make it unsafe to get the reference.
+    //
+    // So we're using the normally internal-to-cell-implementations UnsafeCell here.
+    rt: UnsafeCell<RealTimeThreadState>,
+    ct: UnsafeCell<ControlThreadState>,
+}
+
+impl AudioControlThreadState {
+    // blocking invoke to RT thread. the callback can access the real-time state.
+    // Unsafe for many reasons. You must ensure that invoke_rt is not re-entered,
+    // otherwise you'll create a non-unique &mut as Pipewire will run the callback
+    // directly on the invoking thread.
+    pub unsafe fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
+    where
+        F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
+    {
+        unsafe {
+            unsafe extern "C" fn trampoline<F>(
+                _loop: *mut libspa_sys::spa_loop, _is_async: bool, _seq: u32, _data: *const c_void,
+                _size: usize, user_data: *mut c_void,
+            ) -> i32
+            where
+                F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
+            {
+                let (rt, f): &mut (*mut RealTimeThreadState, Option<F>) =
+                    &mut *(user_data as *mut _);
+                (f.take().unwrap())(&mut **rt);
+                0
+            }
+            let data_loop = pipewire_sys::pw_context_get_data_loop(context.as_ptr());
+            let mut user_data = (self.rt.get(), Some(f));
+            pipewire_sys::pw_data_loop_invoke(
+                data_loop,
+                Some(trampoline::<F>),
+                0,
+                ptr::null_mut(),
+                0,
+                true,
+                &mut user_data as *mut _ as *mut c_void,
+            );
+        }
+    }
+}
+
+enum AudioControlThreadRequest {
+    AddCaptureSink {
+        interval: Duration,
+        waiter: AtomicRingWaiter<AudioPacket>,
+        writer: AtomicRingWriter<AudioPacket>,
+    },
+}
+
+enum AudioControlThreadResponse {
+    Initialized {
+        control_event: *mut libspa_sys::spa_source,
+        quit_event: *mut libspa_sys::spa_source,
+        pw_loop: *mut pipewire_sys::pw_loop,
+    },
+    InitializationFailed, // TODO wrap an error
+    CaptureStream {
+        free_buffers: AtomicRingWriter<RtBuffer>,
+    },
+}
+
+unsafe impl Send for AudioControlThreadResponse {}
+
+struct AudioPacket {
+    data: RtBuffer,
+}
+
+struct AudioStream {
+    free_buffers: AtomicRingWriter<RtBuffer>,
+    waiter: AtomicRingWaiter<AudioPacket>,
+}
+
+impl AudioStream {
+    pub fn next(&mut self, buf: &mut [f32]) {
+        let packet = self.waiter.wait_pop();
+        let data = packet.data.as_slice();
+        buf.copy_from_slice(data);
+        assert!(self.free_buffers.try_push(packet.data).is_none());
+    }
+}
+
+struct AudioControlThreadInner {
+    thread: Option<std::thread::JoinHandle<()>>,
+    waiter: AtomicRingWaiter<AudioControlThreadResponse>,
+    request_tx: AtomicRingWriter<AudioControlThreadRequest>,
+    control_event: *mut libspa_sys::spa_source,
+    quit_event: *mut libspa_sys::spa_source,
+    pw_loop: *mut pipewire_sys::pw_loop,
+}
+
+impl AudioControlThreadInner {
+    fn try_send_request(&mut self, request: AudioControlThreadRequest) -> anyhow::Result<()> {
+        if self.request_tx.try_push(request).is_some() {
+            bail!("failed to send request to audio control thread");
+        }
+        unsafe { signal_event(self.pw_loop, self.control_event) }
+        Ok(())
+    }
+}
+
+impl Drop for AudioControlThreadInner {
+    fn drop(&mut self) {
+        unsafe { signal_event(self.pw_loop, self.quit_event) }
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+#[derive(Clone)]
+struct AudioControlThread {
+    inner: Arc<Mutex<AudioControlThreadInner>>,
+}
+
 impl AudioControlThread {
     pub fn new() -> anyhow::Result<Self> {
         // single-slot mailbox for receiving responses back from the ACT
@@ -501,7 +524,7 @@ impl AudioControlThread {
         let thread = Some(std::thread::spawn({
             let waiter = waiter.clone();
             move || unsafe {
-                let state = Rc::new(AudioControlThreadInner {
+                let state = Rc::new(AudioControlThreadState {
                     rt: UnsafeCell::new(RealTimeThreadState {
                         accumulator: 0.0,
                         capture_sinks: ptr::null_mut(),
@@ -524,7 +547,16 @@ impl AudioControlThread {
         }));
         match waiter.wait_pop() {
             AudioControlThreadResponse::Initialized { control_event, quit_event, pw_loop } => {
-                Ok(Self { thread, waiter, control_event, quit_event, pw_loop, request_tx })
+                Ok(Self {
+                    inner: Arc::new(Mutex::new(AudioControlThreadInner {
+                        thread,
+                        waiter,
+                        control_event,
+                        quit_event,
+                        pw_loop,
+                        request_tx,
+                    })),
+                })
             }
             AudioControlThreadResponse::InitializationFailed => {
                 bail!("failed to initialize audio control thread")
@@ -533,15 +565,7 @@ impl AudioControlThread {
         }
     }
 
-    fn try_send_request(&mut self, request: AudioControlThreadRequest) -> anyhow::Result<()> {
-        if self.request_tx.try_push(request).is_some() {
-            bail!("failed to send request to audio control thread");
-        }
-        unsafe { signal_event(self.pw_loop, self.control_event) }
-        Ok(())
-    }
-
-    pub fn capture_audio_stream(&mut self, interval: Duration) -> anyhow::Result<AudioStream> {
+    pub fn capture_audio_stream(&self, interval: Duration) -> anyhow::Result<AudioStream> {
         let (response_rx, response_tx) = AtomicRing::new(CAPTURE_BUFFER_POOL_SIZE);
         let response_waiter = AtomicRingWaiter::new(response_rx);
         let request = AudioControlThreadRequest::AddCaptureSink {
@@ -549,8 +573,11 @@ impl AudioControlThread {
             waiter: response_waiter.clone(),
             writer: response_tx,
         };
-        self.try_send_request(request)?;
-        match self.waiter.wait_pop() {
+        // TODO: once we have a request/response thing that can handle concurrent requests,
+        // this lock can be dropped while waiting
+        let mut inner = self.inner.lock();
+        inner.try_send_request(request)?;
+        match inner.waiter.wait_pop() {
             AudioControlThreadResponse::CaptureStream { free_buffers } => {
                 Ok(AudioStream { free_buffers, waiter: response_waiter })
             }
@@ -559,15 +586,8 @@ impl AudioControlThread {
     }
 }
 
-impl Drop for AudioControlThread {
-    fn drop(&mut self) {
-        unsafe { signal_event(self.pw_loop, self.quit_event) }
-        self.thread.take().unwrap().join().unwrap();
-    }
-}
-
 pub fn test() -> anyhow::Result<()> {
-    let mut audio_control = AudioControlThread::new()?;
+    let audio_control = AudioControlThread::new()?;
     println!("we got audio control");
     let start = Instant::now();
     let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
