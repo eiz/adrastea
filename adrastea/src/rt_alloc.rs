@@ -128,9 +128,10 @@ fn required_padding(offset: u32, align: u32) -> u32 {
 // "BTreeMap"
 // 🤣
 // anyway its super jank nonsense
-// allocations and deallocations obviously use the global heap so they are not realtime
-// but realtime is expected to do no allocations. the use pattern here is to allocate
-// stuff on the control thread and then pass raw pointers to RT
+// allocations and deallocations obviously use the global heap for the free list
+// so they are not realtime but realtime is expected to do no allocations. the use
+// pattern here is to allocate stuff on the control thread and then pass raw pointers
+// to RT
 unsafe impl Allocator for RtObjectHeap {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let mut inner = self.inner.borrow_mut();
@@ -202,5 +203,42 @@ unsafe impl Allocator for RtObjectHeap {
                 arena.free_map.insert(free_start, free_end - free_start);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use allocator_api2::{boxed::*, vec::*};
+
+    #[test]
+    fn allocator_misc() {
+        struct Foo {
+            a: u32,
+            b: u32,
+        }
+        impl Drop for Foo {
+            fn drop(&mut self) {
+                println!("dropping foo {} {}", self.a, self.b);
+            }
+        }
+        let rt_alloc = RtObjectHeap::new(1024 * 1024, 8);
+        let foo = Box::new_in(Foo { a: 1, b: 2 }, rt_alloc.clone());
+        let bar = Box::new_in(Foo { a: 3, b: 4 }, rt_alloc.clone());
+        for _t in 0..10 {
+            let mut test_vec = Vec::new_in(rt_alloc.clone());
+
+            for i in 0..1000 {
+                test_vec.push(i);
+            }
+            for (i, j) in test_vec.iter().enumerate() {
+                assert_eq!(i, *j);
+            }
+        }
+
+        assert_eq!(foo.a, 1);
+        assert_eq!(foo.b, 2);
+        assert_eq!(bar.a, 3);
+        assert_eq!(bar.b, 4);
     }
 }

@@ -57,10 +57,7 @@ struct RealTimeThreadState {
 // TODO I feel like I'm definitely dupe'ing SPA/pipewire infra here
 // lets revisit this and see if there's a more congruent way to do everything. but xplat
 // also will def be a thing so...
-struct RtBuffer {
-    data: *mut c_void,
-    size: usize,
-}
+struct RtBuffer(*mut [f32]);
 
 unsafe impl Send for RtBuffer {}
 
@@ -145,7 +142,7 @@ fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
 
 unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyhow::Result<()> {
     let main_loop = MainLoop::new()?;
-    let context = Context::new(&main_loop)?;
+    let context = Rc::new(Context::new(&main_loop)?);
     let core = context.connect(None)?;
     // we do not use the provided userdata mechanism because
     // 1. it is jank af with respect to Default trait bounds
@@ -266,6 +263,7 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
     )?;
     let control_event = main_loop.add_event({
         let state = state.clone();
+        let context = context.clone();
         move || {
             let ct = &mut *state.ct.get();
             while let Some(request) = ct.request_rx.try_pop() {
@@ -277,15 +275,24 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                     } => {
                         let rate = (SAMPLE_RATE as f32 * interval.as_secs_f32()) as usize;
                         let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
+                        let (buf_rx, mut buf_tx) = AtomicRing::new(CAPTURE_BUFFER_POOL_SIZE);
+                        let mut capture_sink = Box::into_raw(Box::new_in(
+                            RtCaptureSink { next: ptr::null_mut(), free_buffers: buf_rx },
+                            ct.rt_heap.clone(),
+                        ));
 
                         for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
                             let buf: Box<[MaybeUninit<f32>], RtObjectHeap> =
                                 Box::new_zeroed_slice_in(buf_len, ct.rt_heap.clone());
-                            let _buf =
+                            let buf =
                                 Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
+                            let buf = RtBuffer(buf);
 
-                            todo!();
+                            buf_tx.try_push(buf).unwrap();
                         }
+
+                        let context_raw = context.as_ptr();
+                        todo!();
                     }
                 }
             }
@@ -419,41 +426,4 @@ pub fn test() -> anyhow::Result<()> {
     println!("we got capture stream");
     std::thread::sleep(Duration::from_secs(5));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use allocator_api2::vec::*;
-
-    #[test]
-    fn allocator_misc() {
-        struct Foo {
-            a: u32,
-            b: u32,
-        }
-        impl Drop for Foo {
-            fn drop(&mut self) {
-                println!("dropping foo {} {}", self.a, self.b);
-            }
-        }
-        let rt_alloc = RtObjectHeap::new(1024 * 1024, 8);
-        let foo = Box::new_in(Foo { a: 1, b: 2 }, rt_alloc.clone());
-        let bar = Box::new_in(Foo { a: 3, b: 4 }, rt_alloc.clone());
-        for _t in 0..10 {
-            let mut test_vec = Vec::new_in(rt_alloc.clone());
-
-            for i in 0..1000 {
-                test_vec.push(i);
-            }
-            for (i, j) in test_vec.iter().enumerate() {
-                assert_eq!(i, *j);
-            }
-        }
-
-        assert_eq!(foo.a, 1);
-        assert_eq!(foo.b, 2);
-        assert_eq!(bar.a, 3);
-        assert_eq!(bar.b, 4);
-    }
 }
