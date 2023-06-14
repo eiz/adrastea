@@ -16,13 +16,12 @@
 use core::{
     cell::UnsafeCell,
     ffi::c_void,
-    fmt::Formatter,
     mem::MaybeUninit,
-    ptr::{self},
+    ptr,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use std::f64::consts::PI;
+use std::{f64::consts::PI, time::Instant};
 
 use alloc::{rc::Rc, sync::Arc};
 use allocator_api2::boxed::Box;
@@ -43,18 +42,20 @@ use crate::{
     util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWriter},
 };
 
+// TODO: The current version of pipewire-rs, while a good effort, still has a number
+// of soundness and usability problems. This code has a bunch of even uglier workarounds
+// for those problems. Think through some good design improvements and contribute them.
+//
+// Overall, at the moment this file is basically a C program with Rust syntax. Proceed with
+// _extreme_ caution.
+
 const SAMPLE_RATE: u32 = 48000;
 const NUM_CHANNELS: usize = 2;
 const VOLUME: f32 = 0.1;
 const CAPTURE_BUFFER_POOL_SIZE: usize = 16;
 
-struct RealTimeThreadState {
-    accumulator: f64,
-    did_thing: bool,
-    did_other_thing: bool,
-    capture_sinks: *mut RtCaptureSink,
-}
-
+// TODO: Used to launder raw pointers as Send atm. Should go away eventually in favor of
+// a more specific interface for RT data.
 struct RtPtr<T>(*mut T);
 impl<T> RtPtr<T> {
     pub fn into_raw(self) -> *mut T {
@@ -69,20 +70,97 @@ impl<T> Clone for RtPtr<T> {
 }
 impl<T> Copy for RtPtr<T> {}
 
-// TODO I feel like I'm definitely dupe'ing SPA/pipewire infra here
-// lets revisit this and see if there's a more congruent way to do everything. but xplat
-// also will def be a thing so...
+// TODO: Another really "bad idea" helper type. This erases the allocator a buffer
+// was allocated from, so that we can send it to the RT thread. As a result,
+// RtBuffer does not implemenent `Drop` and will leak if dropped.
 struct RtBuffer(*mut [f32]);
 
 unsafe impl Send for RtBuffer {}
 
 impl RtBuffer {
-    //TODO
+    pub fn new(size: usize, heap: RtObjectHeap) -> Self {
+        let buf: Box<[MaybeUninit<f32>], RtObjectHeap> = Box::new_zeroed_slice_in(size, heap);
+        let buf = Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
+        Self(buf)
+    }
+
+    pub fn as_slice_mut(&mut self) -> &mut [f32] {
+        unsafe { &mut *self.0 }
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        unsafe { &*self.0 }
+    }
 }
 
 struct RtCaptureSink {
     next: *mut RtCaptureSink,
+    pending_buffer: Option<RtBuffer>,
+    pending_buffer_offset: usize,
     free_buffers: AtomicRingReader<RtBuffer>,
+    waiter: AtomicRingWaiter<AudioPacket>,
+    writer: AtomicRingWriter<AudioPacket>,
+}
+
+impl RtCaptureSink {
+    pub fn new(
+        free_buffers: AtomicRingReader<RtBuffer>, waiter: AtomicRingWaiter<AudioPacket>,
+        writer: AtomicRingWriter<AudioPacket>,
+    ) -> Self {
+        Self {
+            next: ptr::null_mut(),
+            pending_buffer: None,
+            pending_buffer_offset: 0,
+            free_buffers,
+            waiter,
+            writer,
+        }
+    }
+}
+
+struct RealTimeThreadState {
+    accumulator: f64,
+    capture_sinks: *mut RtCaptureSink,
+}
+
+impl RealTimeThreadState {
+    pub unsafe fn process_capture_stream(&mut self, data: &mut [f32]) {
+        let mut capture_sink = self.capture_sinks;
+        while !capture_sink.is_null() {
+            let mut data = &mut *data;
+            while !data.is_empty() {
+                if (*capture_sink).pending_buffer.is_none() {
+                    (*capture_sink).pending_buffer = (*capture_sink).free_buffers.try_pop();
+                    if (*capture_sink).pending_buffer.is_none() {
+                        println!("xrun: exhausted capture buffers");
+                        break;
+                    }
+                }
+                let pending_buffer = (*capture_sink).pending_buffer.as_mut().unwrap();
+                let pending_buffer = pending_buffer.as_slice_mut();
+                let avail = pending_buffer.len() - (*capture_sink).pending_buffer_offset;
+                let (data_chunk, rest) = data.split_at_mut(avail.min(data.len()));
+                let (_, dest) = pending_buffer.split_at_mut((*capture_sink).pending_buffer_offset);
+                let dest_len = dest.len();
+                let dest = &mut dest[..data_chunk.len().min(dest_len)];
+                data = rest;
+                (*capture_sink).pending_buffer_offset += data_chunk.len();
+                dest.copy_from_slice(data_chunk);
+                if (*capture_sink).pending_buffer_offset == pending_buffer.len() {
+                    let packet =
+                        AudioPacket { data: (*capture_sink).pending_buffer.take().unwrap() };
+                    (*capture_sink).pending_buffer_offset = 0;
+                    if let Some(failed) = (*capture_sink).writer.try_push(packet) {
+                        (*capture_sink).pending_buffer = Some(failed.data);
+                        println!("xrun: dropped capture sink packet");
+                    } else {
+                        (*capture_sink).waiter.alert();
+                    }
+                }
+            }
+            capture_sink = (*capture_sink).next;
+        }
+    }
 }
 
 struct ControlThreadState {
@@ -107,12 +185,16 @@ struct AudioControlThreadInner {
 }
 
 impl AudioControlThreadInner {
-    pub fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
+    // blocking invoke to RT thread. the callback can access the real-time state.
+    // Unsafe for many reasons. You must ensure that invoke_rt is not re-entered,
+    // otherwise you'll create a non-unique &mut as Pipewire will run the callback
+    // directly on the invoking thread.
+    pub unsafe fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
     where
         F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
     {
         unsafe {
-            unsafe extern "C" fn invoke_data_loop_sync_trampoline<F>(
+            unsafe extern "C" fn trampoline<F>(
                 _loop: *mut libspa_sys::spa_loop, _is_async: bool, _seq: u32, _data: *const c_void,
                 _size: usize, user_data: *mut c_void,
             ) -> i32
@@ -128,7 +210,7 @@ impl AudioControlThreadInner {
             let mut user_data = (self.rt.get(), Some(f));
             pipewire_sys::pw_data_loop_invoke(
                 data_loop,
-                Some(invoke_data_loop_sync_trampoline::<F>),
+                Some(trampoline::<F>),
                 0,
                 ptr::null_mut(),
                 0,
@@ -156,15 +238,28 @@ enum AudioControlThreadResponse {
     InitializationFailed, // TODO wrap an error
     CaptureStream {
         free_buffers: AtomicRingWriter<RtBuffer>,
-        waiter: AtomicRingWaiter<RtBuffer>,
     },
 }
 
 unsafe impl Send for AudioControlThreadResponse {}
 
-struct AudioPacket;
+struct AudioPacket {
+    data: RtBuffer,
+}
 
-struct AudioStream;
+struct AudioStream {
+    free_buffers: AtomicRingWriter<RtBuffer>,
+    waiter: AtomicRingWaiter<AudioPacket>,
+}
+
+impl AudioStream {
+    pub fn next(&mut self, buf: &mut [f32]) {
+        let packet = self.waiter.wait_pop();
+        let data = packet.data.as_slice();
+        buf.copy_from_slice(data);
+        assert!(self.free_buffers.try_push(packet.data).is_none());
+    }
+}
 
 struct AudioControlThread {
     thread: Option<std::thread::JoinHandle<()>>,
@@ -185,6 +280,20 @@ fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
         for j in 0..n_channels {
             buf[i * n_channels + j] = val;
         }
+    }
+}
+
+fn data_as_f32_slice(data: &mut pipewire::spa::data::Data) -> Option<&mut [f32]> {
+    let ptr = data.as_raw();
+
+    if ptr.data.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let len = (*ptr.chunk).size as usize / std::mem::size_of::<f32>();
+        let offset = (*ptr.chunk).offset as usize;
+        Some(std::slice::from_raw_parts_mut(ptr.data.add(offset) as *mut f32, len))
     }
 }
 
@@ -234,15 +343,13 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
             .process({
                 let state = state.clone();
                 move |stream, ()| {
-                    // much yo, very lo
                     let rt = &mut *state.rt.get();
-                    rt.did_thing = true;
                     if let Some(mut buffer) = stream.dequeue_buffer() {
-                        for _data in buffer.datas_mut() {
-                            //
+                        for data in buffer.datas_mut() {
+                            if let Some(samples) = data_as_f32_slice(data) {
+                                rt.process_capture_stream(samples);
+                            }
                         }
-                    } else {
-                        println!("null buffer omg what do we do");
                     }
                 }
             })
@@ -283,10 +390,6 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
                 (*data0.chunk).offset = 0;
                 (*data0.chunk).stride = stride as i32;
                 (*data0.chunk).size = (data_buf.len() * std::mem::size_of::<f32>()) as u32;
-                if rt.did_thing && !rt.did_other_thing {
-                    rt.did_other_thing = true;
-                    println!("did other thing after doing thing");
-                }
                 stream.queue_raw_buffer(raw_buffer);
             }
         })
@@ -316,39 +419,35 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadInner>) -> anyho
             let ct = &mut *state.ct.get();
             while let Some(request) = ct.request_rx.try_pop() {
                 match request {
-                    AudioControlThreadRequest::AddCaptureSink {
-                        interval,
-                        waiter: _,
-                        writer: _,
-                    } => {
+                    AudioControlThreadRequest::AddCaptureSink { interval, waiter, writer } => {
                         let rate = (SAMPLE_RATE as f32 * interval.as_secs_f32()) as usize;
-                        let buf_len = rate * NUM_CHANNELS * std::mem::size_of::<f32>();
+                        let buf_len = rate * NUM_CHANNELS;
                         let (buf_rx, mut buf_tx) = AtomicRing::new(CAPTURE_BUFFER_POOL_SIZE);
+                        // TODO think through how to safely represent the sharing of data with
+                        // the RT thread. RtPtr is just butchering around the problem.
                         let capture_sink = RtPtr(Box::into_raw(Box::new_in(
-                            RtCaptureSink { next: ptr::null_mut(), free_buffers: buf_rx },
+                            RtCaptureSink::new(buf_rx, waiter, writer),
                             ct.rt_heap.clone(),
                         )));
-
                         for _i in 0..CAPTURE_BUFFER_POOL_SIZE {
-                            let buf: Box<[MaybeUninit<f32>], RtObjectHeap> =
-                                Box::new_zeroed_slice_in(buf_len, ct.rt_heap.clone());
-                            let buf =
-                                Box::<[f32], RtObjectHeap>::into_raw(unsafe { buf.assume_init() });
-                            let buf = RtBuffer(buf);
-
+                            let buf = RtBuffer::new(buf_len, ct.rt_heap.clone());
                             assert!(buf_tx.try_push(buf).is_none());
                         }
-
                         state.invoke_rt(&context, move |rt| {
                             let capture_sink = capture_sink.into_raw();
                             (*capture_sink).next = rt.capture_sinks;
                             rt.capture_sinks = capture_sink;
-                            println!("we in there {:?} {:?}", std::thread::current(), capture_sink);
                         });
+                        assert!(ct
+                            .response_tx
+                            .try_push(AudioControlThreadResponse::CaptureStream {
+                                free_buffers: buf_tx,
+                            })
+                            .is_none());
+                        ct.response_waiter.alert();
                     }
                 }
             }
-            println!("event handler");
         }
     });
     // Another API issue: add_event callbacks aren't FnMut
@@ -405,8 +504,6 @@ impl AudioControlThread {
                 let state = Rc::new(AudioControlThreadInner {
                     rt: UnsafeCell::new(RealTimeThreadState {
                         accumulator: 0.0,
-                        did_thing: false,
-                        did_other_thing: false,
                         capture_sinks: ptr::null_mut(),
                     }),
                     ct: UnsafeCell::new(ControlThreadState {
@@ -445,16 +542,20 @@ impl AudioControlThread {
     }
 
     pub fn capture_audio_stream(&mut self, interval: Duration) -> anyhow::Result<AudioStream> {
-        let (response_rx, response_tx) = AtomicRing::new(64);
+        let (response_rx, response_tx) = AtomicRing::new(CAPTURE_BUFFER_POOL_SIZE);
         let response_waiter = AtomicRingWaiter::new(response_rx);
         let request = AudioControlThreadRequest::AddCaptureSink {
             interval,
-            waiter: response_waiter,
+            waiter: response_waiter.clone(),
             writer: response_tx,
         };
         self.try_send_request(request)?;
-        let _response = self.waiter.wait_pop();
-        todo!();
+        match self.waiter.wait_pop() {
+            AudioControlThreadResponse::CaptureStream { free_buffers } => {
+                Ok(AudioStream { free_buffers, waiter: response_waiter })
+            }
+            _ => unreachable!("invalid response"),
+        }
     }
 }
 
@@ -466,16 +567,15 @@ impl Drop for AudioControlThread {
 }
 
 pub fn test() -> anyhow::Result<()> {
-    for _ in 0..100 {
-        std::thread::spawn(|| {
-            let _mainloop = pipewire::MainLoop::new().unwrap();
-        });
-    }
-
     let mut audio_control = AudioControlThread::new()?;
     println!("we got audio control");
-    let _audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
+    let start = Instant::now();
+    let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
     println!("we got capture stream");
-    std::thread::sleep(Duration::from_secs(5));
+    while start.elapsed() < Duration::from_secs(5) {
+        let mut samples = [0.0f32; 480 * 2];
+        audio_stream.next(&mut samples);
+        println!("samples: {:?}", samples);
+    }
     Ok(())
 }
