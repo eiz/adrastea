@@ -109,7 +109,7 @@ struct AudioControlThreadInner {
 impl AudioControlThreadInner {
     pub fn invoke_rt<F>(&self, context: &Context<MainLoop>, f: F)
     where
-        F: Fn(&mut RealTimeThreadState) + 'static + Send,
+        F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
     {
         unsafe {
             unsafe extern "C" fn invoke_data_loop_sync_trampoline<F>(
@@ -117,14 +117,15 @@ impl AudioControlThreadInner {
                 _size: usize, user_data: *mut c_void,
             ) -> i32
             where
-                F: Fn(&mut RealTimeThreadState) + 'static + Send,
+                F: FnOnce(&mut RealTimeThreadState) + 'static + Send,
             {
-                let (rt, f): &(*mut RealTimeThreadState, *const F) = &*(user_data as *const _);
-                (**f)(&mut **rt);
+                let (rt, f): &mut (*mut RealTimeThreadState, Option<F>) =
+                    &mut *(user_data as *mut _);
+                (f.take().unwrap())(&mut **rt);
                 0
             }
             let data_loop = pipewire_sys::pw_context_get_data_loop(context.as_ptr());
-            let user_data = (self.rt.get(), &f as *const F);
+            let mut user_data = (self.rt.get(), Some(f));
             pipewire_sys::pw_data_loop_invoke(
                 data_loop,
                 Some(invoke_data_loop_sync_trampoline::<F>),
@@ -132,7 +133,7 @@ impl AudioControlThreadInner {
                 ptr::null_mut(),
                 0,
                 true,
-                &user_data as *const _ as *mut c_void,
+                &mut user_data as *mut _ as *mut c_void,
             );
         }
     }
