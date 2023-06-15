@@ -61,7 +61,6 @@ use crate::{
 
 pub const SAMPLE_RATE: u32 = 16000;
 pub const NUM_CHANNELS: usize = 1;
-const VOLUME: f32 = 0.1;
 const CAPTURE_BUFFER_POOL_SIZE: usize = 64;
 
 // TODO: Used to launder raw pointers as Send atm. Should go away eventually in favor of
@@ -131,13 +130,12 @@ impl RtCaptureSink {
 }
 
 struct RealTimeThreadState {
-    accumulator: f64,
     capture_sinks: *mut RtCaptureSink,
 }
 
 impl RealTimeThreadState {
     pub fn new() -> Self {
-        Self { accumulator: 0.0, capture_sinks: ptr::null_mut() }
+        Self { capture_sinks: ptr::null_mut() }
     }
 
     pub unsafe fn process_capture_stream(&mut self, data: &mut [f32]) {
@@ -185,19 +183,6 @@ struct ControlThreadState {
     response_tx: AtomicRingWriter<AudioControlThreadResponse>,
     response_waiter: AtomicRingWaiter<AudioControlThreadResponse>,
     rt_heap: RtObjectHeap,
-}
-
-fn sine_wave(last: &mut f64, buf: &mut [f32], n_channels: usize) {
-    for i in 0..buf.len() / n_channels {
-        *last += PI * 2.0 * 440.0 / SAMPLE_RATE as f64;
-        if *last > PI * 2.0 {
-            *last -= PI * 2.0;
-        }
-        let val = (*last).sin() as f32 * VOLUME;
-        for j in 0..n_channels {
-            buf[i * n_channels + j] = val;
-        }
-    }
 }
 
 fn data_as_f32_slice(data: &mut pipewire::spa::data::Data) -> Option<&mut [f32]> {
@@ -303,7 +288,7 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadState>) -> anyho
                     (data0.maxsize as usize / std::mem::size_of::<f32>())
                         .min(requested * NUM_CHANNELS),
                 );
-                sine_wave(&mut rt.accumulator, data_buf, NUM_CHANNELS);
+                data_buf.fill(0.0);
                 (*data0.chunk).offset = 0;
                 (*data0.chunk).stride = stride as i32;
                 (*data0.chunk).size = (data_buf.len() * std::mem::size_of::<f32>()) as u32;

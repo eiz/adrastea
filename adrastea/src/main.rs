@@ -803,6 +803,7 @@ pub fn streaming_test() -> anyhow::Result<()> {
     let timer = Instant::now();
     let mut vad_active = false;
     let mut vad_grace = 0;
+    let mut prev_samples = [0.0f32; SAMPLE_RATE as usize / 10 * NUM_CHANNELS];
     loop {
         let mut vad_was_active = vad_active;
         let mut samples = [0.0f32; SAMPLE_RATE as usize / 10 * NUM_CHANNELS];
@@ -825,10 +826,11 @@ pub fn streaming_test() -> anyhow::Result<()> {
             } else {
                 vad_active = false;
             }
+            prev_samples = samples;
         }
         if vad_was_active {
             if all_samples.len() == 0 {
-                all_samples.extend(std::iter::repeat(0.0).take(SAMPLE_RATE as usize));
+                all_samples.extend(&prev_samples);
             }
             all_samples.extend(samples.iter());
             if all_samples.len() > SAMPLE_RATE as usize * NUM_CHANNELS * 30 {
@@ -862,23 +864,14 @@ pub fn streaming_test() -> anyhow::Result<()> {
             token_buffer.push(argmax as i32);
         }
 
-        let detok = context
-            .model()
-            .tokenizer()
-            .decode(token_buffer.iter().map(|x| *x as usize).collect())?;
+        let detok = context.model().tokenizer().decode(
+            token_buffer.iter().map(|x| *x as usize).filter(|&x| x < end_of_text).collect(),
+        )?;
+        let detok = detok.trim();
         println!("[{:?}] final: {}", timer.elapsed(), detok);
         token_buffer = initial_tokens.clone();
         all_samples.clear();
     }
-    /*
-    drop(audio_stream);
-    let mut out_file = File::create("out.wav")?;
-    wav::write(
-        wav::Header::new(wav::WAV_FORMAT_IEEE_FLOAT, NUM_CHANNELS as u16, SAMPLE_RATE, 32),
-        &wav::BitDepth::ThirtyTwoFloat(all_samples.into()),
-        &mut out_file,
-    )?;
-    Ok(())*/
 }
 
 struct Flops(f64);
