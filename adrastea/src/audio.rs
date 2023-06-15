@@ -49,6 +49,15 @@ use crate::{
 //
 // Overall, at the moment this file is basically a C program with Rust syntax. Proceed with
 // _extreme_ caution.
+//
+// TODO: In some ways this module really wants to recreate something like
+// pipewire inside of itself. This seems kind of needed as long as PW is
+// Linux-only, but it seems like a bit of a shame. Windows for example has the
+// exact set of primitives you need to make it work (eventfd -> HEVENT, memoryfd
+// -> CreateFileMapping/ZwCreateSection, dma-buf -> NTHANDLE-style DXGI shared
+// textures) except you need something like the SAR handle queue or Chromium's
+// Mojo broker to do the cross process handle shipping. For a purely client side
+// implementation tho it would work fine.
 
 pub const SAMPLE_RATE: u32 = 16000;
 pub const NUM_CHANNELS: usize = 1;
@@ -485,13 +494,13 @@ enum AudioControlThreadRequest {
 }
 
 enum AudioControlThreadResponse {
+    Ok,
     Initialized {
         control_event: *mut libspa_sys::spa_source,
         quit_event: *mut libspa_sys::spa_source,
         pw_loop: *mut pipewire_sys::pw_loop,
     },
     InitializationFailed, // TODO wrap an error
-    Ok,
     CaptureStream {
         object_id: u64,
         free_buffers: AtomicRingWriter<RtBuffer>,
@@ -559,10 +568,7 @@ pub struct AudioControlThread {
 
 impl AudioControlThread {
     pub fn new() -> anyhow::Result<Self> {
-        // single-slot mailbox for receiving responses back from the ACT
-        // prob not the ideal solution here but I had it handy and I'm sick of
-        // adding dependencies for this ... thing. will likely switch over to using
-        // thread parking so we can have multiple in flight requests.
+        // TODO: currently limited to a single outstanding request
         let (response_rx, response_tx) = AtomicRing::new(1);
         let (request_rx, request_tx) = AtomicRing::new(1);
         let waiter = AtomicRingWaiter::new(response_rx);

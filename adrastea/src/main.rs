@@ -13,7 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use alloc::sync::Arc;
+use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
@@ -780,22 +780,106 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
 }
 
 pub fn streaming_test() -> anyhow::Result<()> {
+    let phys = HipPhysicalDevice::get(0)?;
+    let device = Arc::new(HipDevice::new(phys)?);
+    let _scope = device.lock()?;
+    let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
+    let start = Instant::now();
+    let model =
+        WhisperModel::new(&WhisperModelState::load("/home/eiz/.cache/whisper/small.pt", ())?)?;
+    println!("model load time: {:?}", start.elapsed());
+    let mut context = WhisperContext::new(Arc::new(model), kernels.clone())?;
+    let mut all_samples = VecDeque::new();
+    let initial_tokens = (context.model().tokenizer())
+        // language of glorious mother nation
+        .encode_with_special_tokens("<|startoftranscript|><|en|><|transcribe|>")
+        .iter()
+        .map(|x| *x as i32)
+        .collect::<Vec<_>>();
+    let mut token_buffer = initial_tokens.clone();
+    let end_of_text = context.model().tokenizer().encode_with_special_tokens("<|endoftext|>")[0];
     let audio_control = AudioControlThread::new()?;
-    let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
-    let mut all_samples = vec![];
-    while all_samples.len() < SAMPLE_RATE as usize * 5 * NUM_CHANNELS {
-        let mut samples = [0.0f32; SAMPLE_RATE as usize / 100 * NUM_CHANNELS];
-        audio_stream.next(&mut samples);
-        all_samples.extend_from_slice(&samples);
+    let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(100))?;
+    let timer = Instant::now();
+    let mut vad_active = false;
+    let mut vad_grace = 0;
+    loop {
+        //println!("[{:?}] recording for 1s", timer.elapsed());
+        let mut chunk_samples = vec![];
+        let mut vad_was_active = vad_active;
+        while chunk_samples.len() < SAMPLE_RATE as usize * NUM_CHANNELS {
+            let mut samples = [0.0f32; SAMPLE_RATE as usize / 10 * NUM_CHANNELS];
+            audio_stream.next(&mut samples);
+            let mut sum_sq = 0.0;
+            for sample in &samples {
+                sum_sq += sample * sample;
+            }
+            let rms = (sum_sq / samples.len() as f32).sqrt();
+            //println!("rms: {}", rms);
+            if rms > 0.05 {
+                if !vad_was_active {
+                    println!("vad active");
+                }
+                vad_active = true;
+                vad_was_active = true;
+                vad_grace = 10;
+            } else {
+                if vad_grace > 0 {
+                    vad_grace -= 1;
+                } else {
+                    vad_active = false;
+                }
+            }
+            chunk_samples.extend_from_slice(&samples);
+        }
+        if vad_was_active {
+            all_samples.extend(chunk_samples.iter());
+            if all_samples.len() > SAMPLE_RATE as usize * NUM_CHANNELS * 30 {
+                all_samples.drain(0..all_samples.len() - SAMPLE_RATE as usize * NUM_CHANNELS * 30);
+            }
+        }
+        if !vad_was_active || vad_active {
+            continue;
+        }
+
+        println!("[{:?}] encoding", timer.elapsed());
+        let features = context.encode(all_samples.make_contiguous())?;
+        println!("[{:?}] decoding", timer.elapsed());
+        for _i in 0..(context.model().dims().n_text_ctx as usize - token_buffer.len()) {
+            let logits = context.decode(features.as_view(), &token_buffer)?.into_cpu()?;
+            let logits_vec = logits.storage().as_cpu();
+            let last_logits =
+                &logits_vec[logits_vec.len() - context.model().dims().n_vocab as usize..];
+            let argmax = last_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap()
+                .0;
+            if argmax as usize == end_of_text {
+                println!("<|endoftext|>");
+                break;
+            }
+            token_buffer.push(argmax as i32);
+        }
+
+        let detok = context
+            .model()
+            .tokenizer()
+            .decode(token_buffer.iter().map(|x| *x as usize).collect())?;
+        println!("[{:?}] final: {}", timer.elapsed(), detok);
+        token_buffer = initial_tokens.clone();
+        all_samples.clear();
     }
+    /*
     drop(audio_stream);
     let mut out_file = File::create("out.wav")?;
     wav::write(
         wav::Header::new(wav::WAV_FORMAT_IEEE_FLOAT, NUM_CHANNELS as u16, SAMPLE_RATE, 32),
-        &wav::BitDepth::ThirtyTwoFloat(all_samples),
+        &wav::BitDepth::ThirtyTwoFloat(all_samples.into()),
         &mut out_file,
     )?;
-    Ok(())
+    Ok(())*/
 }
 
 struct Flops(f64);
