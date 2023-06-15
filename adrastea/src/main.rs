@@ -804,36 +804,33 @@ pub fn streaming_test() -> anyhow::Result<()> {
     let mut vad_active = false;
     let mut vad_grace = 0;
     loop {
-        //println!("[{:?}] recording for 1s", timer.elapsed());
-        let mut chunk_samples = vec![];
         let mut vad_was_active = vad_active;
-        while chunk_samples.len() < SAMPLE_RATE as usize * NUM_CHANNELS {
-            let mut samples = [0.0f32; SAMPLE_RATE as usize / 10 * NUM_CHANNELS];
-            audio_stream.next(&mut samples);
-            let mut sum_sq = 0.0;
-            for sample in &samples {
-                sum_sq += sample * sample;
+        let mut samples = [0.0f32; SAMPLE_RATE as usize / 10 * NUM_CHANNELS];
+        audio_stream.next(&mut samples);
+        let mut sum_sq = 0.0;
+        for sample in &samples {
+            sum_sq += sample * sample;
+        }
+        let rms = (sum_sq / samples.len() as f32).sqrt();
+        if rms > 0.05 {
+            if !vad_was_active {
+                println!("vad active");
             }
-            let rms = (sum_sq / samples.len() as f32).sqrt();
-            //println!("rms: {}", rms);
-            if rms > 0.05 {
-                if !vad_was_active {
-                    println!("vad active");
-                }
-                vad_active = true;
-                vad_was_active = true;
-                vad_grace = 10;
+            vad_active = true;
+            vad_was_active = true;
+            vad_grace = 10;
+        } else {
+            if vad_grace > 0 {
+                vad_grace -= 1;
             } else {
-                if vad_grace > 0 {
-                    vad_grace -= 1;
-                } else {
-                    vad_active = false;
-                }
+                vad_active = false;
             }
-            chunk_samples.extend_from_slice(&samples);
         }
         if vad_was_active {
-            all_samples.extend(chunk_samples.iter());
+            if all_samples.len() == 0 {
+                all_samples.extend(std::iter::repeat(0.0).take(SAMPLE_RATE as usize));
+            }
+            all_samples.extend(samples.iter());
             if all_samples.len() > SAMPLE_RATE as usize * NUM_CHANNELS * 30 {
                 all_samples.drain(0..all_samples.len() - SAMPLE_RATE as usize * NUM_CHANNELS * 30);
             }
@@ -841,7 +838,10 @@ pub fn streaming_test() -> anyhow::Result<()> {
         if !vad_was_active || vad_active {
             continue;
         }
-
+        all_samples.extend(
+            std::iter::repeat(0.0)
+                .take(WHISPER_SAMPLE_RATE as usize * WHISPER_CHUNK_LENGTH - all_samples.len()),
+        );
         println!("[{:?}] encoding", timer.elapsed());
         let features = context.encode(all_samples.make_contiguous())?;
         println!("[{:?}] decoding", timer.elapsed());
@@ -857,7 +857,6 @@ pub fn streaming_test() -> anyhow::Result<()> {
                 .unwrap()
                 .0;
             if argmax as usize == end_of_text {
-                println!("<|endoftext|>");
                 break;
             }
             token_buffer.push(argmax as i32);

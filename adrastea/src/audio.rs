@@ -62,7 +62,7 @@ use crate::{
 pub const SAMPLE_RATE: u32 = 16000;
 pub const NUM_CHANNELS: usize = 1;
 const VOLUME: f32 = 0.1;
-const CAPTURE_BUFFER_POOL_SIZE: usize = 16;
+const CAPTURE_BUFFER_POOL_SIZE: usize = 64;
 
 // TODO: Used to launder raw pointers as Send atm. Should go away eventually in favor of
 // a more specific interface for RT data.
