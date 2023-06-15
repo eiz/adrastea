@@ -31,6 +31,7 @@ use simt_hip::{
 };
 
 use crate::{
+    audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
     pickle::{ModelState, PickledModel},
     tensor::Tensor,
@@ -778,6 +779,25 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
+pub fn streaming_test() -> anyhow::Result<()> {
+    let audio_control = AudioControlThread::new()?;
+    let mut audio_stream = audio_control.capture_audio_stream(Duration::from_millis(10))?;
+    let mut all_samples = vec![];
+    while all_samples.len() < SAMPLE_RATE as usize * 5 * NUM_CHANNELS {
+        let mut samples = [0.0f32; SAMPLE_RATE as usize / 100 * NUM_CHANNELS];
+        audio_stream.next(&mut samples);
+        all_samples.extend_from_slice(&samples);
+    }
+    drop(audio_stream);
+    let mut out_file = File::create("out.wav")?;
+    wav::write(
+        wav::Header::new(wav::WAV_FORMAT_IEEE_FLOAT, NUM_CHANNELS as u16, SAMPLE_RATE, 32),
+        &wav::BitDepth::ThirtyTwoFloat(all_samples),
+        &mut out_file,
+    )?;
+    Ok(())
+}
+
 struct Flops(f64);
 
 impl Display for Flops {
@@ -1065,7 +1085,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "microbenchmark" {
         unsafe { microbenchmark()? }
     } else if args.len() >= 2 && args[1] == "audio" {
-        audio::test()?
+        streaming_test()?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan");
     }
