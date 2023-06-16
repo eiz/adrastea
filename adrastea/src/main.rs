@@ -23,13 +23,10 @@ use core::{
 use half::f16;
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 use wayland_client::{
-    protocol::{
-        wl_compositor::{self, WlCompositor},
-        wl_registry::{self, WlRegistry},
-    },
+    protocol::{wl_compositor, wl_registry, wl_surface},
     Connection, Dispatch,
 };
-use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
+use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -1149,13 +1146,17 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
 
 #[derive(Default)]
 struct WaylandTest {
-    compositor: Option<WlCompositor>,
-    xdg_wm_base: Option<XdgWmBase>,
+    initialized: bool,
+    compositor: Option<wl_compositor::WlCompositor>,
+    xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
+    surface: Option<wl_surface::WlSurface>,
+    xdg_surface: Option<xdg_surface::XdgSurface>,
+    xdg_top_level: Option<xdg_toplevel::XdgToplevel>,
 }
 
-impl Dispatch<WlRegistry, ()> for WaylandTest {
+impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &WlRegistry, event: wl_registry::Event, data: &(),
+        state: &mut Self, proxy: &wl_registry::WlRegistry, event: wl_registry::Event, data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
@@ -1168,25 +1169,91 @@ impl Dispatch<WlRegistry, ()> for WaylandTest {
                 state.xdg_wm_base = Some(proxy.bind(name, version, qhandle, ()));
                 println!("got xdg_wm_base");
             }
+
+            if !state.initialized && state.compositor.is_some() && state.xdg_wm_base.is_some() {
+                let compositor = state.compositor.as_ref().unwrap();
+                let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
+                let surface = compositor.create_surface(qhandle, ());
+                let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
+                let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
+
+                xdg_top_level.set_title("Bruh".into());
+                surface.commit();
+                state.surface = Some(surface);
+                state.xdg_surface = Some(xdg_surface);
+                state.xdg_top_level = Some(xdg_top_level);
+            }
         }
     }
 }
 
-impl Dispatch<WlCompositor, ()> for WaylandTest {
+impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &WlCompositor, event: wl_compositor::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_compositor::WlCompositor, _event: wl_compositor::Event,
+        _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        println!("compositor {:?}", event);
+        // we don't expect any events
     }
 }
 
-impl Dispatch<XdgWmBase, ()> for WaylandTest {
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &XdgWmBase, event: xdg_wm_base::Event, data: &(),
+        state: &mut Self, proxy: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        match event {
+            xdg_wm_base::Event::Ping { serial } => proxy.pong(serial),
+            _ => {}
+        }
         println!("xdg_wm_base {:?}", event);
+    }
+}
+
+impl Dispatch<wl_surface::WlSurface, ()> for WaylandTest {
+    fn event(
+        _state: &mut Self, _proxy: &wl_surface::WlSurface, event: wl_surface::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        match event {
+            wl_surface::Event::Enter { .. } => todo!(),
+            wl_surface::Event::Leave { .. } => todo!(),
+            wl_surface::Event::PreferredBufferScale { .. } => todo!(),
+            wl_surface::Event::PreferredBufferTransform { .. } => todo!(),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &xdg_surface::XdgSurface,
+        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("xdg_surface {:?}", event);
+        match event {
+            xdg_surface::Event::Configure { serial } => {
+                proxy.ack_configure(serial);
+            }
+            _ => todo!(),
+        }
+    }
+}
+
+impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &xdg_toplevel::XdgToplevel,
+        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("xdg_toplevel {:?}", event);
+        match event {
+            xdg_toplevel::Event::Configure { width, height, states } => {}
+            xdg_toplevel::Event::Close => {}
+            xdg_toplevel::Event::ConfigureBounds { width, height } => {}
+            xdg_toplevel::Event::WmCapabilities { capabilities } => {}
+            _ => {}
+        }
     }
 }
 
