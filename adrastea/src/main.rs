@@ -22,6 +22,14 @@ use core::{
 };
 use half::f16;
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
+use wayland_client::{
+    protocol::{
+        wl_compositor::{self, WlCompositor},
+        wl_registry::{self, WlRegistry},
+    },
+    Connection, Dispatch,
+};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -1139,6 +1147,62 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct WaylandTest {
+    compositor: Option<WlCompositor>,
+    xdg_wm_base: Option<XdgWmBase>,
+}
+
+impl Dispatch<WlRegistry, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &WlRegistry, event: wl_registry::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global { name, interface, version } = event {
+            println!("global {:?} {:?} {:?}", name, interface, version);
+            if interface == "wl_compositor" {
+                state.compositor = Some(proxy.bind(name, version, qhandle, ()));
+                println!("compositor {:?}", state.compositor);
+            }
+            if interface == "xdg_wm_base" {
+                state.xdg_wm_base = Some(proxy.bind(name, version, qhandle, ()));
+                println!("got xdg_wm_base");
+            }
+        }
+    }
+}
+
+impl Dispatch<WlCompositor, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &WlCompositor, event: wl_compositor::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("compositor {:?}", event);
+    }
+}
+
+impl Dispatch<XdgWmBase, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &XdgWmBase, event: xdg_wm_base::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("xdg_wm_base {:?}", event);
+    }
+}
+
+fn wayland_test() -> anyhow::Result<()> {
+    let conn = Connection::connect_to_env()?;
+    let display = conn.display();
+    let mut event_queue = conn.new_event_queue();
+    let handle = event_queue.handle();
+    let _registry = display.get_registry(&handle, ());
+    println!("conn {:?}", conn);
+    loop {
+        event_queue.blocking_dispatch(&mut WaylandTest::default())?;
+    }
+    todo!()
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1162,8 +1226,10 @@ fn main() -> anyhow::Result<()> {
         unsafe { microbenchmark()? }
     } else if args.len() >= 2 && args[1] == "audio" {
         streaming_test()?
+    } else if args.len() >= 2 && args[1] == "wayland" {
+        wayland_test()?
     } else {
-        println!("test commands: cuda, hip, load, wav, vulkan");
+        println!("test commands: cuda, hip, load, wav, vulkan, wayland");
     }
     Ok(())
 }
