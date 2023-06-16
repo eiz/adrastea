@@ -23,7 +23,7 @@ use core::{
 use half::f16;
 use std::{collections::HashMap, fs::File, path::Path, time::Instant};
 use wayland_client::{
-    protocol::{wl_compositor, wl_registry, wl_surface},
+    protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface},
     Connection, Dispatch,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -1144,14 +1144,33 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug)]
 struct WaylandTest {
     initialized: bool,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
+    wl_shm: Option<wl_shm::WlShm>,
+    wl_shm_pool: Option<wl_shm_pool::WlShmPool>,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     xdg_top_level: Option<xdg_toplevel::XdgToplevel>,
+    buffer: Option<wl_buffer::WlBuffer>,
+}
+
+impl WaylandTest {
+    pub fn new() -> Self {
+        Self {
+            initialized: false,
+            compositor: None,
+            xdg_wm_base: None,
+            wl_shm: None,
+            wl_shm_pool: None,
+            surface: None,
+            xdg_surface: None,
+            xdg_top_level: None,
+            buffer: None,
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
@@ -1169,19 +1188,44 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
                 state.xdg_wm_base = Some(proxy.bind(name, version, qhandle, ()));
                 println!("got xdg_wm_base");
             }
+            if interface == "wl_shm" {
+                state.wl_shm = Some(proxy.bind(name, version, qhandle, ()));
+            }
 
-            if !state.initialized && state.compositor.is_some() && state.xdg_wm_base.is_some() {
+            if !state.initialized
+                && state.compositor.is_some()
+                && state.xdg_wm_base.is_some()
+                && state.wl_shm.is_some()
+            {
                 let compositor = state.compositor.as_ref().unwrap();
                 let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
+                let wl_shm = state.wl_shm.as_ref().unwrap();
                 let surface = compositor.create_surface(qhandle, ());
                 let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
                 let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
-
+                let memfd =
+                    unsafe { libc::memfd_create(b"wl_shm_pool\0".as_ptr() as *const i8, 0) };
+                unsafe {
+                    libc::ftruncate(memfd, 1024 * 1024 * 100);
+                }
+                let wl_shm_pool = wl_shm.create_pool(memfd, 1024 * 1024 * 100, qhandle, ());
+                let buffer = wl_shm_pool.create_buffer(
+                    0,
+                    1920,
+                    1080,
+                    1920 * 4,
+                    wl_shm::Format::Abgr8888,
+                    qhandle,
+                    (),
+                );
                 xdg_top_level.set_title("Bruh".into());
                 surface.commit();
                 state.surface = Some(surface);
                 state.xdg_surface = Some(xdg_surface);
                 state.xdg_top_level = Some(xdg_top_level);
+                state.wl_shm_pool = Some(wl_shm_pool);
+                state.buffer = Some(buffer);
+                state.initialized = true;
             }
         }
     }
@@ -1234,8 +1278,11 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
         match event {
             xdg_surface::Event::Configure { serial } => {
                 proxy.ack_configure(serial);
+                let surface = state.surface.as_ref().unwrap();
+                surface.attach(state.buffer.as_ref(), 0, 0);
+                surface.commit();
             }
-            _ => todo!(),
+            _ => {}
         }
     }
 }
@@ -1257,6 +1304,37 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
     }
 }
 
+impl Dispatch<wl_shm::WlShm, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &wl_shm::WlShm,
+        event: <wl_shm::WlShm as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("wl_shm {:?}", event);
+        //
+    }
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &wl_shm_pool::WlShmPool,
+        event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("wl_shm_pool {:?}", event);
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &wl_buffer::WlBuffer,
+        event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
+        qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("wl_buffer {:?}", event);
+    }
+}
+
 fn wayland_test() -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
@@ -1264,8 +1342,9 @@ fn wayland_test() -> anyhow::Result<()> {
     let handle = event_queue.handle();
     let _registry = display.get_registry(&handle, ());
     println!("conn {:?}", conn);
+    let mut state = WaylandTest::new();
     loop {
-        event_queue.blocking_dispatch(&mut WaylandTest::default())?;
+        event_queue.blocking_dispatch(&mut state)?;
     }
     todo!()
 }
