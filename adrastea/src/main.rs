@@ -24,11 +24,15 @@ use half::f16;
 use std::{collections::HashMap, fs::File, os::fd::RawFd, path::Path, time::Instant};
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
     },
     Connection, Dispatch,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::{
+    wp::linux_dmabuf::zv1::client::{zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1},
+    xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -1149,6 +1153,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
 #[derive(Debug)]
 struct WaylandTest {
     initialized: bool,
+    post_bind_sync_complete: bool,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     wl_shm: Option<wl_shm::WlShm>,
@@ -1161,12 +1166,14 @@ struct WaylandTest {
     mmap_mut: Option<memmap2::MmapMut>,
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
+    zwp_linux_dmabuf_v1: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
 }
 
 impl WaylandTest {
     pub fn new() -> Self {
         Self {
             initialized: false,
+            post_bind_sync_complete: false,
             compositor: None,
             xdg_wm_base: None,
             wl_shm: None,
@@ -1179,6 +1186,7 @@ impl WaylandTest {
             mmap_mut: None,
             wl_seat: None,
             wl_pointer: None,
+            zwp_linux_dmabuf_v1: None,
         }
     }
 }
@@ -1202,50 +1210,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
             if interface == "wl_seat" {
                 state.wl_seat = Some(proxy.bind(name, version, qhandle, ()));
             }
-
-            if !state.initialized
-                && state.compositor.is_some()
-                && state.xdg_wm_base.is_some()
-                && state.wl_shm.is_some()
-                && state.wl_seat.is_some()
-            {
-                let compositor = state.compositor.as_ref().unwrap();
-                let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
-                let wl_shm = state.wl_shm.as_ref().unwrap();
-                let wl_seat = state.wl_seat.as_ref().unwrap();
-                let surface = compositor.create_surface(qhandle, ());
-                let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
-                let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
-                let pointer = wl_seat.get_pointer(qhandle, ());
-                let memfd =
-                    unsafe { libc::memfd_create(b"wl_shm_pool\0".as_ptr() as *const i8, 0) };
-                unsafe {
-                    libc::ftruncate(memfd, 4096 * 4096 * 4);
-                    let mut mapping = memmap2::Mmap::map(memfd).unwrap().make_mut().unwrap();
-                    mapping.as_mut().fill(0xFF);
-                    state.mmap_mut = Some(mapping);
-                }
-                state.memfd = Some(memfd);
-
-                let wl_shm_pool = wl_shm.create_pool(memfd, 4096 * 4096 * 4, qhandle, ());
-                let buffer = wl_shm_pool.create_buffer(
-                    0,
-                    1920,
-                    1080,
-                    1920 * 4,
-                    wl_shm::Format::Abgr8888,
-                    qhandle,
-                    (),
-                );
-                xdg_top_level.set_title("Bruh".into());
-                surface.commit();
-                state.surface = Some(surface);
-                state.xdg_surface = Some(xdg_surface);
-                state.xdg_top_level = Some(xdg_top_level);
-                state.wl_shm_pool = Some(wl_shm_pool);
-                state.buffer = Some(buffer);
-                state.wl_pointer = Some(pointer);
-                state.initialized = true;
+            if interface == "zwp_linux_dmabuf_v1" {
+                state.zwp_linux_dmabuf_v1 = Some(proxy.bind(name, version, qhandle, ()));
             }
         }
     }
@@ -1399,12 +1365,94 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &wl_callback::WlCallback,
+        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if !state.post_bind_sync_complete {
+            state.post_bind_sync_complete = true;
+            conn.display().sync(qhandle, ());
+            return;
+        }
+        // TODO: theres different kinds of wl_callbacks, don't just assume 🤣
+        if !state.initialized
+            && state.compositor.is_some()
+            && state.xdg_wm_base.is_some()
+            && state.wl_shm.is_some()
+            && state.wl_seat.is_some()
+        {
+            let compositor = state.compositor.as_ref().unwrap();
+            let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
+            let wl_shm = state.wl_shm.as_ref().unwrap();
+            let wl_seat = state.wl_seat.as_ref().unwrap();
+            let surface = compositor.create_surface(qhandle, ());
+            let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
+            let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
+            let pointer = wl_seat.get_pointer(qhandle, ());
+            if let Some(dmabuf_api) = state.zwp_linux_dmabuf_v1.as_ref() {
+                dmabuf_api.get_surface_feedback(&surface, qhandle, ());
+            }
+            let memfd = unsafe { libc::memfd_create(b"wl_shm_pool\0".as_ptr() as *const i8, 0) };
+            unsafe {
+                libc::ftruncate(memfd, 4096 * 4096 * 4);
+                let mut mapping = memmap2::Mmap::map(memfd).unwrap().make_mut().unwrap();
+                mapping.as_mut().fill(0xFF);
+                state.mmap_mut = Some(mapping);
+            }
+            state.memfd = Some(memfd);
+
+            let wl_shm_pool = wl_shm.create_pool(memfd, 4096 * 4096 * 4, qhandle, ());
+            let buffer = wl_shm_pool.create_buffer(
+                0,
+                1920,
+                1080,
+                1920 * 4,
+                wl_shm::Format::Abgr8888,
+                qhandle,
+                (),
+            );
+            xdg_top_level.set_title("Bruh".into());
+            surface.commit();
+            state.surface = Some(surface);
+            state.xdg_surface = Some(xdg_surface);
+            state.xdg_top_level = Some(xdg_top_level);
+            state.wl_shm_pool = Some(wl_shm_pool);
+            state.buffer = Some(buffer);
+            state.wl_pointer = Some(pointer);
+            state.initialized = true;
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: <zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("zwp_linux_dmabuf_v1 {:?}", event);
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        event: <zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 as wayland_client::Proxy>::Event,
+        data: &(), conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("zwp_linux_dmabuf_feedback {:?}", event);
+    }
+}
+
 fn wayland_test() -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let display = conn.display();
     let mut event_queue = conn.new_event_queue();
     let handle = event_queue.handle();
     let _registry = display.get_registry(&handle, ());
+    display.sync(&handle, ());
     println!("conn {:?}", conn);
     let mut state = WaylandTest::new();
     loop {
