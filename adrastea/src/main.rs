@@ -864,7 +864,6 @@ pub fn streaming_test() -> anyhow::Result<()> {
             }
             token_buffer.push(argmax as i32);
         }
-
         let detok = context.model().tokenizer().decode(
             token_buffer.iter().map(|x| *x as usize).filter(|&x| x < end_of_text).collect(),
         )?;
@@ -1166,7 +1165,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "wayland" {
         wayland::wayland_test()?
     } else {
-        println!("test commands: cuda, hip, load, wav, vulkan, wayland");
+        println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }
     Ok(())
 }

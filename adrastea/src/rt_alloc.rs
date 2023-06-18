@@ -17,18 +17,27 @@ use core::{
     alloc::Layout,
     cell::RefCell,
     ffi::c_void,
+    fmt::{self, Formatter},
     ptr::{self, NonNull},
 };
 
 use alloc::{collections::BTreeMap, rc::Rc};
 use allocator_api2::alloc::Allocator;
 
-pub trait PageAllocatorHandle {
+fn required_padding(offset: u32, align: u32) -> u32 {
+    if offset % align == 0 {
+        0
+    } else {
+        align - (offset % align)
+    }
+}
+
+pub trait ArenaHandle {
     fn as_ptr(&self) -> *mut c_void;
     unsafe fn offset(&self, offset: usize) -> Self;
 }
 
-impl PageAllocatorHandle for *mut c_void {
+impl ArenaHandle for *mut c_void {
     fn as_ptr(&self) -> *mut c_void {
         *self
     }
@@ -38,22 +47,22 @@ impl PageAllocatorHandle for *mut c_void {
     }
 }
 
-pub trait PageAllocator {
-    type PageHandle: PageAllocatorHandle;
-    type ArenaParams: Clone;
+pub trait ArenaAllocator {
+    type Handle: ArenaHandle;
+    type Params: Clone;
 
-    fn allocate(size: u32, params: &Self::ArenaParams) -> Self::PageHandle;
-    fn deallocate(handle: &Self::PageHandle, size: u32, params: &Self::ArenaParams);
+    fn allocate(size: u32, params: &Self::Params) -> Self::Handle;
+    unsafe fn deallocate(handle: &Self::Handle, size: u32, params: &Self::Params);
 }
 
-#[derive(Copy, Clone)]
-pub struct LockedPageAllocator;
+#[derive(Copy, Clone, Debug)]
+pub struct LockedArenaAllocator;
 
-impl PageAllocator for LockedPageAllocator {
-    type PageHandle = *mut c_void;
-    type ArenaParams = ();
+impl ArenaAllocator for LockedArenaAllocator {
+    type Handle = *mut c_void;
+    type Params = ();
 
-    fn allocate(size: u32, _params: &Self::ArenaParams) -> Self::PageHandle {
+    fn allocate(size: u32, _params: &Self::Params) -> Self::Handle {
         unsafe {
             let ptr = libc::mmap64(
                 ptr::null_mut(),
@@ -73,7 +82,7 @@ impl PageAllocator for LockedPageAllocator {
         }
     }
 
-    fn deallocate(handle: &Self::PageHandle, size: u32, _params: &Self::ArenaParams) {
+    unsafe fn deallocate(handle: &Self::Handle, size: u32, _params: &Self::Params) {
         unsafe {
             libc::munlock(handle.as_ptr(), size as usize);
             libc::munmap(handle.as_ptr(), size as usize);
@@ -81,21 +90,21 @@ impl PageAllocator for LockedPageAllocator {
     }
 }
 
-struct RtObjectArena<T: PageAllocator = LockedPageAllocator> {
-    arena: T::PageHandle,
-    arena_params: T::ArenaParams,
+struct RtObjectArena<T: ArenaAllocator = LockedArenaAllocator> {
+    arena: T::Handle,
+    arena_params: T::Params,
     size: u32,
     free_map: BTreeMap<u32, u32>,
 }
 
-impl<T: PageAllocator> RtObjectArena<T> {
-    pub fn new(size: u32, params: &T::ArenaParams) -> Self {
+impl<T: ArenaAllocator> RtObjectArena<T> {
+    pub fn new(size: u32, params: &T::Params) -> Self {
         let mut free_map = BTreeMap::new();
         free_map.insert(0, size);
         Self { arena: T::allocate(size, params), arena_params: params.clone(), size, free_map }
     }
 
-    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> T::PageHandle {
+    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> T::Handle {
         let size = self.free_map.remove(&offset).expect("invariant: invalid allocation offset");
         let size_lo = required_padding(offset, layout.align() as u32);
         let data_base = offset + size_lo;
@@ -144,20 +153,27 @@ impl<T: PageAllocator> RtObjectArena<T> {
     }
 }
 
-impl<T: PageAllocator> Drop for RtObjectArena<T> {
+impl<T: ArenaAllocator> Drop for RtObjectArena<T> {
     fn drop(&mut self) {
-        T::deallocate(&self.arena, self.size, &self.arena_params);
+        unsafe { T::deallocate(&self.arena, self.size, &self.arena_params) }
     }
 }
 
-struct RtObjectHeapInner<T: PageAllocator> {
+impl<T: ArenaAllocator> fmt::Debug for RtObjectArena<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RtObjectArena").field("size", &self.size).finish()
+    }
+}
+
+#[derive(Debug)]
+struct RtObjectHeapInner<T: ArenaAllocator> {
     arenas: Vec<RtObjectArena<T>>,
-    arena_params: T::ArenaParams,
+    arena_params: T::Params,
     arena_size: u32,
     max_arenas: usize,
 }
 
-impl<T: PageAllocator> RtObjectHeapInner<T> {
+impl<T: ArenaAllocator> RtObjectHeapInner<T> {
     fn more_core(&mut self) -> usize {
         if self.arenas.len() >= self.max_arenas {
             panic!("rt_allocator: exhausted arena limit");
@@ -168,12 +184,12 @@ impl<T: PageAllocator> RtObjectHeapInner<T> {
 }
 
 #[derive(Clone)]
-pub struct RtObjectHeap<T: PageAllocator = LockedPageAllocator> {
+pub struct RtObjectHeap<T: ArenaAllocator = LockedArenaAllocator> {
     inner: Rc<RefCell<RtObjectHeapInner<T>>>,
 }
 
-impl<T: PageAllocator> RtObjectHeap<T> {
-    pub fn new(arena_size: u32, max_arenas: usize, arena_params: T::ArenaParams) -> Self {
+impl<T: ArenaAllocator> RtObjectHeap<T> {
+    pub fn new(arena_size: u32, max_arenas: usize, arena_params: T::Params) -> Self {
         Self {
             inner: Rc::new(RefCell::new(RtObjectHeapInner {
                 arenas: Vec::new(),
@@ -183,28 +199,10 @@ impl<T: PageAllocator> RtObjectHeap<T> {
             })),
         }
     }
-}
 
-fn required_padding(offset: u32, align: u32) -> u32 {
-    if offset % align == 0 {
-        0
-    } else {
-        align - (offset % align)
-    }
-}
-
-// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
-// and that was annoying
-// so i thought to myself
-// "BTreeMap"
-// 🤣
-// anyway its super jank nonsense
-// allocations and deallocations obviously use the global heap for the free list
-// so they are not realtime but realtime is expected to do no allocations. the use
-// pattern here is to allocate stuff on the control thread and then pass raw pointers
-// to RT
-unsafe impl<T: PageAllocator> Allocator for RtObjectHeap<T> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+    pub fn allocate_handle(
+        &self, layout: Layout,
+    ) -> Result<T::Handle, allocator_api2::alloc::AllocError> {
         let mut inner = self.inner.borrow_mut();
         if layout.size() > u32::MAX as usize || layout.size() > inner.arena_size as usize {
             panic!("rt_allocator: alloc size {} too large", layout.size());
@@ -228,12 +226,44 @@ unsafe impl<T: PageAllocator> Allocator for RtObjectHeap<T> {
                 }
             }
         }
-        let data_ptr = if let Some((arena_idx, offset, _)) = best {
+        let handle = if let Some((arena_idx, offset, _)) = best {
             inner.arenas[arena_idx].split_and_allocate(offset, layout)
         } else {
             let idx = inner.more_core();
             inner.arenas[idx].split_and_allocate(0, layout)
         };
+        Ok(handle)
+    }
+
+    pub unsafe fn deallocate_handle(&self, handle: T::Handle, layout: Layout) {
+        let mut inner = self.inner.borrow_mut();
+        for arena in &mut inner.arenas {
+            if arena.try_deallocate_and_merge(handle.as_ptr() as *mut c_void, layout) {
+                break;
+            }
+        }
+    }
+}
+
+impl<T: ArenaAllocator> fmt::Debug for RtObjectHeap<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RtObjectHeap").finish()
+    }
+}
+
+// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
+// and that was annoying
+// so i thought to myself
+// "BTreeMap"
+// 🤣
+// anyway its super jank nonsense
+// allocations and deallocations obviously use the global heap for the free list
+// so they are not realtime but realtime is expected to do no allocations. the use
+// pattern here is to allocate stuff on the control thread and then pass raw pointers
+// to RT
+unsafe impl<T: ArenaAllocator> Allocator for RtObjectHeap<T> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let data_ptr = self.allocate_handle(layout)?;
         let ptr = unsafe {
             NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
                 data_ptr.as_ptr() as *mut u8,
