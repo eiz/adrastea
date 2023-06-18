@@ -1150,12 +1150,13 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Default, Debug)]
 struct WaylandTest {
     initialized: bool,
     post_bind_sync_complete: bool,
     frame_number: i64,
-    dims: (i32, i32),
+    width: i32,
+    height: i32,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     wl_shm: Option<wl_shm::WlShm>,
@@ -1172,35 +1173,10 @@ struct WaylandTest {
     frame_callback: Option<wl_callback::WlCallback>,
 }
 
-impl WaylandTest {
-    pub fn new() -> Self {
-        Self {
-            initialized: false,
-            post_bind_sync_complete: false,
-            frame_number: 0,
-            dims: (0, 0),
-            compositor: None,
-            xdg_wm_base: None,
-            wl_shm: None,
-            wl_shm_pool: None,
-            surface: None,
-            xdg_surface: None,
-            xdg_top_level: None,
-            buffer: None,
-            memfd: None,
-            mmap_mut: None,
-            wl_seat: None,
-            wl_pointer: None,
-            zwp_linux_dmabuf_v1: None,
-            frame_callback: None,
-        }
-    }
-}
-
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_registry::WlRegistry, event: wl_registry::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        state: &mut Self, proxy: &wl_registry::WlRegistry, event: wl_registry::Event, _data: &(),
+        _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let wl_registry::Event::Global { name, interface, version } = event {
             println!("global {:?} {:?} {:?}", name, interface, version);
@@ -1234,8 +1210,8 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandTest {
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, proxy: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
             xdg_wm_base::Event::Ping { serial } => proxy.pong(serial),
@@ -1263,8 +1239,8 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandTest {
 impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
     fn event(
         state: &mut Self, proxy: &xdg_surface::XdgSurface,
-        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("xdg_surface {:?}", event);
         match event {
@@ -1284,14 +1260,14 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
 
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &xdg_toplevel::XdgToplevel,
-        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        state: &mut Self, _proxy: &xdg_toplevel::XdgToplevel,
+        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("xdg_toplevel {:?}", event);
         match event {
-            xdg_toplevel::Event::Configure { width, height, states } => {
-                if width != 0 && height != 0 {
+            xdg_toplevel::Event::Configure { width, height, states: _ } => {
+                if width != 0 && height != 0 && (width != state.width || height != state.height) {
                     let old_buffer = state.buffer.take().unwrap();
                     let wl_shm_pool = state.wl_shm_pool.as_ref().unwrap();
                     let buffer = wl_shm_pool.create_buffer(
@@ -1313,12 +1289,13 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
                     };
                     pixels[..width as usize * height as usize].fill(0x0000FF00);
                     state.buffer = Some(buffer);
-                    state.dims = (height, width);
+                    state.height = height;
+                    state.width = width;
                 }
             }
             xdg_toplevel::Event::Close => {}
-            xdg_toplevel::Event::ConfigureBounds { width, height } => {}
-            xdg_toplevel::Event::WmCapabilities { capabilities } => {}
+            xdg_toplevel::Event::ConfigureBounds { width: _, height: _ } => {}
+            xdg_toplevel::Event::WmCapabilities { capabilities: _ } => {}
             _ => {}
         }
     }
@@ -1326,9 +1303,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
 
 impl Dispatch<wl_shm::WlShm, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_shm::WlShm,
-        event: <wl_shm::WlShm as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_shm::WlShm,
+        event: <wl_shm::WlShm as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("wl_shm {:?}", event);
         //
@@ -1337,9 +1314,9 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandTest {
 
 impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_shm_pool::WlShmPool,
-        event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_shm_pool::WlShmPool,
+        event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("wl_shm_pool {:?}", event);
     }
@@ -1347,9 +1324,9 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
 
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_buffer::WlBuffer,
-        event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_buffer::WlBuffer,
+        _event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         // println!("wl_buffer {:?}", event);
     }
@@ -1357,9 +1334,9 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
 
 impl Dispatch<wl_pointer::WlPointer, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_pointer::WlPointer,
-        event: <wl_pointer::WlPointer as wayland_client::Proxy>::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_pointer::WlPointer,
+        event: <wl_pointer::WlPointer as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("wl_pointer {:?}", event);
     }
@@ -1367,9 +1344,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandTest {
 
 impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &wl_seat::WlSeat,
-        event: <wl_seat::WlSeat as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
-        qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_seat::WlSeat,
+        event: <wl_seat::WlSeat as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
+        _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("wl_seat {:?}", event);
     }
@@ -1378,7 +1355,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
 impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
     fn event(
         state: &mut Self, proxy: &wl_callback::WlCallback,
-        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &(),
+        _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, _data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if Some(proxy) == state.frame_callback.as_ref() {
@@ -1396,8 +1373,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
             pixels.fill(color);
             state.frame_callback = Some(surface.frame(&qhandle, ()));
             surface.attach(state.buffer.as_ref(), 0, 0);
-            surface.damage(0, 0, state.dims.1, state.dims.0);
+            surface.damage(0, 0, state.width, state.height);
             surface.commit();
+            return;
         }
         if !state.post_bind_sync_complete {
             state.post_bind_sync_complete = true;
@@ -1458,9 +1436,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-        event: <zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event, data: &(),
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: <zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("zwp_linux_dmabuf_v1 {:?}", event);
     }
@@ -1468,9 +1446,9 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
 
 impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for WaylandTest {
     fn event(
-        state: &mut Self, proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        _state: &mut Self, _proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
         event: <zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 as wayland_client::Proxy>::Event,
-        data: &(), conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("zwp_linux_dmabuf_feedback {:?}", event);
     }
@@ -1484,7 +1462,7 @@ fn wayland_test() -> anyhow::Result<()> {
     let _registry = display.get_registry(&handle, ());
     display.sync(&handle, ());
     println!("conn {:?}", conn);
-    let mut state = WaylandTest::new();
+    let mut state = WaylandTest::default();
     loop {
         event_queue.blocking_dispatch(&mut state)?;
     }

@@ -15,7 +15,6 @@
 
 use core::{
     cell::UnsafeCell,
-    f64::consts::PI,
     ffi::c_void,
     mem::MaybeUninit,
     ptr,
@@ -268,7 +267,7 @@ unsafe fn audio_control_thread_main(state: Rc<AudioControlThreadState>) -> anyho
         .process({
             let state = state.clone();
             move |stream, ()| {
-                let rt = &mut *state.rt.get();
+                let _rt = &mut *state.rt.get();
                 // TODO we're using raw buffers here due to some limitations in
                 // the safe rust bindings, namely, the lack of access to
                 // 'requested'
