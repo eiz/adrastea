@@ -34,6 +34,7 @@ use wayland_protocols::{
     wp::linux_dmabuf::zv1::client::{zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1},
     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -1172,6 +1173,9 @@ struct WaylandTest {
     wl_pointer: Option<wl_pointer::WlPointer>,
     _wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     zwp_linux_dmabuf_v1: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    zwlr_layer_shell_v1: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    layer_surface: Option<wl_surface::WlSurface>,
+    wlr_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     frame_callback: Option<wl_callback::WlCallback>,
 }
 
@@ -1184,18 +1188,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
             println!("global {:?} {:?} {:?}", name, interface, version);
             if interface == "wl_compositor" {
                 state.compositor = Some(proxy.bind(name, version, qhandle, ()));
-            }
-            if interface == "xdg_wm_base" {
+            } else if interface == "xdg_wm_base" {
                 state.xdg_wm_base = Some(proxy.bind(name, version, qhandle, ()));
-            }
-            if interface == "wl_shm" {
+            } else if interface == "wl_shm" {
                 state.wl_shm = Some(proxy.bind(name, version, qhandle, ()));
-            }
-            if interface == "wl_seat" {
+            } else if interface == "wl_seat" {
                 state.wl_seat = Some(proxy.bind(name, version, qhandle, ()));
-            }
-            if interface == "zwp_linux_dmabuf_v1" {
+            } else if interface == "zwp_linux_dmabuf_v1" {
                 state.zwp_linux_dmabuf_v1 = Some(proxy.bind(name, version, qhandle, ()));
+            } else if interface == "zwlr_layer_shell_v1" {
+                state.zwlr_layer_shell_v1 = Some(proxy.bind(name, version, qhandle, ()));
             }
         }
     }
@@ -1357,9 +1359,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandTest {
                 fd,
                 size: _,
             } => {
-                let mmap = unsafe { memmap2::Mmap::map(&fd).unwrap() };
-                let xkb_text = CStr::from_bytes_with_nul(&mmap).unwrap();
-                println!("{}", xkb_text.to_string_lossy());
+                //let mmap = unsafe { memmap2::Mmap::map(&fd).unwrap() };
+                //let xkb_text = CStr::from_bytes_with_nul(&mmap).unwrap();
+                //println!("{}", xkb_text.to_string_lossy());
             }
             _ => {}
         }
@@ -1448,6 +1450,29 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
 
             xdg_top_level.set_title("Bruh".into());
             surface.commit();
+
+            if let Some(zwlr_layer_shell_v1) = state.zwlr_layer_shell_v1.as_ref() {
+                let layer_surface = compositor.create_surface(qhandle, ());
+                let wlr_layer_surface = zwlr_layer_shell_v1.get_layer_surface(
+                    &layer_surface,
+                    None,
+                    zwlr_layer_shell_v1::Layer::Overlay,
+                    "bruh".into(),
+                    qhandle,
+                    (),
+                );
+
+                wlr_layer_surface.set_anchor(
+                    zwlr_layer_surface_v1::Anchor::Bottom
+                        | zwlr_layer_surface_v1::Anchor::Right
+                        | zwlr_layer_surface_v1::Anchor::Left
+                        | zwlr_layer_surface_v1::Anchor::Top,
+                );
+                layer_surface.commit();
+                state.layer_surface = Some(layer_surface);
+                state.wlr_layer_surface = Some(wlr_layer_surface);
+            }
+
             state.surface = Some(surface);
             state.xdg_surface = Some(xdg_surface);
             state.xdg_top_level = Some(xdg_top_level);
@@ -1476,6 +1501,35 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for Wa
         _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("zwp_linux_dmabuf_feedback {:?}", event);
+    }
+}
+
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        event: <zwlr_layer_shell_v1::ZwlrLayerShellV1 as wayland_client::Proxy>::Event, data: &(),
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("zwlr_layer_shell_v1 {:?}", event);
+    }
+}
+
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
+        data: &(), conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("zwlr_layer_surface_v1 {:?}", event);
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                //
+            }
+            zwlr_layer_surface_v1::Event::Closed => {
+                //
+            }
+            _ => {}
+        }
     }
 }
 

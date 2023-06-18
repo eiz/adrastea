@@ -566,7 +566,7 @@ impl AudioControlThread {
                         request_rx,
                         response_tx,
                         response_waiter: waiter,
-                        rt_heap: RtObjectHeap::new(1024 * 1024, 8),
+                        rt_heap: RtObjectHeap::new(1024 * 1024, 8, ()),
                     }),
                 });
                 if let Err(_e) = audio_control_thread_main(state.clone()) {

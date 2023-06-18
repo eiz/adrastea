@@ -23,14 +23,37 @@ use core::{
 use alloc::{collections::BTreeMap, rc::Rc};
 use allocator_api2::alloc::Allocator;
 
-struct RtObjectArena {
-    arena: *mut c_void,
-    size: u32,
-    free_map: BTreeMap<u32, u32>,
+pub trait PageAllocatorHandle {
+    fn as_ptr(&self) -> *mut c_void;
+    unsafe fn offset(&self, offset: usize) -> Self;
 }
 
-impl RtObjectArena {
-    pub fn new(size: u32) -> Self {
+impl PageAllocatorHandle for *mut c_void {
+    fn as_ptr(&self) -> *mut c_void {
+        *self
+    }
+
+    unsafe fn offset(&self, offset: usize) -> Self {
+        unsafe { self.add(offset) }
+    }
+}
+
+pub trait PageAllocator {
+    type PageHandle: PageAllocatorHandle;
+    type ArenaParams: Clone;
+
+    fn allocate(size: u32, params: &Self::ArenaParams) -> Self::PageHandle;
+    fn deallocate(handle: &Self::PageHandle, size: u32, params: &Self::ArenaParams);
+}
+
+#[derive(Copy, Clone)]
+pub struct LockedPageAllocator;
+
+impl PageAllocator for LockedPageAllocator {
+    type PageHandle = *mut c_void;
+    type ArenaParams = ();
+
+    fn allocate(size: u32, _params: &Self::ArenaParams) -> Self::PageHandle {
         unsafe {
             let ptr = libc::mmap64(
                 ptr::null_mut(),
@@ -46,13 +69,33 @@ impl RtObjectArena {
             if libc::mlock(ptr, size as usize) < 0 {
                 panic!("rt_allocator: failed to lock pages");
             }
-            let mut free_map = BTreeMap::new();
-            free_map.insert(0, size);
-            Self { arena: ptr, size, free_map }
+            ptr
         }
     }
 
-    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> *mut c_void {
+    fn deallocate(handle: &Self::PageHandle, size: u32, _params: &Self::ArenaParams) {
+        unsafe {
+            libc::munlock(handle.as_ptr(), size as usize);
+            libc::munmap(handle.as_ptr(), size as usize);
+        }
+    }
+}
+
+struct RtObjectArena<T: PageAllocator = LockedPageAllocator> {
+    arena: T::PageHandle,
+    arena_params: T::ArenaParams,
+    size: u32,
+    free_map: BTreeMap<u32, u32>,
+}
+
+impl<T: PageAllocator> RtObjectArena<T> {
+    pub fn new(size: u32, params: &T::ArenaParams) -> Self {
+        let mut free_map = BTreeMap::new();
+        free_map.insert(0, size);
+        Self { arena: T::allocate(size, params), arena_params: params.clone(), size, free_map }
+    }
+
+    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> T::PageHandle {
         let size = self.free_map.remove(&offset).expect("invariant: invalid allocation offset");
         let size_lo = required_padding(offset, layout.align() as u32);
         let data_base = offset + size_lo;
@@ -60,7 +103,7 @@ impl RtObjectArena {
         let size_hi = offset + size - upper_base;
         assert!(upper_base + size_hi <= self.size);
         unsafe {
-            let result = self.arena.add(data_base as usize);
+            let result = self.arena.offset(data_base as usize);
             if size_lo > 0 {
                 self.free_map.insert(offset, size_lo);
             }
@@ -70,44 +113,72 @@ impl RtObjectArena {
             result
         }
     }
-}
 
-impl Drop for RtObjectArena {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munlock(self.arena, self.size as usize);
-            libc::munmap(self.arena, self.size as usize);
+    pub fn try_deallocate_and_merge(&mut self, ptr: *mut c_void, layout: Layout) -> bool {
+        let addr = ptr as usize;
+        let arena_base = self.arena.as_ptr() as usize;
+        let arena_end = arena_base + self.size as usize;
+        if addr >= arena_base && addr < arena_end {
+            let addr = addr - arena_base;
+            let mut free_start = addr as u32;
+            let mut free_end = free_start + layout.size() as u32;
+            let first_below = self.free_map.range(..addr as u32).next_back().map(|(k, v)| (*k, *v));
+            let first_above = self.free_map.range(addr as u32 + 1..).next().map(|(k, v)| (*k, *v));
+            if let Some((below_offset, below_size)) = first_below {
+                let below_end = below_offset + below_size;
+                if below_end == addr as u32 {
+                    free_start = below_offset;
+                }
+                self.free_map.remove(&below_offset);
+            }
+            if let Some((above_offset, above_size)) = first_above {
+                if above_offset == free_end {
+                    free_end = above_offset + above_size;
+                }
+                self.free_map.remove(&above_offset);
+            }
+            self.free_map.insert(free_start, free_end - free_start);
+            return true;
         }
+        false
     }
 }
 
-struct RtObjectHeapInner {
-    arenas: Vec<RtObjectArena>,
+impl<T: PageAllocator> Drop for RtObjectArena<T> {
+    fn drop(&mut self) {
+        T::deallocate(&self.arena, self.size, &self.arena_params);
+    }
+}
+
+struct RtObjectHeapInner<T: PageAllocator> {
+    arenas: Vec<RtObjectArena<T>>,
+    arena_params: T::ArenaParams,
     arena_size: u32,
     max_arenas: usize,
 }
 
-impl RtObjectHeapInner {
+impl<T: PageAllocator> RtObjectHeapInner<T> {
     fn more_core(&mut self) -> usize {
         if self.arenas.len() >= self.max_arenas {
             panic!("rt_allocator: exhausted arena limit");
         }
-        self.arenas.push(RtObjectArena::new(self.arena_size));
+        self.arenas.push(RtObjectArena::new(self.arena_size, &self.arena_params));
         self.arenas.len() - 1
     }
 }
 
 #[derive(Clone)]
-pub struct RtObjectHeap {
-    inner: Rc<RefCell<RtObjectHeapInner>>,
+pub struct RtObjectHeap<T: PageAllocator = LockedPageAllocator> {
+    inner: Rc<RefCell<RtObjectHeapInner<T>>>,
 }
 
-impl RtObjectHeap {
-    pub fn new(arena_size: u32, max_arenas: usize) -> Self {
+impl<T: PageAllocator> RtObjectHeap<T> {
+    pub fn new(arena_size: u32, max_arenas: usize, arena_params: T::ArenaParams) -> Self {
         Self {
             inner: Rc::new(RefCell::new(RtObjectHeapInner {
                 arenas: Vec::new(),
                 arena_size,
+                arena_params,
                 max_arenas,
             })),
         }
@@ -132,7 +203,7 @@ fn required_padding(offset: u32, align: u32) -> u32 {
 // so they are not realtime but realtime is expected to do no allocations. the use
 // pattern here is to allocate stuff on the control thread and then pass raw pointers
 // to RT
-unsafe impl Allocator for RtObjectHeap {
+unsafe impl<T: PageAllocator> Allocator for RtObjectHeap<T> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let mut inner = self.inner.borrow_mut();
         if layout.size() > u32::MAX as usize || layout.size() > inner.arena_size as usize {
@@ -165,7 +236,7 @@ unsafe impl Allocator for RtObjectHeap {
         };
         let ptr = unsafe {
             NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(
-                data_ptr as *mut u8,
+                data_ptr.as_ptr() as *mut u8,
                 layout.size(),
             ))
         };
@@ -174,33 +245,9 @@ unsafe impl Allocator for RtObjectHeap {
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let mut inner = self.inner.borrow_mut();
-        let addr = ptr.as_ptr() as usize;
-
         for arena in &mut inner.arenas {
-            let arena_base = arena.arena as usize;
-            let arena_end = arena_base + arena.size as usize;
-            if addr >= arena_base && addr < arena_end {
-                let addr = addr - arena_base;
-                let mut free_start = addr as u32;
-                let mut free_end = free_start + layout.size() as u32;
-                let first_below =
-                    arena.free_map.range(..addr as u32).next_back().map(|(k, v)| (*k, *v));
-                let first_above =
-                    arena.free_map.range(addr as u32 + 1..).next().map(|(k, v)| (*k, *v));
-                if let Some((below_offset, below_size)) = first_below {
-                    let below_end = below_offset + below_size;
-                    if below_end == addr as u32 {
-                        free_start = below_offset;
-                    }
-                    arena.free_map.remove(&below_offset);
-                }
-                if let Some((above_offset, above_size)) = first_above {
-                    if above_offset == free_end {
-                        free_end = above_offset + above_size;
-                    }
-                    arena.free_map.remove(&above_offset);
-                }
-                arena.free_map.insert(free_start, free_end - free_start);
+            if arena.try_deallocate_and_merge(ptr.as_ptr() as *mut c_void, layout) {
+                break;
             }
         }
     }
@@ -222,7 +269,7 @@ mod tests {
                 println!("dropping foo {} {}", self.a, self.b);
             }
         }
-        let rt_alloc = RtObjectHeap::new(1024 * 1024, 8);
+        let rt_alloc: RtObjectHeap = RtObjectHeap::new(1024 * 1024, 8, ());
         let foo = Box::new_in(Foo { a: 1, b: 2 }, rt_alloc.clone());
         let bar = Box::new_in(Foo { a: 3, b: 4 }, rt_alloc.clone());
         for _t in 0..10 {
