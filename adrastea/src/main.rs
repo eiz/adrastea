@@ -24,10 +24,11 @@ use half::f16;
 use std::{collections::HashMap, fs::File, os::fd::RawFd, path::Path, time::Instant};
 use wayland_client::{
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor,
+        wl_keyboard::{self, KeymapFormat},
+        wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
-    Connection, Dispatch,
+    Connection, Dispatch, WEnum,
 };
 use wayland_protocols::{
     wp::linux_dmabuf::zv1::client::{zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1},
@@ -1169,6 +1170,7 @@ struct WaylandTest {
     mmap_mut: Option<memmap2::MmapMut>,
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
+    _wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     zwp_linux_dmabuf_v1: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     frame_callback: Option<wl_callback::WlCallback>,
 }
@@ -1287,7 +1289,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
                             mapping.len() / 4,
                         )
                     };
-                    pixels[..width as usize * height as usize].fill(0x0000FF00);
+                    pixels[..width as usize * height as usize].fill(0xFF00FF00);
                     state.buffer = Some(buffer);
                     state.height = height;
                     state.width = width;
@@ -1325,8 +1327,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
 impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
     fn event(
         _state: &mut Self, _proxy: &wl_buffer::WlBuffer,
-        _event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
-        _qhandle: &wayland_client::QueueHandle<Self>,
+        _event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         // println!("wl_buffer {:?}", event);
     }
@@ -1339,6 +1341,28 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandTest {
         _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("wl_pointer {:?}", event);
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandTest {
+    fn event(
+        _state: &mut Self, _proxy: &wl_keyboard::WlKeyboard,
+        event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event, _data: &(),
+        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        println!("wl_keyboard {:?}", event);
+        match event {
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(KeymapFormat::XkbV1),
+                fd,
+                size: _,
+            } => {
+                let mmap = unsafe { memmap2::Mmap::map(&fd).unwrap() };
+                let xkb_text = CStr::from_bytes_with_nul(&mmap).unwrap();
+                println!("{}", xkb_text.to_string_lossy());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1367,9 +1391,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
             // buffers.
             let color = if state.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
             let mapping = state.mmap_mut.as_mut().unwrap();
-            let pixels = unsafe {
-                std::slice::from_raw_parts_mut(mapping.as_mut_ptr() as *mut u32, mapping.len() / 4)
-            };
+            let (ptr, len) = (mapping.as_mut_ptr(), mapping.len());
+            drop(mapping);
+            let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len / 4) };
             pixels.fill(color);
             state.frame_callback = Some(surface.frame(&qhandle, ()));
             surface.attach(state.buffer.as_ref(), 0, 0);
@@ -1397,6 +1421,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
             let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
             let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
             let pointer = wl_seat.get_pointer(qhandle, ());
+            let _keyboard = wl_seat.get_keyboard(qhandle, ());
             if let Some(dmabuf_api) = state.zwp_linux_dmabuf_v1.as_ref() {
                 dmabuf_api.get_surface_feedback(&surface, qhandle, ());
             }
