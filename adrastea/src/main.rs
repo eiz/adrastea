@@ -1154,6 +1154,8 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
 struct WaylandTest {
     initialized: bool,
     post_bind_sync_complete: bool,
+    frame_number: i64,
+    dims: (i32, i32),
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     wl_shm: Option<wl_shm::WlShm>,
@@ -1167,6 +1169,7 @@ struct WaylandTest {
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
     zwp_linux_dmabuf_v1: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+    frame_callback: Option<wl_callback::WlCallback>,
 }
 
 impl WaylandTest {
@@ -1174,6 +1177,8 @@ impl WaylandTest {
         Self {
             initialized: false,
             post_bind_sync_complete: false,
+            frame_number: 0,
+            dims: (0, 0),
             compositor: None,
             xdg_wm_base: None,
             wl_shm: None,
@@ -1187,6 +1192,7 @@ impl WaylandTest {
             wl_seat: None,
             wl_pointer: None,
             zwp_linux_dmabuf_v1: None,
+            frame_callback: None,
         }
     }
 }
@@ -1266,6 +1272,9 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
                 proxy.ack_configure(serial);
                 let surface = state.surface.as_ref().unwrap();
                 surface.attach(state.buffer.as_ref(), 0, 0);
+                if state.frame_callback.is_none() {
+                    state.frame_callback = Some(surface.frame(&qhandle, ()));
+                }
                 surface.commit();
             }
             _ => {}
@@ -1302,8 +1311,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
                             mapping.len() / 4,
                         )
                     };
-                    pixels[..width as usize * height as usize].fill(0x000000FF);
+                    pixels[..width as usize * height as usize].fill(0x0000FF00);
                     state.buffer = Some(buffer);
+                    state.dims = (height, width);
                 }
             }
             xdg_toplevel::Event::Close => {}
@@ -1341,7 +1351,7 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
         event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, data: &(), conn: &Connection,
         qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        println!("wl_buffer {:?}", event);
+        // println!("wl_buffer {:?}", event);
     }
 }
 
@@ -1371,6 +1381,24 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
         event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
+        if Some(proxy) == state.frame_callback.as_ref() {
+            state.frame_callback = None;
+            state.frame_number += 1;
+            let surface = state.surface.as_ref().unwrap();
+            // it feels silly even putting TODOs in this code but...
+            // we definitely need a proper swap chain abstraction to manage in-use/free
+            // buffers.
+            let color = if state.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
+            let mapping = state.mmap_mut.as_mut().unwrap();
+            let pixels = unsafe {
+                std::slice::from_raw_parts_mut(mapping.as_mut_ptr() as *mut u32, mapping.len() / 4)
+            };
+            pixels.fill(color);
+            state.frame_callback = Some(surface.frame(&qhandle, ()));
+            surface.attach(state.buffer.as_ref(), 0, 0);
+            surface.damage(0, 0, state.dims.1, state.dims.0);
+            surface.commit();
+        }
         if !state.post_bind_sync_complete {
             state.post_bind_sync_complete = true;
             conn.display().sync(qhandle, ());
@@ -1404,6 +1432,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
             state.memfd = Some(memfd);
 
             let wl_shm_pool = wl_shm.create_pool(memfd, 4096 * 4096 * 4, qhandle, ());
+
             let buffer = wl_shm_pool.create_buffer(
                 0,
                 1920,
@@ -1413,6 +1442,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
                 qhandle,
                 (),
             );
+
             xdg_top_level.set_title("Bruh".into());
             surface.commit();
             state.surface = Some(surface);
