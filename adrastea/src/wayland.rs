@@ -28,6 +28,7 @@ use std::os::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
+use skia_safe::{paint::Style, AlphaType, Color, ColorType, ISize, ImageInfo, Paint, Surface};
 use wayland_client::{
     protocol::{
         wl_buffer, wl_callback, wl_compositor,
@@ -226,7 +227,7 @@ impl IWindow for TopLevelWindow {
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<HciClient>) {
         let mut inner = self.0.borrow_mut();
         inner.surface.attach(inner.buffer.as_ref().map(|b| &b.buffer), 0, 0);
-        if inner.frame_callback.is_none() {
+        if inner.frame_callback.is_none() && inner.width > 0 && inner.height > 0 {
             inner.frame_callback = Some(inner.surface.frame(qhandle, inner.id));
         }
         inner.surface.commit();
@@ -236,15 +237,35 @@ impl IWindow for TopLevelWindow {
         let mut inner = self.0.borrow_mut();
         inner.frame_callback = None;
         inner.frame_number += 1;
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
         // it feels silly even putting TODOs in this code but...
         // we definitely need a proper swap chain abstraction to manage in-use/free
         // buffers.
-        let color = if inner.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
         let buffer = inner.buffer.as_ref().unwrap();
         // TODO bad bad bad
-        let (ptr, len) = (buffer.handle.as_ptr(), inner.width * inner.height);
-        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len as usize) };
-        pixels.fill(color);
+        let (ptr, len) = (buffer.handle.as_ptr(), inner.width * inner.height * 4);
+        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+        let image_info = ImageInfo::new(
+            ISize::new(inner.width, inner.height),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut surface =
+            Surface::new_raster_direct(&image_info, pixels, inner.width as usize * 4, None)
+                .unwrap();
+        let canvas = surface.canvas();
+        let mut paint = Paint::default();
+        paint
+            .set_style(Style::Stroke)
+            .set_stroke_width(4.0)
+            .set_color(Color::RED)
+            .set_anti_alias(true);
+        canvas.clear(if inner.frame_number % 2 == 0 { Color::WHITE } else { Color::BLACK });
+        canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0, &paint);
+
         inner.surface.attach(Some(&buffer.buffer), 0, 0);
         inner.frame_callback = Some(inner.surface.frame(&qhandle, inner.id));
         inner.surface.damage(0, 0, inner.width, inner.height);
