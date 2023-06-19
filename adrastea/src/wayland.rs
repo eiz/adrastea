@@ -116,6 +116,7 @@ impl WaylandShmBuffer {
 
 impl Drop for WaylandShmBuffer {
     fn drop(&mut self) {
+        // TODO: gotta actually free the memory somewhere
         self.buffer.destroy();
     }
 }
@@ -263,8 +264,10 @@ impl IWindow for TopLevelWindow {
             .set_stroke_width(4.0)
             .set_color(Color::RED)
             .set_anti_alias(true);
-        canvas.clear(if inner.frame_number % 2 == 0 { Color::WHITE } else { Color::BLACK });
-        canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0, &paint);
+        canvas.clear(Color::WHITE);
+        for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
+            canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0 + 8.0 * i as f32, &paint);
+        }
 
         inner.surface.attach(Some(&buffer.buffer), 0, 0);
         inner.frame_callback = Some(inner.surface.frame(&qhandle, inner.id));
