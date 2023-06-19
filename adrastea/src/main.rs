@@ -23,6 +23,7 @@ use core::{
 };
 use skia_safe::{paint, Canvas, Color, EncodedImageFormat, Paint, Surface};
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
+use wayland::SurfaceClient;
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -782,6 +783,13 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
+pub fn wayland_test() -> anyhow::Result<()> {
+    let (mut event_queue, mut client) = SurfaceClient::connect_to_env()?;
+    loop {
+        event_queue.blocking_dispatch(&mut client)?;
+    }
+}
+
 pub fn streaming_test() -> anyhow::Result<()> {
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
@@ -1179,7 +1187,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "audio" {
         streaming_test()?
     } else if args.len() >= 2 && args[1] == "wayland" {
-        wayland::wayland_test()?
+        wayland_test()?
     } else if args.len() >= 2 && args[1] == "skia" {
         skia_test()?
     } else {
