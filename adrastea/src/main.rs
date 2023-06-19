@@ -21,7 +21,8 @@ use core::{
     fmt::{Debug, Display, Formatter},
     time::Duration,
 };
-use std::{collections::HashMap, fs::File, path::Path, time::Instant};
+use skia_safe::{paint, Canvas, Color, EncodedImageFormat, Paint, Surface};
+use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -1140,6 +1141,20 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn skia_test() -> anyhow::Result<()> {
+    let mut surface = Surface::new_raster_n32_premul((256, 256)).unwrap();
+    let canvas = surface.canvas();
+    let mut paint = Paint::default();
+
+    paint.set_style(skia_safe::paint::Style::Stroke).set_stroke_width(4.0).set_color(Color::RED);
+    canvas.draw_line((0, 0), (256, 256), &paint);
+    let image = surface.image_snapshot();
+    let data = image.encode(surface.direct_context(), EncodedImageFormat::PNG, None).unwrap();
+    let mut f = File::create("test.png")?;
+    f.write_all(data.as_bytes())?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1165,6 +1180,8 @@ fn main() -> anyhow::Result<()> {
         streaming_test()?
     } else if args.len() >= 2 && args[1] == "wayland" {
         wayland::wayland_test()?
+    } else if args.len() >= 2 && args[1] == "skia" {
+        skia_test()?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }

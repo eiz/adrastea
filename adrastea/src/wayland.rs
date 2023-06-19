@@ -16,7 +16,6 @@
 use core::{
     alloc::Layout,
     any::{request_ref, Provider},
-    borrow::BorrowMut,
     cell::RefCell,
     ffi::CStr,
     marker::PhantomData,
@@ -179,15 +178,31 @@ impl From<u64> for DelegateId {
     }
 }
 
+impl IUnknown for TopLevelWindow {}
+impl Provider for TopLevelWindow {
+    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
+        demand.provide_ref::<dyn IWindow>(self);
+        demand.provide_ref::<dyn ITopLevelWindow>(self);
+    }
+}
+
+trait IUnknown: Provider + core::fmt::Debug {}
+
+impl dyn IUnknown + '_ {
+    pub fn query_interface<T: ?Sized + 'static>(&self) -> Option<&T> {
+        request_ref(self)
+    }
+}
+
 trait IWindow {
-    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>);
-    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>);
+    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<HciClient>);
+    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<HciClient>);
 }
 
 trait ITopLevelWindow {
     fn toplevel_configure(
-        &self, alloc: &WaylandShmAllocator<WaylandTest>,
-        qhandle: &wayland_client::QueueHandle<WaylandTest>, width: i32, height: i32,
+        &self, alloc: &WaylandShmAllocator<HciClient>,
+        qhandle: &wayland_client::QueueHandle<HciClient>, width: i32, height: i32,
     );
 }
 
@@ -208,7 +223,7 @@ struct TopLevelWindowInner {
 struct TopLevelWindow(RefCell<TopLevelWindowInner>);
 
 impl IWindow for TopLevelWindow {
-    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<HciClient>) {
         let mut inner = self.0.borrow_mut();
         inner.surface.attach(inner.buffer.as_ref().map(|b| &b.buffer), 0, 0);
         if inner.frame_callback.is_none() {
@@ -217,7 +232,7 @@ impl IWindow for TopLevelWindow {
         inner.surface.commit();
     }
 
-    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<HciClient>) {
         let mut inner = self.0.borrow_mut();
         inner.frame_callback = None;
         inner.frame_number += 1;
@@ -240,8 +255,8 @@ impl IWindow for TopLevelWindow {
 
 impl ITopLevelWindow for TopLevelWindow {
     fn toplevel_configure(
-        &self, alloc: &WaylandShmAllocator<WaylandTest>,
-        qhandle: &wayland_client::QueueHandle<WaylandTest>, width: i32, height: i32,
+        &self, alloc: &WaylandShmAllocator<HciClient>,
+        qhandle: &wayland_client::QueueHandle<HciClient>, width: i32, height: i32,
     ) {
         let mut inner = self.0.borrow_mut();
         if width != 0 && height != 0 && (width != inner.width || height != inner.height) {
@@ -263,24 +278,8 @@ impl ITopLevelWindow for TopLevelWindow {
     }
 }
 
-impl IUnknown for TopLevelWindow {}
-impl Provider for TopLevelWindow {
-    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
-        demand.provide_ref::<dyn IWindow>(self);
-        demand.provide_ref::<dyn ITopLevelWindow>(self);
-    }
-}
-
-trait IUnknown: Provider + core::fmt::Debug {}
-
-impl dyn IUnknown + '_ {
-    pub fn query_interface<T: ?Sized + 'static>(&self) -> Option<&T> {
-        request_ref(self)
-    }
-}
-
 #[derive(Default, Debug)]
-struct WaylandTest {
+struct HciClient {
     initialized: bool,
     post_bind_sync_complete: bool,
     delegate_table: BTreeMap<DelegateId, Box<dyn IUnknown>>,
@@ -297,7 +296,7 @@ struct WaylandTest {
     wlr_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
 }
 
-impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
+impl Dispatch<wl_registry::WlRegistry, ()> for HciClient {
     fn event(
         state: &mut Self, proxy: &wl_registry::WlRegistry, event: wl_registry::Event, _data: &(),
         _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
@@ -321,7 +320,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandTest {
+impl Dispatch<wl_compositor::WlCompositor, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_compositor::WlCompositor, _event: wl_compositor::Event,
         _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
@@ -330,7 +329,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandTest {
+impl Dispatch<xdg_wm_base::XdgWmBase, ()> for HciClient {
     fn event(
         _state: &mut Self, proxy: &xdg_wm_base::XdgWmBase, event: xdg_wm_base::Event, _data: &(),
         _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
@@ -343,7 +342,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, DelegateId> for WaylandTest {
+impl Dispatch<wl_surface::WlSurface, DelegateId> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_surface::WlSurface, event: wl_surface::Event,
         _data: &DelegateId, _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
@@ -358,7 +357,7 @@ impl Dispatch<wl_surface::WlSurface, DelegateId> for WaylandTest {
     }
 }
 
-impl Dispatch<xdg_surface::XdgSurface, DelegateId> for WaylandTest {
+impl Dispatch<xdg_surface::XdgSurface, DelegateId> for HciClient {
     fn event(
         state: &mut Self, proxy: &xdg_surface::XdgSurface,
         event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, data: &DelegateId,
@@ -378,7 +377,7 @@ impl Dispatch<xdg_surface::XdgSurface, DelegateId> for WaylandTest {
     }
 }
 
-impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for WaylandTest {
+impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for HciClient {
     fn event(
         state: &mut Self, _proxy: &xdg_toplevel::XdgToplevel,
         event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, data: &DelegateId,
@@ -405,7 +404,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_shm::WlShm, ()> for WaylandTest {
+impl Dispatch<wl_shm::WlShm, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_shm::WlShm,
         event: <wl_shm::WlShm as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
@@ -416,7 +415,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_shm_pool::WlShmPool,
         event: <wl_shm_pool::WlShmPool as wayland_client::Proxy>::Event, _data: &(),
@@ -426,7 +425,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
+impl Dispatch<wl_buffer::WlBuffer, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_buffer::WlBuffer,
         _event: <wl_buffer::WlBuffer as wayland_client::Proxy>::Event, _data: &(),
@@ -436,7 +435,7 @@ impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_pointer::WlPointer, ()> for WaylandTest {
+impl Dispatch<wl_pointer::WlPointer, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_pointer::WlPointer,
         event: <wl_pointer::WlPointer as wayland_client::Proxy>::Event, _data: &(),
@@ -446,7 +445,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandTest {
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_keyboard::WlKeyboard,
         event: <wl_keyboard::WlKeyboard as wayland_client::Proxy>::Event, _data: &(),
@@ -468,7 +467,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
+impl Dispatch<wl_seat::WlSeat, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &wl_seat::WlSeat,
         event: <wl_seat::WlSeat as wayland_client::Proxy>::Event, _data: &(), _conn: &Connection,
@@ -478,7 +477,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, DelegateId> for WaylandTest {
+impl Dispatch<wl_callback::WlCallback, DelegateId> for HciClient {
     fn event(
         state: &mut Self, proxy: &wl_callback::WlCallback,
         event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &DelegateId,
@@ -491,7 +490,7 @@ impl Dispatch<wl_callback::WlCallback, DelegateId> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
+impl Dispatch<wl_callback::WlCallback, ()> for HciClient {
     fn event(
         state: &mut Self, proxy: &wl_callback::WlCallback,
         _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, _data: &(),
@@ -582,7 +581,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
         event: <zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as wayland_client::Proxy>::Event, _data: &(),
@@ -592,7 +591,7 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DelegateId> for WaylandTest {
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DelegateId> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
         event: <zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 as wayland_client::Proxy>::Event,
@@ -602,7 +601,7 @@ impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DelegateId
     }
 }
 
-impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandTest {
+impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for HciClient {
     fn event(
         _state: &mut Self, _proxy: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
         event: <zwlr_layer_shell_v1::ZwlrLayerShellV1 as wayland_client::Proxy>::Event, _data: &(),
@@ -612,7 +611,7 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandTest {
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for HciClient {
     fn event(
         state: &mut Self, proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
@@ -640,7 +639,7 @@ pub fn wayland_test() -> anyhow::Result<()> {
     let _registry = display.get_registry(&handle, ());
     display.sync(&handle, ());
     println!("conn {:?}", conn);
-    let mut state = WaylandTest::default();
+    let mut state = HciClient::default();
     loop {
         event_queue.blocking_dispatch(&mut state)?;
     }
