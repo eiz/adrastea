@@ -15,7 +15,7 @@
 
 use core::{alloc::Layout, ffi::CStr, marker::PhantomData};
 use std::os::{
-    fd::{FromRawFd, OwnedFd, RawFd},
+    fd::{FromRawFd, OwnedFd},
     raw::c_void,
 };
 
@@ -40,8 +40,14 @@ use crate::rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap};
 #[derive(Debug)]
 struct WaylandArenaHandleInner {
     pool: wl_shm_pool::WlShmPool,
-    fd: OwnedFd,
+    _fd: OwnedFd,
     mapping: MmapMut,
+}
+
+impl Drop for WaylandArenaHandleInner {
+    fn drop(&mut self) {
+        self.pool.destroy();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +82,7 @@ impl<T: Dispatch<wl_shm_pool::WlShmPool, ()> + 'static> ArenaAllocator
             // TODO we need to use F_SEAL_FUTURE_WRITE here
             let inner = Arc::new(WaylandArenaHandleInner {
                 pool: params.0.create_pool(memfd, size as i32, &params.2, ()),
-                fd: OwnedFd::from_raw_fd(memfd),
+                _fd: OwnedFd::from_raw_fd(memfd),
                 mapping,
             });
             WaylandArenaHandle(inner, 0)
@@ -97,6 +103,12 @@ struct WaylandShmBuffer {
 impl WaylandShmBuffer {
     pub fn new(handle: WaylandArenaHandle, buffer: wl_buffer::WlBuffer) -> Self {
         Self { handle, buffer }
+    }
+}
+
+impl Drop for WaylandShmBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
     }
 }
 
@@ -143,21 +155,76 @@ where
     }
 }
 
+#[derive(Debug)]
+struct WaylandTopLevel {
+    width: i32,
+    height: i32,
+    frame_number: i64,
+    surface: wl_surface::WlSurface,
+    xdg_surface: xdg_surface::XdgSurface,
+    xdg_toplevel: xdg_toplevel::XdgToplevel,
+    buffer: Option<WaylandShmBuffer>,
+    frame_callback: Option<wl_callback::WlCallback>,
+}
+
+impl WaylandTopLevel {
+    pub fn toplevel_configure(
+        &mut self, alloc: &WaylandShmAllocator<WaylandTest>,
+        qhandle: &wayland_client::QueueHandle<WaylandTest>, width: i32, height: i32,
+    ) {
+        if width != 0 && height != 0 && (width != self.width || height != self.height) {
+            let old_buffer = self.buffer.take().unwrap();
+            let buffer =
+                alloc.create_buffer(width, height, width * 4, wl_shm::Format::Abgr8888, qhandle);
+            old_buffer.buffer.destroy();
+            let pixels = unsafe {
+                std::slice::from_raw_parts_mut(
+                    buffer.handle.as_ptr() as *mut u32,
+                    (height * width) as usize,
+                )
+            };
+            pixels[..width as usize * height as usize].fill(0xFF00FF00);
+            self.buffer = Some(buffer);
+            self.height = height;
+            self.width = width;
+        }
+    }
+    pub fn finish_configure(&mut self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+        self.surface.attach(self.buffer.as_ref().map(|b| &b.buffer), 0, 0);
+        if self.frame_callback.is_none() {
+            self.frame_callback = Some(self.surface.frame(qhandle, ()));
+        }
+        self.surface.commit();
+    }
+    pub fn frame_callback(&mut self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+        self.frame_callback = None;
+        self.frame_number += 1;
+        // it feels silly even putting TODOs in this code but...
+        // we definitely need a proper swap chain abstraction to manage in-use/free
+        // buffers.
+        let color = if self.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
+        let buffer = self.buffer.as_ref().unwrap();
+        // TODO bad bad bad
+        let (ptr, len) = (buffer.handle.as_ptr(), self.width * self.height);
+        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len as usize) };
+        pixels.fill(color);
+        self.frame_callback = Some(self.surface.frame(&qhandle, ()));
+        self.surface.attach(self.buffer.as_ref().map(|b| &b.buffer), 0, 0);
+        self.surface.damage(0, 0, self.width, self.height);
+        self.surface.commit();
+        return;
+    }
+}
+
 #[derive(Default, Debug)]
 struct WaylandTest {
     initialized: bool,
     post_bind_sync_complete: bool,
-    frame_number: i64,
-    width: i32,
-    height: i32,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     shm_allocator: Option<WaylandShmAllocator<Self>>,
     wl_shm: Option<wl_shm::WlShm>,
-    surface: Option<wl_surface::WlSurface>,
-    xdg_surface: Option<xdg_surface::XdgSurface>,
-    xdg_top_level: Option<xdg_toplevel::XdgToplevel>,
-    buffer: Option<WaylandShmBuffer>,
+    top_level: Option<WaylandTopLevel>,
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
     _wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -165,7 +232,6 @@ struct WaylandTest {
     zwlr_layer_shell_v1: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     layer_surface: Option<wl_surface::WlSurface>,
     wlr_layer_surface: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
-    frame_callback: Option<wl_callback::WlCallback>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for WaylandTest {
@@ -239,12 +305,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
         match event {
             xdg_surface::Event::Configure { serial } => {
                 proxy.ack_configure(serial);
-                let surface = state.surface.as_ref().unwrap();
-                surface.attach(state.buffer.as_ref().map(|b| &b.buffer), 0, 0);
-                if state.frame_callback.is_none() {
-                    state.frame_callback = Some(surface.frame(&qhandle, ()));
-                }
-                surface.commit();
+                state.top_level.as_mut().unwrap().finish_configure(qhandle);
             }
             _ => {}
         }
@@ -260,28 +321,12 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
         println!("xdg_toplevel {:?}", event);
         match event {
             xdg_toplevel::Event::Configure { width, height, states: _ } => {
-                if width != 0 && height != 0 && (width != state.width || height != state.height) {
-                    let old_buffer = state.buffer.take().unwrap();
-                    let shm_allocator = state.shm_allocator.as_ref().unwrap();
-                    let buffer = shm_allocator.create_buffer(
-                        width,
-                        height,
-                        width * 4,
-                        wl_shm::Format::Abgr8888,
-                        qhandle,
-                    );
-                    old_buffer.buffer.destroy();
-                    let pixels = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            buffer.handle.as_ptr() as *mut u32,
-                            (height * width) as usize,
-                        )
-                    };
-                    pixels[..width as usize * height as usize].fill(0xFF00FF00);
-                    state.buffer = Some(buffer);
-                    state.height = height;
-                    state.width = width;
-                }
+                state.top_level.as_mut().unwrap().toplevel_configure(
+                    state.shm_allocator.as_ref().unwrap(),
+                    qhandle,
+                    width,
+                    height,
+                );
             }
             xdg_toplevel::Event::Close => {}
             xdg_toplevel::Event::ConfigureBounds { width: _, height: _ } => {}
@@ -370,24 +415,8 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
         _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, _data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        if Some(proxy) == state.frame_callback.as_ref() {
-            state.frame_callback = None;
-            state.frame_number += 1;
-            let surface = state.surface.as_ref().unwrap();
-            // it feels silly even putting TODOs in this code but...
-            // we definitely need a proper swap chain abstraction to manage in-use/free
-            // buffers.
-            let color = if state.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
-            let buffer = state.buffer.as_ref().unwrap();
-            // TODO bad bad bad
-            let (ptr, len) = (buffer.handle.as_ptr(), state.width * state.height);
-            let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len as usize) };
-            pixels.fill(color);
-            state.frame_callback = Some(surface.frame(&qhandle, ()));
-            surface.attach(state.buffer.as_ref().map(|b| &b.buffer), 0, 0);
-            surface.damage(0, 0, state.width, state.height);
-            surface.commit();
-            return;
+        if Some(proxy) == state.top_level.as_ref().and_then(|tl| tl.frame_callback.as_ref()) {
+            state.top_level.as_mut().unwrap().frame_callback(qhandle);
         }
         if !state.post_bind_sync_complete {
             state.post_bind_sync_complete = true;
@@ -451,10 +480,16 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
                 state.wlr_layer_surface = Some(wlr_layer_surface);
             }
 
-            state.surface = Some(surface);
-            state.xdg_surface = Some(xdg_surface);
-            state.xdg_top_level = Some(xdg_top_level);
-            state.buffer = Some(buffer);
+            state.top_level = Some(WaylandTopLevel {
+                width: 0,
+                height: 0,
+                frame_number: 0,
+                surface,
+                xdg_surface,
+                xdg_toplevel: xdg_top_level,
+                buffer: Some(buffer),
+                frame_callback: None,
+            });
             state.wl_pointer = Some(pointer);
             state.shm_allocator = Some(shm_allocator);
             state.initialized = true;
@@ -494,14 +529,15 @@ impl Dispatch<zwlr_layer_shell_v1::ZwlrLayerShellV1, ()> for WaylandTest {
 
 impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WaylandTest {
     fn event(
-        _state: &mut Self, _proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        state: &mut Self, proxy: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         event: <zwlr_layer_surface_v1::ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
         _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("zwlr_layer_surface_v1 {:?}", event);
         match event {
-            zwlr_layer_surface_v1::Event::Configure { serial: _, width: _, height: _ } => {
-                //
+            zwlr_layer_surface_v1::Event::Configure { serial, width: _, height: _ } => {
+                proxy.ack_configure(serial);
+                state.layer_surface.as_ref().unwrap().commit();
             }
             zwlr_layer_surface_v1::Event::Closed => {
                 //
