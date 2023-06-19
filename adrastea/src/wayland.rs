@@ -28,7 +28,10 @@ use std::os::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
-use skia_safe::{paint::Style, AlphaType, Color, ColorType, ISize, ImageInfo, Paint, Surface};
+use skia_safe::{
+    paint::Style, AlphaType, Color, ColorType, Font, FontStyle, ISize, ImageInfo, Paint, Surface,
+    Typeface,
+};
 use wayland_client::{
     protocol::{
         wl_buffer, wl_callback, wl_compositor,
@@ -233,6 +236,7 @@ struct TopLevelWindowInner {
     height: i32,
     frame_number: i64,
     surface: wl_surface::WlSurface,
+    font: Font,
     xdg_surface: xdg_surface::XdgSurface,
     xdg_toplevel: xdg_toplevel::XdgToplevel,
     buffer: Option<WaylandShmBuffer<HciClient>>,
@@ -241,6 +245,30 @@ struct TopLevelWindowInner {
 
 #[derive(Debug)]
 struct TopLevelWindow(RefCell<TopLevelWindowInner>);
+
+impl TopLevelWindow {
+    pub fn new(
+        tlw_delegate: DelegateId, surface: wl_surface::WlSurface,
+        xdg_surface: xdg_surface::XdgSurface, xdg_toplevel: xdg_toplevel::XdgToplevel,
+        buffer: WaylandShmBuffer<HciClient>,
+    ) -> Self {
+        let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
+        let font = Font::from_typeface(typeface, 18.0);
+
+        Self(RefCell::new(TopLevelWindowInner {
+            id: tlw_delegate,
+            width: 0,
+            height: 0,
+            frame_number: 0,
+            surface,
+            xdg_surface,
+            xdg_toplevel,
+            buffer: Some(buffer),
+            frame_callback: None,
+            font,
+        }))
+    }
+}
 
 impl IWindow for TopLevelWindow {
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<HciClient>) {
@@ -276,16 +304,25 @@ impl IWindow for TopLevelWindow {
             Surface::new_raster_direct(&image_info, pixels, inner.width as usize * 4, None)
                 .unwrap();
         let canvas = surface.canvas();
+        canvas.scale((1.5, 1.5));
         let mut paint = Paint::default();
+        let mut text_paint = Paint::default();
         paint
             .set_style(Style::Stroke)
             .set_stroke_width(4.0)
             .set_color(Color::RED)
             .set_anti_alias(true);
-        canvas.clear(Color::WHITE);
+        text_paint.set_anti_alias(true).set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.clear(Color::from_rgb(0x20, 0x20, 0x20));
         for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
             canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0 + 8.0 * i as f32, &paint);
         }
+        canvas.draw_str(
+            format!("frame {:?}", inner.frame_number),
+            (0, 24),
+            &inner.font,
+            &text_paint,
+        );
 
         inner.surface.attach(Some(&buffer.buffer), 0, 0);
         inner.frame_callback = Some(inner.surface.frame(&qhandle, inner.id));
@@ -581,17 +618,13 @@ impl Dispatch<wl_callback::WlCallback, ()> for HciClient {
             surface.commit();
             state.delegate_table.insert(
                 tlw_delegate,
-                Box::new(TopLevelWindow(RefCell::new(TopLevelWindowInner {
-                    id: tlw_delegate,
-                    width: 0,
-                    height: 0,
-                    frame_number: 0,
+                Box::new(TopLevelWindow::new(
+                    tlw_delegate,
                     surface,
                     xdg_surface,
-                    xdg_toplevel: xdg_top_level,
-                    buffer: Some(buffer),
-                    frame_callback: None,
-                }))),
+                    xdg_top_level,
+                    buffer,
+                )),
             );
 
             if let Some(zwlr_layer_shell_v1) = state.zwlr_layer_shell_v1.as_ref() {
