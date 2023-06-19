@@ -103,21 +103,41 @@ impl<T: Dispatch<wl_shm_pool::WlShmPool, ()> + 'static> ArenaAllocator
 }
 
 #[derive(Debug)]
-struct WaylandShmBuffer {
+struct WaylandShmBuffer<T>
+where
+    T: 'static,
+    T: Dispatch<wl_shm_pool::WlShmPool, ()>,
+    T: Dispatch<wl_buffer::WlBuffer, ()>,
+{
+    heap: Arc<RtObjectHeap<WaylandArenaAllocator<T>>>,
+    layout: Layout,
     handle: WaylandArenaHandle,
     buffer: wl_buffer::WlBuffer,
 }
 
-impl WaylandShmBuffer {
-    pub fn new(handle: WaylandArenaHandle, buffer: wl_buffer::WlBuffer) -> Self {
-        Self { handle, buffer }
+impl<T> WaylandShmBuffer<T>
+where
+    T: 'static,
+    T: Dispatch<wl_shm_pool::WlShmPool, ()>,
+    T: Dispatch<wl_buffer::WlBuffer, ()>,
+{
+    pub fn new(
+        heap: Arc<RtObjectHeap<WaylandArenaAllocator<T>>>, layout: Layout,
+        handle: WaylandArenaHandle, buffer: wl_buffer::WlBuffer,
+    ) -> Self {
+        Self { heap, layout, handle, buffer }
     }
 }
 
-impl Drop for WaylandShmBuffer {
+impl<T> Drop for WaylandShmBuffer<T>
+where
+    T: 'static,
+    T: Dispatch<wl_shm_pool::WlShmPool, ()>,
+    T: Dispatch<wl_buffer::WlBuffer, ()>,
+{
     fn drop(&mut self) {
-        // TODO: gotta actually free the memory somewhere
         self.buffer.destroy();
+        unsafe { self.heap.deallocate_handle(self.handle.clone(), self.layout) }
     }
 }
 
@@ -128,7 +148,7 @@ where
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
     T: Dispatch<wl_buffer::WlBuffer, ()>,
 {
-    heap: RtObjectHeap<WaylandArenaAllocator<T>>,
+    heap: Arc<RtObjectHeap<WaylandArenaAllocator<T>>>,
 }
 
 impl<T> WaylandShmAllocator<T>
@@ -138,19 +158,17 @@ where
     T: Dispatch<wl_buffer::WlBuffer, ()>,
 {
     pub fn new(heap: RtObjectHeap<WaylandArenaAllocator<T>>) -> Self {
-        Self { heap }
+        Self { heap: Arc::new(heap) }
     }
 
     pub fn create_buffer(
         &self, width: i32, height: i32, stride: i32, format: wl_shm::Format,
         qhandle: &wayland_client::QueueHandle<T>,
-    ) -> WaylandShmBuffer {
+    ) -> WaylandShmBuffer<T> {
         println!("width: {}, height: {}, stride: {}", width, height, stride);
         let total_size = height.checked_mul(stride).unwrap();
-        let handle = self
-            .heap
-            .allocate_handle(Layout::from_size_align(total_size as usize, 32).unwrap())
-            .unwrap();
+        let layout = Layout::from_size_align(total_size as usize, 32).unwrap();
+        let handle = self.heap.allocate_handle(layout).unwrap();
         let buffer = handle.0.pool.create_buffer(
             handle.1 as i32,
             width,
@@ -160,7 +178,7 @@ where
             qhandle,
             (),
         );
-        WaylandShmBuffer::new(handle, buffer)
+        WaylandShmBuffer::new(self.heap.clone(), layout, handle, buffer)
     }
 }
 
@@ -217,7 +235,7 @@ struct TopLevelWindowInner {
     surface: wl_surface::WlSurface,
     xdg_surface: xdg_surface::XdgSurface,
     xdg_toplevel: xdg_toplevel::XdgToplevel,
-    buffer: Option<WaylandShmBuffer>,
+    buffer: Option<WaylandShmBuffer<HciClient>>,
     frame_callback: Option<wl_callback::WlCallback>,
 }
 
