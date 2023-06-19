@@ -261,6 +261,9 @@ impl<T: ArenaAllocator> fmt::Debug for RtObjectHeap<T> {
 // so they are not realtime but realtime is expected to do no allocations. the use
 // pattern here is to allocate stuff on the control thread and then pass raw pointers
 // to RT
+//
+// this can also be used as a manager for other 'weird' memory resources like
+// memfds, wayland buffers, sub allocations of gpu buffers, etc
 unsafe impl<T: ArenaAllocator> Allocator for RtObjectHeap<T> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let data_ptr = self.allocate_handle(layout)?;

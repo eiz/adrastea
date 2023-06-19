@@ -13,13 +13,21 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use core::{alloc::Layout, ffi::CStr, marker::PhantomData};
+use core::{
+    alloc::Layout,
+    any::{request_ref, Provider},
+    borrow::BorrowMut,
+    cell::RefCell,
+    ffi::CStr,
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use std::os::{
     fd::{FromRawFd, OwnedFd},
     raw::c_void,
 };
 
-use alloc::sync::Arc;
+use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use wayland_client::{
     protocol::{
@@ -155,8 +163,37 @@ where
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Ord, PartialOrd)]
+struct DelegateId(u64);
+
+impl DelegateId {
+    pub fn new() -> Self {
+        static mut ID: AtomicU64 = AtomicU64::new(0);
+        Self(unsafe { ID.fetch_add(1, Ordering::SeqCst) })
+    }
+}
+
+impl From<u64> for DelegateId {
+    fn from(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+trait IWindow {
+    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>);
+    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>);
+}
+
+trait ITopLevelWindow {
+    fn toplevel_configure(
+        &self, alloc: &WaylandShmAllocator<WaylandTest>,
+        qhandle: &wayland_client::QueueHandle<WaylandTest>, width: i32, height: i32,
+    );
+}
+
 #[derive(Debug)]
-struct WaylandTopLevel {
+struct TopLevelWindowInner {
+    id: DelegateId,
     width: i32,
     height: i32,
     frame_number: i64,
@@ -167,13 +204,48 @@ struct WaylandTopLevel {
     frame_callback: Option<wl_callback::WlCallback>,
 }
 
-impl WaylandTopLevel {
-    pub fn toplevel_configure(
-        &mut self, alloc: &WaylandShmAllocator<WaylandTest>,
+#[derive(Debug)]
+struct TopLevelWindow(RefCell<TopLevelWindowInner>);
+
+impl IWindow for TopLevelWindow {
+    fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+        let mut inner = self.0.borrow_mut();
+        inner.surface.attach(inner.buffer.as_ref().map(|b| &b.buffer), 0, 0);
+        if inner.frame_callback.is_none() {
+            inner.frame_callback = Some(inner.surface.frame(qhandle, inner.id));
+        }
+        inner.surface.commit();
+    }
+
+    fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
+        let mut inner = self.0.borrow_mut();
+        inner.frame_callback = None;
+        inner.frame_number += 1;
+        // it feels silly even putting TODOs in this code but...
+        // we definitely need a proper swap chain abstraction to manage in-use/free
+        // buffers.
+        let color = if inner.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
+        let buffer = inner.buffer.as_ref().unwrap();
+        // TODO bad bad bad
+        let (ptr, len) = (buffer.handle.as_ptr(), inner.width * inner.height);
+        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len as usize) };
+        pixels.fill(color);
+        inner.surface.attach(Some(&buffer.buffer), 0, 0);
+        inner.frame_callback = Some(inner.surface.frame(&qhandle, inner.id));
+        inner.surface.damage(0, 0, inner.width, inner.height);
+        inner.surface.commit();
+        return;
+    }
+}
+
+impl ITopLevelWindow for TopLevelWindow {
+    fn toplevel_configure(
+        &self, alloc: &WaylandShmAllocator<WaylandTest>,
         qhandle: &wayland_client::QueueHandle<WaylandTest>, width: i32, height: i32,
     ) {
-        if width != 0 && height != 0 && (width != self.width || height != self.height) {
-            let old_buffer = self.buffer.take().unwrap();
+        let mut inner = self.0.borrow_mut();
+        if width != 0 && height != 0 && (width != inner.width || height != inner.height) {
+            let old_buffer = inner.buffer.take().unwrap();
             let buffer =
                 alloc.create_buffer(width, height, width * 4, wl_shm::Format::Abgr8888, qhandle);
             old_buffer.buffer.destroy();
@@ -184,35 +256,26 @@ impl WaylandTopLevel {
                 )
             };
             pixels[..width as usize * height as usize].fill(0xFF00FF00);
-            self.buffer = Some(buffer);
-            self.height = height;
-            self.width = width;
+            inner.buffer = Some(buffer);
+            inner.height = height;
+            inner.width = width;
         }
     }
-    pub fn finish_configure(&mut self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
-        self.surface.attach(self.buffer.as_ref().map(|b| &b.buffer), 0, 0);
-        if self.frame_callback.is_none() {
-            self.frame_callback = Some(self.surface.frame(qhandle, ()));
-        }
-        self.surface.commit();
+}
+
+impl Delegate for TopLevelWindow {}
+impl Provider for TopLevelWindow {
+    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
+        demand.provide_ref::<dyn IWindow>(self);
+        demand.provide_ref::<dyn ITopLevelWindow>(self);
     }
-    pub fn frame_callback(&mut self, qhandle: &wayland_client::QueueHandle<WaylandTest>) {
-        self.frame_callback = None;
-        self.frame_number += 1;
-        // it feels silly even putting TODOs in this code but...
-        // we definitely need a proper swap chain abstraction to manage in-use/free
-        // buffers.
-        let color = if self.frame_number % 2 == 0 { 0xFFFFFFFF } else { 0xFF000000 };
-        let buffer = self.buffer.as_ref().unwrap();
-        // TODO bad bad bad
-        let (ptr, len) = (buffer.handle.as_ptr(), self.width * self.height);
-        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u32, len as usize) };
-        pixels.fill(color);
-        self.frame_callback = Some(self.surface.frame(&qhandle, ()));
-        self.surface.attach(self.buffer.as_ref().map(|b| &b.buffer), 0, 0);
-        self.surface.damage(0, 0, self.width, self.height);
-        self.surface.commit();
-        return;
+}
+
+trait Delegate: Provider + core::fmt::Debug {}
+
+impl dyn Delegate + '_ {
+    pub fn get_dispatcher<T: ?Sized + 'static>(&self) -> Option<&T> {
+        request_ref(self)
     }
 }
 
@@ -220,11 +283,11 @@ impl WaylandTopLevel {
 struct WaylandTest {
     initialized: bool,
     post_bind_sync_complete: bool,
+    delegate_table: BTreeMap<DelegateId, Box<dyn Delegate>>,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     shm_allocator: Option<WaylandShmAllocator<Self>>,
     wl_shm: Option<wl_shm::WlShm>,
-    top_level: Option<WaylandTopLevel>,
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
     _wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -280,10 +343,10 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<wl_surface::WlSurface, ()> for WaylandTest {
+impl Dispatch<wl_surface::WlSurface, DelegateId> for WaylandTest {
     fn event(
-        _state: &mut Self, _proxy: &wl_surface::WlSurface, event: wl_surface::Event, _data: &(),
-        _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+        _state: &mut Self, _proxy: &wl_surface::WlSurface, event: wl_surface::Event,
+        _data: &DelegateId, _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         match event {
             wl_surface::Event::Enter { .. } => todo!(),
@@ -295,38 +358,44 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<xdg_surface::XdgSurface, ()> for WaylandTest {
+impl Dispatch<xdg_surface::XdgSurface, DelegateId> for WaylandTest {
     fn event(
         state: &mut Self, proxy: &xdg_surface::XdgSurface,
-        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, _data: &(),
+        event: <xdg_surface::XdgSurface as wayland_client::Proxy>::Event, data: &DelegateId,
         _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("xdg_surface {:?}", event);
         match event {
             xdg_surface::Event::Configure { serial } => {
                 proxy.ack_configure(serial);
-                state.top_level.as_mut().unwrap().finish_configure(qhandle);
+                if let Some(delegate) = state.delegate_table.get_mut(data) {
+                    let cw = delegate.get_dispatcher::<dyn IWindow>().unwrap();
+                    cw.finish_configure(qhandle);
+                }
             }
             _ => {}
         }
     }
 }
 
-impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WaylandTest {
+impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for WaylandTest {
     fn event(
         state: &mut Self, _proxy: &xdg_toplevel::XdgToplevel,
-        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, _data: &(),
+        event: <xdg_toplevel::XdgToplevel as wayland_client::Proxy>::Event, data: &DelegateId,
         _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("xdg_toplevel {:?}", event);
         match event {
             xdg_toplevel::Event::Configure { width, height, states: _ } => {
-                state.top_level.as_mut().unwrap().toplevel_configure(
-                    state.shm_allocator.as_ref().unwrap(),
-                    qhandle,
-                    width,
-                    height,
-                );
+                if let Some(delegate) = state.delegate_table.get_mut(data) {
+                    let top = delegate.get_dispatcher::<dyn ITopLevelWindow>().unwrap();
+                    top.toplevel_configure(
+                        state.shm_allocator.as_ref().unwrap(),
+                        qhandle,
+                        width,
+                        height,
+                    );
+                }
             }
             xdg_toplevel::Event::Close => {}
             xdg_toplevel::Event::ConfigureBounds { width: _, height: _ } => {}
@@ -409,15 +478,25 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandTest {
     }
 }
 
+impl Dispatch<wl_callback::WlCallback, DelegateId> for WaylandTest {
+    fn event(
+        state: &mut Self, proxy: &wl_callback::WlCallback,
+        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &DelegateId,
+        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+    ) {
+        if let Some(delegate) = state.delegate_table.get_mut(data) {
+            let cb = delegate.get_dispatcher::<dyn IWindow>().unwrap();
+            cb.frame_callback(qhandle);
+        }
+    }
+}
+
 impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
     fn event(
         state: &mut Self, proxy: &wl_callback::WlCallback,
         _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, _data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
-        if Some(proxy) == state.top_level.as_ref().and_then(|tl| tl.frame_callback.as_ref()) {
-            state.top_level.as_mut().unwrap().frame_callback(qhandle);
-        }
         if !state.post_bind_sync_complete {
             state.post_bind_sync_complete = true;
             conn.display().sync(qhandle, ());
@@ -433,20 +512,22 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
             let compositor = state.compositor.as_ref().unwrap();
             let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
             let wl_shm = state.wl_shm.as_ref().unwrap();
+            let wl_seat = state.wl_seat.as_ref().unwrap();
             let shm_allocator = WaylandShmAllocator::new(RtObjectHeap::new(
                 4096 * 4096 * 4,
                 8,
                 (wl_shm.clone(), cstr::cstr!("wl_shm_pool"), qhandle.clone()),
             ));
-            let wl_seat = state.wl_seat.as_ref().unwrap();
-            let surface = compositor.create_surface(qhandle, ());
-            let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, ());
-            let xdg_top_level = xdg_surface.get_toplevel(qhandle, ());
             let pointer = wl_seat.get_pointer(qhandle, ());
             let _keyboard = wl_seat.get_keyboard(qhandle, ());
+
+            let tlw_delegate = DelegateId::new();
+            let surface = compositor.create_surface(qhandle, tlw_delegate);
             if let Some(dmabuf_api) = state.zwp_linux_dmabuf_v1.as_ref() {
-                dmabuf_api.get_surface_feedback(&surface, qhandle, ());
+                dmabuf_api.get_surface_feedback(&surface, qhandle, tlw_delegate);
             }
+            let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, tlw_delegate);
+            let xdg_top_level = xdg_surface.get_toplevel(qhandle, tlw_delegate);
             let buffer = shm_allocator.create_buffer(
                 1920,
                 1080,
@@ -457,9 +538,24 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
 
             xdg_top_level.set_title("Bruh".into());
             surface.commit();
+            state.delegate_table.insert(
+                tlw_delegate,
+                Box::new(TopLevelWindow(RefCell::new(TopLevelWindowInner {
+                    id: tlw_delegate,
+                    width: 0,
+                    height: 0,
+                    frame_number: 0,
+                    surface,
+                    xdg_surface,
+                    xdg_toplevel: xdg_top_level,
+                    buffer: Some(buffer),
+                    frame_callback: None,
+                }))),
+            );
 
             if let Some(zwlr_layer_shell_v1) = state.zwlr_layer_shell_v1.as_ref() {
-                let layer_surface = compositor.create_surface(qhandle, ());
+                let layer_id = DelegateId::new();
+                let layer_surface = compositor.create_surface(qhandle, layer_id);
                 let wlr_layer_surface = zwlr_layer_shell_v1.get_layer_surface(
                     &layer_surface,
                     None,
@@ -479,17 +575,6 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandTest {
                 state.layer_surface = Some(layer_surface);
                 state.wlr_layer_surface = Some(wlr_layer_surface);
             }
-
-            state.top_level = Some(WaylandTopLevel {
-                width: 0,
-                height: 0,
-                frame_number: 0,
-                surface,
-                xdg_surface,
-                xdg_toplevel: xdg_top_level,
-                buffer: Some(buffer),
-                frame_callback: None,
-            });
             state.wl_pointer = Some(pointer);
             state.shm_allocator = Some(shm_allocator);
             state.initialized = true;
@@ -507,11 +592,11 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandTest {
     }
 }
 
-impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for WaylandTest {
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, DelegateId> for WaylandTest {
     fn event(
         _state: &mut Self, _proxy: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
         event: <zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 as wayland_client::Proxy>::Event,
-        _data: &(), _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+        _data: &DelegateId, _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         println!("zwp_linux_dmabuf_feedback {:?}", event);
     }

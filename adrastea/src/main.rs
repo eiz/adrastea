@@ -13,6 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
+#![feature(provide_any)]
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     cell::RefCell,
