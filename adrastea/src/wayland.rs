@@ -84,7 +84,7 @@ impl<T: Dispatch<wl_shm_pool::WlShmPool, ()> + 'static> ArenaAllocator
     type Handle = WaylandArenaHandle;
     type Params = (wl_shm::WlShm, &'static CStr, wayland_client::QueueHandle<T>);
 
-    fn allocate(size: u32, params: &Self::Params) -> Self::Handle {
+    fn allocate(size: usize, params: &Self::Params) -> Self::Handle {
         unsafe {
             let memfd = libc::memfd_create(params.1.as_ptr(), 0);
             assert!(memfd >= 0);
@@ -100,7 +100,7 @@ impl<T: Dispatch<wl_shm_pool::WlShmPool, ()> + 'static> ArenaAllocator
         }
     }
 
-    unsafe fn deallocate(_handle: &Self::Handle, _size: u32, _params: &Self::Params) {
+    unsafe fn deallocate(_handle: &Self::Handle, _size: usize, _params: &Self::Params) {
         // the buffer pool is released automatically when the handle goes out of scope
     }
 }

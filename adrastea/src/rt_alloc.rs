@@ -13,6 +13,20 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
+// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
+// and that was annoying
+// so i thought to myself
+// "BTreeMap"
+// 🤣
+// anyway its super jank nonsense
+// allocations and deallocations obviously use the global heap for the free list
+// so they are not realtime but realtime is expected to do no allocations. the use
+// pattern here is to allocate stuff on the control thread and then pass raw pointers
+// to RT
+//
+// this can also be used as a manager for other 'weird' memory resources like
+// memfds, wayland buffers, sub allocations of gpu buffers, etc
+
 use core::{
     alloc::Layout,
     cell::RefCell,
@@ -24,7 +38,7 @@ use core::{
 use alloc::{collections::BTreeMap, rc::Rc};
 use allocator_api2::alloc::Allocator;
 
-fn required_padding(offset: u32, align: u32) -> u32 {
+fn required_padding(offset: usize, align: usize) -> usize {
     if offset % align == 0 {
         0
     } else {
@@ -51,8 +65,8 @@ pub trait ArenaAllocator {
     type Handle: ArenaHandle;
     type Params: Clone;
 
-    fn allocate(size: u32, params: &Self::Params) -> Self::Handle;
-    unsafe fn deallocate(handle: &Self::Handle, size: u32, params: &Self::Params);
+    fn allocate(size: usize, params: &Self::Params) -> Self::Handle;
+    unsafe fn deallocate(handle: &Self::Handle, size: usize, params: &Self::Params);
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -62,7 +76,7 @@ impl ArenaAllocator for LockedArenaAllocator {
     type Handle = *mut c_void;
     type Params = ();
 
-    fn allocate(size: u32, _params: &Self::Params) -> Self::Handle {
+    fn allocate(size: usize, _params: &Self::Params) -> Self::Handle {
         unsafe {
             let ptr = libc::mmap64(
                 ptr::null_mut(),
@@ -82,7 +96,7 @@ impl ArenaAllocator for LockedArenaAllocator {
         }
     }
 
-    unsafe fn deallocate(handle: &Self::Handle, size: u32, _params: &Self::Params) {
+    unsafe fn deallocate(handle: &Self::Handle, size: usize, _params: &Self::Params) {
         unsafe {
             libc::munlock(handle.as_ptr(), size as usize);
             libc::munmap(handle.as_ptr(), size as usize);
@@ -93,22 +107,22 @@ impl ArenaAllocator for LockedArenaAllocator {
 struct RtObjectArena<T: ArenaAllocator = LockedArenaAllocator> {
     arena: T::Handle,
     arena_params: T::Params,
-    size: u32,
-    free_map: BTreeMap<u32, u32>,
+    size: usize,
+    free_map: BTreeMap<usize, usize>,
 }
 
 impl<T: ArenaAllocator> RtObjectArena<T> {
-    pub fn new(size: u32, params: &T::Params) -> Self {
+    pub fn new(size: usize, params: &T::Params) -> Self {
         let mut free_map = BTreeMap::new();
         free_map.insert(0, size);
         Self { arena: T::allocate(size, params), arena_params: params.clone(), size, free_map }
     }
 
-    pub fn split_and_allocate(&mut self, offset: u32, layout: Layout) -> T::Handle {
+    pub fn split_and_allocate(&mut self, offset: usize, layout: Layout) -> T::Handle {
         let size = self.free_map.remove(&offset).expect("invariant: invalid allocation offset");
-        let size_lo = required_padding(offset, layout.align() as u32);
+        let size_lo = required_padding(offset, layout.align() as usize);
         let data_base = offset + size_lo;
-        let upper_base = data_base + layout.size() as u32;
+        let upper_base = data_base + layout.size() as usize;
         let size_hi = offset + size - upper_base;
         assert!(upper_base + size_hi <= self.size);
         unsafe {
@@ -129,13 +143,15 @@ impl<T: ArenaAllocator> RtObjectArena<T> {
         let arena_end = arena_base + self.size as usize;
         if addr >= arena_base && addr < arena_end {
             let addr = addr - arena_base;
-            let mut free_start = addr as u32;
-            let mut free_end = free_start + layout.size() as u32;
-            let first_below = self.free_map.range(..addr as u32).next_back().map(|(k, v)| (*k, *v));
-            let first_above = self.free_map.range(addr as u32 + 1..).next().map(|(k, v)| (*k, *v));
+            let mut free_start = addr as usize;
+            let mut free_end = free_start + layout.size() as usize;
+            let first_below =
+                self.free_map.range(..addr as usize).next_back().map(|(k, v)| (*k, *v));
+            let first_above =
+                self.free_map.range(addr as usize + 1..).next().map(|(k, v)| (*k, *v));
             if let Some((below_offset, below_size)) = first_below {
                 let below_end = below_offset + below_size;
-                if below_end == addr as u32 {
+                if below_end == addr as usize {
                     free_start = below_offset;
                 }
                 self.free_map.remove(&below_offset);
@@ -169,7 +185,7 @@ impl<T: ArenaAllocator> fmt::Debug for RtObjectArena<T> {
 struct RtObjectHeapInner<T: ArenaAllocator> {
     arenas: Vec<RtObjectArena<T>>,
     arena_params: T::Params,
-    arena_size: u32,
+    arena_size: usize,
     max_arenas: usize,
 }
 
@@ -189,7 +205,7 @@ pub struct RtObjectHeap<T: ArenaAllocator = LockedArenaAllocator> {
 }
 
 impl<T: ArenaAllocator> RtObjectHeap<T> {
-    pub fn new(arena_size: u32, max_arenas: usize, arena_params: T::Params) -> Self {
+    pub fn new(arena_size: usize, max_arenas: usize, arena_params: T::Params) -> Self {
         Self {
             inner: Rc::new(RefCell::new(RtObjectHeapInner {
                 arenas: Vec::new(),
@@ -204,14 +220,14 @@ impl<T: ArenaAllocator> RtObjectHeap<T> {
         &self, layout: Layout,
     ) -> Result<T::Handle, allocator_api2::alloc::AllocError> {
         let mut inner = self.inner.borrow_mut();
-        if layout.size() > u32::MAX as usize || layout.size() > inner.arena_size as usize {
+        if layout.size() > usize::MAX as usize || layout.size() > inner.arena_size as usize {
             panic!("rt_allocator: alloc size {} too large", layout.size());
         }
         let mut best = None;
         for (i, arena) in &mut inner.arenas.iter().enumerate() {
             for (&offset, &size) in &arena.free_map {
-                let padding = required_padding(offset, layout.align() as u32);
-                let total_size = layout.size() as u32 + padding;
+                let padding = required_padding(offset, layout.align() as usize);
+                let total_size = layout.size() as usize + padding;
                 if total_size > size {
                     continue;
                 }
@@ -251,19 +267,6 @@ impl<T: ArenaAllocator> fmt::Debug for RtObjectHeap<T> {
     }
 }
 
-// so i started writing like YE OLDE BEST FIT ALLOCATOR WITH LINKED LISTS
-// and that was annoying
-// so i thought to myself
-// "BTreeMap"
-// 🤣
-// anyway its super jank nonsense
-// allocations and deallocations obviously use the global heap for the free list
-// so they are not realtime but realtime is expected to do no allocations. the use
-// pattern here is to allocate stuff on the control thread and then pass raw pointers
-// to RT
-//
-// this can also be used as a manager for other 'weird' memory resources like
-// memfds, wayland buffers, sub allocations of gpu buffers, etc
 unsafe impl<T: ArenaAllocator> Allocator for RtObjectHeap<T> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
         let data_ptr = self.allocate_handle(layout)?;
