@@ -263,7 +263,7 @@ impl ITopLevelWindow for TopLevelWindow {
     }
 }
 
-impl Delegate for TopLevelWindow {}
+impl IUnknown for TopLevelWindow {}
 impl Provider for TopLevelWindow {
     fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
         demand.provide_ref::<dyn IWindow>(self);
@@ -271,10 +271,10 @@ impl Provider for TopLevelWindow {
     }
 }
 
-trait Delegate: Provider + core::fmt::Debug {}
+trait IUnknown: Provider + core::fmt::Debug {}
 
-impl dyn Delegate + '_ {
-    pub fn get_dispatcher<T: ?Sized + 'static>(&self) -> Option<&T> {
+impl dyn IUnknown + '_ {
+    pub fn query_interface<T: ?Sized + 'static>(&self) -> Option<&T> {
         request_ref(self)
     }
 }
@@ -283,7 +283,7 @@ impl dyn Delegate + '_ {
 struct WaylandTest {
     initialized: bool,
     post_bind_sync_complete: bool,
-    delegate_table: BTreeMap<DelegateId, Box<dyn Delegate>>,
+    delegate_table: BTreeMap<DelegateId, Box<dyn IUnknown>>,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     shm_allocator: Option<WaylandShmAllocator<Self>>,
@@ -369,7 +369,7 @@ impl Dispatch<xdg_surface::XdgSurface, DelegateId> for WaylandTest {
             xdg_surface::Event::Configure { serial } => {
                 proxy.ack_configure(serial);
                 if let Some(delegate) = state.delegate_table.get_mut(data) {
-                    let cw = delegate.get_dispatcher::<dyn IWindow>().unwrap();
+                    let cw = delegate.query_interface::<dyn IWindow>().unwrap();
                     cw.finish_configure(qhandle);
                 }
             }
@@ -388,7 +388,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for WaylandTest {
         match event {
             xdg_toplevel::Event::Configure { width, height, states: _ } => {
                 if let Some(delegate) = state.delegate_table.get_mut(data) {
-                    let top = delegate.get_dispatcher::<dyn ITopLevelWindow>().unwrap();
+                    let top = delegate.query_interface::<dyn ITopLevelWindow>().unwrap();
                     top.toplevel_configure(
                         state.shm_allocator.as_ref().unwrap(),
                         qhandle,
@@ -485,7 +485,7 @@ impl Dispatch<wl_callback::WlCallback, DelegateId> for WaylandTest {
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let Some(delegate) = state.delegate_table.get_mut(data) {
-            let cb = delegate.get_dispatcher::<dyn IWindow>().unwrap();
+            let cb = delegate.query_interface::<dyn IWindow>().unwrap();
             cb.frame_callback(qhandle);
         }
     }
