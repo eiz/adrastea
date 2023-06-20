@@ -24,8 +24,7 @@ use core::{
     time::Duration,
 };
 use skia_safe::{
-    paint::{self, Style},
-    Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
+    paint::Style, Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
 };
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
 use util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
@@ -798,36 +797,43 @@ pub struct GuiTestAudioThreadState {
     writer: AtomicRingWriter<String>,
 }
 
-struct GuiTestSurfaceThreadStateInner {
-    reader: AtomicRingReader<String>,
-    frame_number: usize,
-    last_msg: String,
-    font: Font,
-}
-
-pub struct GuiTestSurfaceThreadState {
-    shared: Arc<GuiTestShared>,
-    inner: RefCell<GuiTestSurfaceThreadStateInner>,
-}
-
 impl Debug for GuiTestAudioThreadState {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("GuiTestAudioThreadState").finish_non_exhaustive()
     }
 }
 
-impl Debug for GuiTestSurfaceThreadState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("GuiTestSurfaceThreadState").finish_non_exhaustive()
+struct MainWindowInner {
+    reader: AtomicRingReader<String>,
+    frame_number: usize,
+    last_msg: String,
+    font: Font,
+}
+pub struct MainWindow {
+    shared: Arc<GuiTestShared>,
+    inner: RefCell<MainWindowInner>,
+}
+impl MainWindow {
+    pub fn new(shared: Arc<GuiTestShared>, reader: AtomicRingReader<String>) -> Self {
+        let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
+        let mut font = Font::from_typeface(typeface, 18.0);
+        font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
+        let inner = MainWindowInner { reader, frame_number: 0, last_msg: String::new(), font };
+        Self { shared, inner: RefCell::new(inner) }
     }
 }
-impl IUnknown for GuiTestSurfaceThreadState {}
-impl Provider for GuiTestSurfaceThreadState {
+impl Debug for MainWindow {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MainWindow").finish_non_exhaustive()
+    }
+}
+impl IUnknown for MainWindow {}
+impl Provider for MainWindow {
     fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
         demand.provide_ref::<dyn ISkiaPaint>(self);
     }
 }
-impl ISkiaPaint for GuiTestSurfaceThreadState {
+impl ISkiaPaint for MainWindow {
     fn on_paint_skia(&self, canvas: &mut Canvas, width: f32, height: f32) {
         let mut inner = self.inner.borrow_mut();
         inner.frame_number += 1;
@@ -862,27 +868,14 @@ impl ISkiaPaint for GuiTestSurfaceThreadState {
     }
 }
 
-fn gui_test_state() -> (GuiTestAudioThreadState, GuiTestSurfaceThreadState) {
+fn gui_test_state() -> (GuiTestAudioThreadState, MainWindow) {
     let shared = Arc::new(GuiTestShared { vad_on: AtomicBool::new(false) });
-    let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
-    let mut font = Font::from_typeface(typeface, 18.0);
-    font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
+
     let (reader, writer) = AtomicRing::new(128);
-    (
-        GuiTestAudioThreadState { shared: shared.clone(), writer },
-        GuiTestSurfaceThreadState {
-            shared: shared.clone(),
-            inner: RefCell::new(GuiTestSurfaceThreadStateInner {
-                frame_number: 0,
-                reader,
-                last_msg: String::new(),
-                font,
-            }),
-        },
-    )
+    (GuiTestAudioThreadState { shared: shared.clone(), writer }, MainWindow::new(shared, reader))
 }
 
-pub fn wayland_test(test_state: GuiTestSurfaceThreadState) -> anyhow::Result<()> {
+pub fn wayland_test(test_state: MainWindow) -> anyhow::Result<()> {
     let (mut event_queue, mut client) = SurfaceClient::connect_to_env()?;
     client.create_toplevel_surface(test_state);
     loop {

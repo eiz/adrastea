@@ -29,7 +29,7 @@ use std::os::{
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use skia_safe::{
-    AlphaType, Canvas, ColorType, Font, FontStyle, ISize, ImageInfo, Surface, Typeface,
+    AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface,
 };
 use wayland_client::{
     protocol::{
@@ -48,7 +48,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_l
 use crate::{
     rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
     util::IUnknown,
-    GuiTestSurfaceThreadState,
 };
 
 #[derive(Debug)]
@@ -225,7 +224,6 @@ struct TopLevelSurfaceInner {
     width: i32,
     height: i32,
     surface: wl_surface::WlSurface,
-    last_msg: String,
     buffer: ShmBuffer<SurfaceClient>,
     frame_callback: Option<wl_callback::WlCallback>,
 }
@@ -246,9 +244,8 @@ impl<T: IUnknown + 'static> TopLevelSurface<T> {
                 id: tlw_delegate,
                 width: 0,
                 height: 0,
-                last_msg: "".into(),
                 surface,
-                buffer: buffer,
+                buffer,
                 frame_callback: None,
             }),
             user_delegate,
@@ -326,7 +323,7 @@ impl<T: IUnknown> ITopLevelSurface for TopLevelSurface<T> {
                     (height * width) as usize,
                 )
             };
-            pixels[..width as usize * height as usize].fill(0xFF00FF00);
+            pixels[..width as usize * height as usize].fill(0xFF000000);
             inner.buffer = buffer;
             inner.height = height;
             inner.width = width;
@@ -605,9 +602,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for SurfaceClient {
 
 impl Dispatch<wl_callback::WlCallback, DelegateId> for SurfaceClient {
     fn event(
-        state: &mut Self, proxy: &wl_callback::WlCallback,
-        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &DelegateId,
-        conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
+        state: &mut Self, _proxy: &wl_callback::WlCallback,
+        _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, data: &DelegateId,
+        _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let Some(delegate) = state.delegate_table.get_mut(data) {
             let cb = delegate.query_interface::<dyn ISurface>().unwrap();
@@ -618,7 +615,7 @@ impl Dispatch<wl_callback::WlCallback, DelegateId> for SurfaceClient {
 
 impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
     fn event(
-        state: &mut Self, proxy: &wl_callback::WlCallback,
+        state: &mut Self, _proxy: &wl_callback::WlCallback,
         _event: <wl_callback::WlCallback as wayland_client::Proxy>::Event, _data: &(),
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
@@ -635,7 +632,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
             && state.wl_seat.is_some()
         {
             let compositor = state.compositor.as_ref().unwrap();
-            let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
+            let _xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
             let wl_shm = state.wl_shm.as_ref().unwrap();
             let wl_seat = state.wl_seat.as_ref().unwrap();
             let shm_allocator = ShmAllocator::new(RtObjectHeap::new(
