@@ -110,7 +110,7 @@ impl<T: Dispatch<wl_shm_pool::WlShmPool, ()> + 'static> ArenaAllocator
 }
 
 #[derive(Debug)]
-struct WaylandShmBuffer<T>
+struct ShmBuffer<T>
 where
     T: 'static,
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
@@ -122,7 +122,7 @@ where
     buffer: wl_buffer::WlBuffer,
 }
 
-impl<T> WaylandShmBuffer<T>
+impl<T> ShmBuffer<T>
 where
     T: 'static,
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
@@ -136,7 +136,7 @@ where
     }
 }
 
-impl<T> Drop for WaylandShmBuffer<T>
+impl<T> Drop for ShmBuffer<T>
 where
     T: 'static,
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
@@ -149,7 +149,7 @@ where
 }
 
 #[derive(Debug)]
-struct WaylandShmAllocator<T>
+struct ShmAllocator<T>
 where
     T: 'static,
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
@@ -158,7 +158,7 @@ where
     heap: Arc<RtObjectHeap<WaylandArenaAllocator<T>>>,
 }
 
-impl<T> WaylandShmAllocator<T>
+impl<T> ShmAllocator<T>
 where
     T: 'static,
     T: Dispatch<wl_shm_pool::WlShmPool, ()>,
@@ -171,7 +171,7 @@ where
     pub fn create_buffer(
         &self, width: i32, height: i32, stride: i32, format: wl_shm::Format,
         qhandle: &wayland_client::QueueHandle<T>,
-    ) -> WaylandShmBuffer<T> {
+    ) -> ShmBuffer<T> {
         let total_size = height.checked_mul(stride).unwrap();
         let layout = Layout::from_size_align(total_size as usize, 32).unwrap();
         let handle = self.heap.allocate_handle(layout).unwrap();
@@ -184,7 +184,7 @@ where
             qhandle,
             (),
         );
-        WaylandShmBuffer::new(self.heap.clone(), layout, handle, buffer)
+        ShmBuffer::new(self.heap.clone(), layout, handle, buffer)
     }
 }
 
@@ -204,20 +204,20 @@ impl From<u64> for DelegateId {
     }
 }
 
-trait IWindow: IUnknown {
+trait ISurface: IUnknown {
     fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>);
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>);
 }
 
-trait ITopLevelWindow: IUnknown {
+trait ITopLevelSurface: IUnknown {
     fn toplevel_configure(
-        &self, alloc: &WaylandShmAllocator<SurfaceClient>,
+        &self, alloc: &ShmAllocator<SurfaceClient>,
         qhandle: &wayland_client::QueueHandle<SurfaceClient>, width: i32, height: i32,
     );
 }
 
 #[derive(Debug)]
-struct TopLevelWindowInner {
+struct TopLevelSurfaceInner {
     id: DelegateId,
     width: i32,
     height: i32,
@@ -225,35 +225,30 @@ struct TopLevelWindowInner {
     surface: wl_surface::WlSurface,
     font: Font,
     last_msg: String,
-    xdg_surface: xdg_surface::XdgSurface,
-    xdg_toplevel: xdg_toplevel::XdgToplevel,
-    buffer: WaylandShmBuffer<SurfaceClient>,
+    buffer: ShmBuffer<SurfaceClient>,
     frame_callback: Option<wl_callback::WlCallback>,
     test_state: Option<GuiTestSurfaceThreadState>,
 }
 
 #[derive(Debug)]
-struct TopLevelWindow(RefCell<TopLevelWindowInner>);
+struct TopLevelSurface(RefCell<TopLevelSurfaceInner>);
 
-impl TopLevelWindow {
+impl TopLevelSurface {
     pub fn new(
-        tlw_delegate: DelegateId, surface: wl_surface::WlSurface,
-        xdg_surface: xdg_surface::XdgSurface, xdg_toplevel: xdg_toplevel::XdgToplevel,
-        buffer: WaylandShmBuffer<SurfaceClient>, test_state: Option<GuiTestSurfaceThreadState>,
+        tlw_delegate: DelegateId, surface: wl_surface::WlSurface, buffer: ShmBuffer<SurfaceClient>,
+        test_state: Option<GuiTestSurfaceThreadState>,
     ) -> Self {
         let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
         let mut font = Font::from_typeface(typeface, 18.0);
         font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
 
-        Self(RefCell::new(TopLevelWindowInner {
+        Self(RefCell::new(TopLevelSurfaceInner {
             id: tlw_delegate,
             width: 0,
             height: 0,
             frame_number: 0,
             last_msg: "".into(),
             surface,
-            xdg_surface,
-            xdg_toplevel,
             buffer: buffer,
             frame_callback: None,
             font,
@@ -262,15 +257,15 @@ impl TopLevelWindow {
     }
 }
 
-impl IUnknown for TopLevelWindow {}
-impl Provider for TopLevelWindow {
+impl IUnknown for TopLevelSurface {}
+impl Provider for TopLevelSurface {
     fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
-        demand.provide_ref::<dyn IWindow>(self);
-        demand.provide_ref::<dyn ITopLevelWindow>(self);
+        demand.provide_ref::<dyn ISurface>(self);
+        demand.provide_ref::<dyn ITopLevelSurface>(self);
     }
 }
 
-impl IWindow for TopLevelWindow {
+impl ISurface for TopLevelSurface {
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>) {
         let mut inner = self.0.borrow_mut();
         inner.surface.attach(Some(&inner.buffer.buffer), 0, 0);
@@ -284,7 +279,7 @@ impl IWindow for TopLevelWindow {
         let mut inner = self.0.borrow_mut();
         inner.frame_callback = None;
         inner.frame_number += 1;
-        let TopLevelWindowInner { ref mut test_state, ref mut last_msg, .. } = &mut *inner;
+        let TopLevelSurfaceInner { ref mut test_state, ref mut last_msg, .. } = &mut *inner;
         if let Some(test_state) = test_state.as_mut() {
             while let Some(text) = test_state.reader.try_pop() {
                 *last_msg = text;
@@ -340,9 +335,9 @@ impl IWindow for TopLevelWindow {
     }
 }
 
-impl ITopLevelWindow for TopLevelWindow {
+impl ITopLevelSurface for TopLevelSurface {
     fn toplevel_configure(
-        &self, alloc: &WaylandShmAllocator<SurfaceClient>,
+        &self, alloc: &ShmAllocator<SurfaceClient>,
         qhandle: &wayland_client::QueueHandle<SurfaceClient>, width: i32, height: i32,
     ) {
         let mut inner = self.0.borrow_mut();
@@ -371,7 +366,7 @@ pub struct SurfaceClient {
     test_state: Option<GuiTestSurfaceThreadState>,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
-    shm_allocator: Option<WaylandShmAllocator<Self>>,
+    shm_allocator: Option<ShmAllocator<Self>>,
     wl_shm: Option<wl_shm::WlShm>,
     wl_seat: Option<wl_seat::WlSeat>,
     wl_pointer: Option<wl_pointer::WlPointer>,
@@ -487,7 +482,7 @@ impl Dispatch<xdg_surface::XdgSurface, DelegateId> for SurfaceClient {
             xdg_surface::Event::Configure { serial } => {
                 proxy.ack_configure(serial);
                 if let Some(delegate) = state.delegate_table.get_mut(data) {
-                    let cw = delegate.query_interface::<dyn IWindow>().unwrap();
+                    let cw = delegate.query_interface::<dyn ISurface>().unwrap();
                     cw.finish_configure(qhandle);
                 }
             }
@@ -506,7 +501,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, DelegateId> for SurfaceClient {
         match event {
             xdg_toplevel::Event::Configure { width, height, states: _ } => {
                 if let Some(delegate) = state.delegate_table.get_mut(data) {
-                    let top = delegate.query_interface::<dyn ITopLevelWindow>().unwrap();
+                    let top = delegate.query_interface::<dyn ITopLevelSurface>().unwrap();
                     top.toplevel_configure(
                         state.shm_allocator.as_ref().unwrap(),
                         qhandle,
@@ -603,7 +598,7 @@ impl Dispatch<wl_callback::WlCallback, DelegateId> for SurfaceClient {
         conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
     ) {
         if let Some(delegate) = state.delegate_table.get_mut(data) {
-            let cb = delegate.query_interface::<dyn IWindow>().unwrap();
+            let cb = delegate.query_interface::<dyn ISurface>().unwrap();
             cb.frame_callback(qhandle);
         }
     }
@@ -631,7 +626,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
             let xdg_wm_base = state.xdg_wm_base.as_ref().unwrap();
             let wl_shm = state.wl_shm.as_ref().unwrap();
             let wl_seat = state.wl_seat.as_ref().unwrap();
-            let shm_allocator = WaylandShmAllocator::new(RtObjectHeap::new(
+            let shm_allocator = ShmAllocator::new(RtObjectHeap::new(
                 4096 * 4096 * 4,
                 8,
                 (wl_shm.clone(), cstr::cstr!("wl_shm_pool"), qhandle.clone()),
@@ -658,11 +653,9 @@ impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
             surface.commit();
             state.delegate_table.insert(
                 tlw_delegate,
-                Box::new(TopLevelWindow::new(
+                Box::new(TopLevelSurface::new(
                     tlw_delegate,
                     surface,
-                    xdg_surface,
-                    xdg_top_level,
                     buffer,
                     state.test_state.take(),
                 )),
