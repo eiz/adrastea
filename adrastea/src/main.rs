@@ -817,7 +817,6 @@ impl MainWindow {
     pub fn new(shared: Arc<GuiTestShared>, reader: AtomicRingReader<String>) -> Self {
         let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
         let mut font = Font::from_typeface(typeface, 18.0);
-        font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
         let inner = MainWindowInner { reader, frame_number: 0, last_msg: String::new(), font };
         Self { shared, inner: RefCell::new(inner) }
     }
@@ -847,23 +846,36 @@ impl ISkiaPaint for MainWindow {
             .set_stroke_width(4.0)
             .set_color(Color::RED)
             .set_anti_alias(true);
-        text_paint.set_anti_alias(true).set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        text_paint.set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
         canvas.clear(Color::from_rgb(0x20, 0x20, 0x20));
         for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
-            canvas.draw_circle((width / 2.0, height / 2.0), 128.0 + 8.0 * i as f32, &paint);
+            canvas.draw_circle((width / 1.25, height / 1.25), 128.0 + 8.0 * i as f32, &paint);
         }
         let txt = format!(
-            "{:>72} {:7}\n    [Adrastea Prototype Mk1 Online]\n\n    [VOICE] {:?}\n    > ",
-            "frame", inner.frame_number, inner.last_msg,
+            "{:60} frame {:7}\n[VOICE] {:?}\n> ",
+            "[Speech Recognition / Language Model Test]", inner.frame_number, inner.last_msg,
         );
         let mut y = 24;
         for line in txt.split('\n') {
             canvas.draw_str(line, (0, y), &inner.font, &text_paint);
             y += 24;
         }
+        for color in &[
+            Color::RED,
+            Color::GREEN,
+            Color::CYAN,
+            Color::YELLOW,
+            Color::MAGENTA,
+            Color::BLUE,
+            Color::from_rgb(0x80, 0x80, 0xe0),
+        ] {
+            text_paint.set_color(*color);
+            canvas.draw_str("ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789 `!@#$%^&*(){}[]~;',./<>?:\"_+", (0, y), &inner.font, &text_paint);
+            y += 24;
+        }
         if self.shared.vad_on.load(Ordering::Relaxed) {
-            text_paint.set_color(Color::RED);
-            canvas.draw_str("VAD", (0, 24), &inner.font, &text_paint);
+            text_paint.set_color(Color::from_rgb(0x80, 0x80, 0xe0));
+            canvas.draw_str(format!("{:>60}", "VAD"), (0, 24), &inner.font, &text_paint);
         }
     }
 }
