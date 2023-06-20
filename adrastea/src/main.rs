@@ -16,16 +16,20 @@
 #![feature(provide_any)]
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
+    any::Provider,
     cell::RefCell,
     ffi::{c_void, CStr},
     fmt::{Debug, Display, Formatter},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use skia_safe::{paint, Canvas, Color, EncodedImageFormat, Paint, Surface};
+use skia_safe::{
+    paint::{self, Style},
+    Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
+};
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
-use util::{AtomicRing, AtomicRingReader, AtomicRingWriter};
-use wayland::SurfaceClient;
+use util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
+use wayland::{ISkiaPaint, SurfaceClient};
 
 use anyhow::bail;
 use ash::{vk, Entry};
@@ -794,9 +798,16 @@ pub struct GuiTestAudioThreadState {
     writer: AtomicRingWriter<String>,
 }
 
+struct GuiTestSurfaceThreadStateInner {
+    reader: AtomicRingReader<String>,
+    frame_number: usize,
+    last_msg: String,
+    font: Font,
+}
+
 pub struct GuiTestSurfaceThreadState {
     shared: Arc<GuiTestShared>,
-    reader: AtomicRingReader<String>,
+    inner: RefCell<GuiTestSurfaceThreadStateInner>,
 }
 
 impl Debug for GuiTestAudioThreadState {
@@ -810,18 +821,70 @@ impl Debug for GuiTestSurfaceThreadState {
         f.debug_struct("GuiTestSurfaceThreadState").finish_non_exhaustive()
     }
 }
+impl IUnknown for GuiTestSurfaceThreadState {}
+impl Provider for GuiTestSurfaceThreadState {
+    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
+        demand.provide_ref::<dyn ISkiaPaint>(self);
+    }
+}
+impl ISkiaPaint for GuiTestSurfaceThreadState {
+    fn on_paint_skia(&self, canvas: &mut Canvas, width: f32, height: f32) {
+        let mut inner = self.inner.borrow_mut();
+        inner.frame_number += 1;
+        while let Some(text) = inner.reader.try_pop() {
+            inner.last_msg = text;
+        }
+        let mut paint = Paint::default();
+        let mut text_paint = Paint::default();
+        paint
+            .set_style(Style::Stroke)
+            .set_stroke_width(4.0)
+            .set_color(Color::RED)
+            .set_anti_alias(true);
+        text_paint.set_anti_alias(true).set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
+        canvas.clear(Color::from_rgb(0x20, 0x20, 0x20));
+        for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
+            canvas.draw_circle((width / 2.0, height / 2.0), 128.0 + 8.0 * i as f32, &paint);
+        }
+        let txt = format!(
+            "{:>72} {:7}\n    [Adrastea Prototype Mk1 Online]\n\n    [VOICE] {:?}\n    > ",
+            "frame", inner.frame_number, inner.last_msg,
+        );
+        let mut y = 24;
+        for line in txt.split('\n') {
+            canvas.draw_str(line, (0, y), &inner.font, &text_paint);
+            y += 24;
+        }
+        if self.shared.vad_on.load(Ordering::Relaxed) {
+            text_paint.set_color(Color::RED);
+            canvas.draw_str("VAD", (0, 24), &inner.font, &text_paint);
+        }
+    }
+}
 
 fn gui_test_state() -> (GuiTestAudioThreadState, GuiTestSurfaceThreadState) {
     let shared = Arc::new(GuiTestShared { vad_on: AtomicBool::new(false) });
+    let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
+    let mut font = Font::from_typeface(typeface, 18.0);
+    font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
     let (reader, writer) = AtomicRing::new(128);
     (
         GuiTestAudioThreadState { shared: shared.clone(), writer },
-        GuiTestSurfaceThreadState { shared: shared.clone(), reader },
+        GuiTestSurfaceThreadState {
+            shared: shared.clone(),
+            inner: RefCell::new(GuiTestSurfaceThreadStateInner {
+                frame_number: 0,
+                reader,
+                last_msg: String::new(),
+                font,
+            }),
+        },
     )
 }
 
-pub fn wayland_test(test_state: Option<GuiTestSurfaceThreadState>) -> anyhow::Result<()> {
-    let (mut event_queue, mut client) = SurfaceClient::connect_to_env(test_state)?;
+pub fn wayland_test(test_state: GuiTestSurfaceThreadState) -> anyhow::Result<()> {
+    let (mut event_queue, mut client) = SurfaceClient::connect_to_env()?;
+    client.create_toplevel_surface(test_state);
     loop {
         event_queue.blocking_dispatch(&mut client)?;
     }
@@ -884,6 +947,9 @@ pub fn streaming_test(mut test_state: Option<GuiTestAudioThreadState>) -> anyhow
             if all_samples.len() > SAMPLE_RATE as usize * NUM_CHANNELS * 30 {
                 all_samples.drain(0..all_samples.len() - SAMPLE_RATE as usize * NUM_CHANNELS * 30);
             }
+        }
+        if let Some(state) = test_state.as_mut() {
+            state.shared.vad_on.store(vad_active, Ordering::Relaxed);
         }
         if !vad_was_active || vad_active {
             continue;
@@ -1194,7 +1260,7 @@ fn skia_test() -> anyhow::Result<()> {
     let canvas = surface.canvas();
     let mut paint = Paint::default();
 
-    paint.set_style(skia_safe::paint::Style::Stroke).set_stroke_width(4.0).set_color(Color::RED);
+    paint.set_style(Style::Stroke).set_stroke_width(4.0).set_color(Color::RED);
     canvas.draw_line((0, 0), (256, 256), &paint);
     let image = surface.image_snapshot();
     let data = image.encode(surface.direct_context(), EncodedImageFormat::PNG, None).unwrap();
@@ -1227,13 +1293,14 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "audio" {
         streaming_test(None)?
     } else if args.len() >= 2 && args[1] == "wayland" {
-        wayland_test(None)?
+        let (_audio_state, surface_state) = gui_test_state();
+        wayland_test(surface_state)?
     } else if args.len() >= 2 && args[1] == "skia" {
         skia_test()?
     } else if args.len() >= 2 && args[1] == "combined" {
         let (audio_state, surface_state) = gui_test_state();
         std::thread::spawn(move || streaming_test(Some(audio_state)));
-        wayland_test(Some(surface_state))?;
+        wayland_test(surface_state)?;
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }

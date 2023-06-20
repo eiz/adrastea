@@ -29,8 +29,7 @@ use std::os::{
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use skia_safe::{
-    paint::Style, AlphaType, Color, ColorType, Font, FontStyle, ISize, ImageInfo, Paint, Surface,
-    Typeface,
+    AlphaType, Canvas, ColorType, Font, FontStyle, ISize, ImageInfo, Surface, Typeface,
 };
 use wayland_client::{
     protocol::{
@@ -38,7 +37,7 @@ use wayland_client::{
         wl_keyboard::{self, KeymapFormat},
         wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
     },
-    Connection, Dispatch, EventQueue, WEnum,
+    Connection, Dispatch, EventQueue, QueueHandle, WEnum,
 };
 use wayland_protocols::{
     wp::linux_dmabuf::zv1::client::{zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1},
@@ -216,58 +215,59 @@ trait ITopLevelSurface: IUnknown {
     );
 }
 
+pub trait ISkiaPaint: IUnknown {
+    fn on_paint_skia(&self, canvas: &mut Canvas, width: f32, height: f32);
+}
+
 #[derive(Debug)]
 struct TopLevelSurfaceInner {
     id: DelegateId,
     width: i32,
     height: i32,
-    frame_number: i64,
     surface: wl_surface::WlSurface,
-    font: Font,
     last_msg: String,
     buffer: ShmBuffer<SurfaceClient>,
     frame_callback: Option<wl_callback::WlCallback>,
-    test_state: Option<GuiTestSurfaceThreadState>,
 }
 
 #[derive(Debug)]
-struct TopLevelSurface(RefCell<TopLevelSurfaceInner>);
+struct TopLevelSurface<T: IUnknown + 'static> {
+    inner: RefCell<TopLevelSurfaceInner>,
+    user_delegate: T,
+}
 
-impl TopLevelSurface {
+impl<T: IUnknown + 'static> TopLevelSurface<T> {
     pub fn new(
         tlw_delegate: DelegateId, surface: wl_surface::WlSurface, buffer: ShmBuffer<SurfaceClient>,
-        test_state: Option<GuiTestSurfaceThreadState>,
+        user_delegate: T,
     ) -> Self {
-        let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
-        let mut font = Font::from_typeface(typeface, 18.0);
-        font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
-
-        Self(RefCell::new(TopLevelSurfaceInner {
-            id: tlw_delegate,
-            width: 0,
-            height: 0,
-            frame_number: 0,
-            last_msg: "".into(),
-            surface,
-            buffer: buffer,
-            frame_callback: None,
-            font,
-            test_state,
-        }))
+        Self {
+            inner: RefCell::new(TopLevelSurfaceInner {
+                id: tlw_delegate,
+                width: 0,
+                height: 0,
+                last_msg: "".into(),
+                surface,
+                buffer: buffer,
+                frame_callback: None,
+            }),
+            user_delegate,
+        }
     }
 }
 
-impl IUnknown for TopLevelSurface {}
-impl Provider for TopLevelSurface {
+impl<T: IUnknown + 'static> IUnknown for TopLevelSurface<T> {}
+impl<T: IUnknown + 'static> Provider for TopLevelSurface<T> {
     fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
+        self.user_delegate.provide(demand);
         demand.provide_ref::<dyn ISurface>(self);
         demand.provide_ref::<dyn ITopLevelSurface>(self);
     }
 }
 
-impl ISurface for TopLevelSurface {
+impl<T: IUnknown + 'static> ISurface for TopLevelSurface<T> {
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>) {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
         inner.surface.attach(Some(&inner.buffer.buffer), 0, 0);
         if inner.frame_callback.is_none() && inner.width > 0 && inner.height > 0 {
             inner.frame_callback = Some(inner.surface.frame(qhandle, inner.id));
@@ -276,55 +276,31 @@ impl ISurface for TopLevelSurface {
     }
 
     fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>) {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
         inner.frame_callback = None;
-        inner.frame_number += 1;
-        let TopLevelSurfaceInner { ref mut test_state, ref mut last_msg, .. } = &mut *inner;
-        if let Some(test_state) = test_state.as_mut() {
-            while let Some(text) = test_state.reader.try_pop() {
-                *last_msg = text;
-            }
-        }
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-        // it feels silly even putting TODOs in this code but...
-        // we definitely need a proper swap chain abstraction to manage in-use/free
-        // buffers.
-        // TODO bad bad bad
-        let (ptr, len) = (inner.buffer.handle.as_ptr(), inner.width * inner.height * 4);
-        let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
-        let image_info = ImageInfo::new(
-            ISize::new(inner.width, inner.height),
-            ColorType::RGBA8888,
-            AlphaType::Premul,
-            None,
-        );
-        let mut surface =
-            Surface::new_raster_direct(&image_info, pixels, inner.width as usize * 4, None)
-                .unwrap();
-        let canvas = surface.canvas();
-        canvas.scale((1.5, 1.5));
-        let mut paint = Paint::default();
-        let mut text_paint = Paint::default();
-        paint
-            .set_style(Style::Stroke)
-            .set_stroke_width(4.0)
-            .set_color(Color::RED)
-            .set_anti_alias(true);
-        text_paint.set_anti_alias(true).set_color(Color::from_rgb(0xc0, 0xc0, 0xc0));
-        canvas.clear(Color::from_rgb(0x20, 0x20, 0x20));
-        for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
-            canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0 + 8.0 * i as f32, &paint);
-        }
-        let txt = format!(
-            "{:>72} {:7}\n    [Adrastea Prototype Mk1 Online]\n\n    [VOICE] {:?}\n    > ",
-            "frame", inner.frame_number, inner.last_msg,
-        );
-        let mut y = 24;
-        for line in txt.split('\n') {
-            canvas.draw_str(line, (0, y), &inner.font, &text_paint);
-            y += 24;
+
+        if let Some(skia_paint) = (self as &dyn IUnknown).query_interface::<dyn ISkiaPaint>() {
+            // it feels silly even putting TODOs in this code but...
+            // we definitely need a proper swap chain abstraction to manage in-use/free
+            // buffers.
+            // TODO bad bad bad
+            let (ptr, len) = (inner.buffer.handle.as_ptr(), inner.width * inner.height * 4);
+            let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
+            let image_info = ImageInfo::new(
+                ISize::new(inner.width, inner.height),
+                ColorType::RGBA8888,
+                AlphaType::Premul,
+                None,
+            );
+            let mut surface =
+                Surface::new_raster_direct(&image_info, pixels, inner.width as usize * 4, None)
+                    .unwrap();
+            let canvas = surface.canvas();
+            canvas.scale((1.5, 1.5));
+            skia_paint.on_paint_skia(canvas, inner.width as f32 / 1.5, inner.height as f32 / 1.5);
         }
 
         inner.surface.attach(Some(&inner.buffer.buffer), 0, 0);
@@ -335,12 +311,12 @@ impl ISurface for TopLevelSurface {
     }
 }
 
-impl ITopLevelSurface for TopLevelSurface {
+impl<T: IUnknown> ITopLevelSurface for TopLevelSurface<T> {
     fn toplevel_configure(
         &self, alloc: &ShmAllocator<SurfaceClient>,
         qhandle: &wayland_client::QueueHandle<SurfaceClient>, width: i32, height: i32,
     ) {
-        let mut inner = self.0.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
         if width != 0 && height != 0 && (width != inner.width || height != inner.height) {
             let buffer =
                 alloc.create_buffer(width, height, width * 4, wl_shm::Format::Abgr8888, qhandle);
@@ -359,11 +335,20 @@ impl ITopLevelSurface for TopLevelSurface {
 }
 
 #[derive(Debug)]
+struct DummyUnknown;
+impl IUnknown for DummyUnknown {}
+impl Provider for DummyUnknown {
+    fn provide<'a>(&'a self, _demand: &mut std::any::Demand<'a>) {
+        //
+    }
+}
+
+#[derive(Debug)]
 pub struct SurfaceClient {
     initialized: bool,
     post_bind_sync_complete: bool,
     delegate_table: BTreeMap<DelegateId, Box<dyn IUnknown>>,
-    test_state: Option<GuiTestSurfaceThreadState>,
+    handle: QueueHandle<Self>,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     shm_allocator: Option<ShmAllocator<Self>>,
@@ -378,35 +363,62 @@ pub struct SurfaceClient {
 }
 
 impl SurfaceClient {
-    pub fn connect_to_env(
-        test_state: Option<GuiTestSurfaceThreadState>,
-    ) -> anyhow::Result<(EventQueue<Self>, Self)> {
+    pub fn connect_to_env() -> anyhow::Result<(EventQueue<Self>, Self)> {
         let conn = Connection::connect_to_env()?;
         let display = conn.display();
-        let event_queue = conn.new_event_queue();
+        let mut event_queue = conn.new_event_queue();
         let handle = event_queue.handle();
         let _registry = display.get_registry(&handle, ());
         display.sync(&handle, ());
-        Ok((
-            event_queue,
-            Self {
-                initialized: false,
-                post_bind_sync_complete: false,
-                delegate_table: BTreeMap::new(),
-                test_state,
-                compositor: None,
-                xdg_wm_base: None,
-                shm_allocator: None,
-                wl_shm: None,
-                wl_seat: None,
-                wl_pointer: None,
-                _wl_keyboard: None,
-                zwp_linux_dmabuf_v1: None,
-                zwlr_layer_shell_v1: None,
-                layer_surface: None,
-                wlr_layer_surface: None,
-            },
-        ))
+        let mut client = Self {
+            initialized: false,
+            post_bind_sync_complete: false,
+            delegate_table: BTreeMap::new(),
+            handle,
+            compositor: None,
+            xdg_wm_base: None,
+            shm_allocator: None,
+            wl_shm: None,
+            wl_seat: None,
+            wl_pointer: None,
+            _wl_keyboard: None,
+            zwp_linux_dmabuf_v1: None,
+            zwlr_layer_shell_v1: None,
+            layer_surface: None,
+            wlr_layer_surface: None,
+        };
+        while !client.initialized {
+            event_queue.blocking_dispatch(&mut client)?;
+        }
+        Ok((event_queue, client))
+    }
+
+    pub fn create_toplevel_surface<T: IUnknown + 'static>(&mut self, user_delegate: T) {
+        assert!(self.initialized);
+        let shm_allocator = self.shm_allocator.as_ref().unwrap();
+        let compositor = self.compositor.as_ref().unwrap();
+        let xdg_wm_base = self.xdg_wm_base.as_ref().unwrap();
+        let tlw_delegate = DelegateId::new();
+        let surface = compositor.create_surface(&self.handle, tlw_delegate);
+        if let Some(dmabuf_api) = self.zwp_linux_dmabuf_v1.as_ref() {
+            dmabuf_api.get_surface_feedback(&surface, &self.handle, tlw_delegate);
+        }
+        let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.handle, tlw_delegate);
+        let xdg_top_level = xdg_surface.get_toplevel(&self.handle, tlw_delegate);
+        let buffer = shm_allocator.create_buffer(
+            1920,
+            1080,
+            1920 * 4,
+            wl_shm::Format::Abgr8888,
+            &self.handle,
+        );
+
+        xdg_top_level.set_title("Bruh".into());
+        surface.commit();
+        self.delegate_table.insert(
+            tlw_delegate,
+            Box::new(TopLevelSurface::new(tlw_delegate, surface, buffer, user_delegate)),
+        );
     }
 }
 
@@ -633,33 +645,6 @@ impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
             ));
             let pointer = wl_seat.get_pointer(qhandle, ());
             let _keyboard = wl_seat.get_keyboard(qhandle, ());
-
-            let tlw_delegate = DelegateId::new();
-            let surface = compositor.create_surface(qhandle, tlw_delegate);
-            if let Some(dmabuf_api) = state.zwp_linux_dmabuf_v1.as_ref() {
-                dmabuf_api.get_surface_feedback(&surface, qhandle, tlw_delegate);
-            }
-            let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, qhandle, tlw_delegate);
-            let xdg_top_level = xdg_surface.get_toplevel(qhandle, tlw_delegate);
-            let buffer = shm_allocator.create_buffer(
-                1920,
-                1080,
-                1920 * 4,
-                wl_shm::Format::Abgr8888,
-                qhandle,
-            );
-
-            xdg_top_level.set_title("Bruh".into());
-            surface.commit();
-            state.delegate_table.insert(
-                tlw_delegate,
-                Box::new(TopLevelSurface::new(
-                    tlw_delegate,
-                    surface,
-                    buffer,
-                    state.test_state.take(),
-                )),
-            );
 
             if let Some(zwlr_layer_shell_v1) = state.zwlr_layer_shell_v1.as_ref() {
                 let layer_id = DelegateId::new();
