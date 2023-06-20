@@ -19,10 +19,12 @@ use core::{
     cell::RefCell,
     ffi::{c_void, CStr},
     fmt::{Debug, Display, Formatter},
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 use skia_safe::{paint, Canvas, Color, EncodedImageFormat, Paint, Surface};
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
+use util::{AtomicRing, AtomicRingReader, AtomicRingWriter};
 use wayland::SurfaceClient;
 
 use anyhow::bail;
@@ -783,14 +785,49 @@ fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::R
     Ok(())
 }
 
-pub fn wayland_test() -> anyhow::Result<()> {
-    let (mut event_queue, mut client) = SurfaceClient::connect_to_env()?;
+pub struct GuiTestShared {
+    vad_on: AtomicBool,
+}
+
+pub struct GuiTestAudioThreadState {
+    shared: Arc<GuiTestShared>,
+    writer: AtomicRingWriter<String>,
+}
+
+pub struct GuiTestSurfaceThreadState {
+    shared: Arc<GuiTestShared>,
+    reader: AtomicRingReader<String>,
+}
+
+impl Debug for GuiTestAudioThreadState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GuiTestAudioThreadState").finish_non_exhaustive()
+    }
+}
+
+impl Debug for GuiTestSurfaceThreadState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("GuiTestSurfaceThreadState").finish_non_exhaustive()
+    }
+}
+
+fn gui_test_state() -> (GuiTestAudioThreadState, GuiTestSurfaceThreadState) {
+    let shared = Arc::new(GuiTestShared { vad_on: AtomicBool::new(false) });
+    let (reader, writer) = AtomicRing::new(128);
+    (
+        GuiTestAudioThreadState { shared: shared.clone(), writer },
+        GuiTestSurfaceThreadState { shared: shared.clone(), reader },
+    )
+}
+
+pub fn wayland_test(test_state: Option<GuiTestSurfaceThreadState>) -> anyhow::Result<()> {
+    let (mut event_queue, mut client) = SurfaceClient::connect_to_env(test_state)?;
     loop {
         event_queue.blocking_dispatch(&mut client)?;
     }
 }
 
-pub fn streaming_test() -> anyhow::Result<()> {
+pub fn streaming_test(mut test_state: Option<GuiTestAudioThreadState>) -> anyhow::Result<()> {
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
@@ -879,6 +916,9 @@ pub fn streaming_test() -> anyhow::Result<()> {
         )?;
         let detok = detok.trim();
         println!("[{:?}] final: {}", timer.elapsed(), detok);
+        if let Some(state) = test_state.as_mut() {
+            state.writer.try_push(detok.into());
+        }
         token_buffer = initial_tokens.clone();
         all_samples.clear();
     }
@@ -1185,11 +1225,15 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 2 && args[1] == "microbenchmark" {
         unsafe { microbenchmark()? }
     } else if args.len() >= 2 && args[1] == "audio" {
-        streaming_test()?
+        streaming_test(None)?
     } else if args.len() >= 2 && args[1] == "wayland" {
-        wayland_test()?
+        wayland_test(None)?
     } else if args.len() >= 2 && args[1] == "skia" {
         skia_test()?
+    } else if args.len() >= 2 && args[1] == "combined" {
+        let (audio_state, surface_state) = gui_test_state();
+        std::thread::spawn(move || streaming_test(Some(audio_state)));
+        wayland_test(Some(surface_state))?;
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }

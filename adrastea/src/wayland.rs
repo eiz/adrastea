@@ -15,7 +15,7 @@
 
 use core::{
     alloc::Layout,
-    any::{request_ref, Provider},
+    any::Provider,
     cell::RefCell,
     ffi::CStr,
     marker::PhantomData,
@@ -46,7 +46,11 @@ use wayland_protocols::{
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
-use crate::rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap};
+use crate::{
+    rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
+    util::IUnknown,
+    GuiTestSurfaceThreadState,
+};
 
 #[derive(Debug)]
 struct WaylandArenaHandleInner {
@@ -168,7 +172,6 @@ where
         &self, width: i32, height: i32, stride: i32, format: wl_shm::Format,
         qhandle: &wayland_client::QueueHandle<T>,
     ) -> WaylandShmBuffer<T> {
-        println!("width: {}, height: {}, stride: {}", width, height, stride);
         let total_size = height.checked_mul(stride).unwrap();
         let layout = Layout::from_size_align(total_size as usize, 32).unwrap();
         let handle = self.heap.allocate_handle(layout).unwrap();
@@ -201,28 +204,12 @@ impl From<u64> for DelegateId {
     }
 }
 
-impl IUnknown for TopLevelWindow {}
-impl Provider for TopLevelWindow {
-    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
-        demand.provide_ref::<dyn IWindow>(self);
-        demand.provide_ref::<dyn ITopLevelWindow>(self);
-    }
-}
-
-trait IUnknown: Provider + core::fmt::Debug {}
-
-impl dyn IUnknown + '_ {
-    pub fn query_interface<T: ?Sized + 'static>(&self) -> Option<&T> {
-        request_ref(self)
-    }
-}
-
-trait IWindow {
+trait IWindow: IUnknown {
     fn frame_callback(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>);
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>);
 }
 
-trait ITopLevelWindow {
+trait ITopLevelWindow: IUnknown {
     fn toplevel_configure(
         &self, alloc: &WaylandShmAllocator<SurfaceClient>,
         qhandle: &wayland_client::QueueHandle<SurfaceClient>, width: i32, height: i32,
@@ -237,10 +224,12 @@ struct TopLevelWindowInner {
     frame_number: i64,
     surface: wl_surface::WlSurface,
     font: Font,
+    last_msg: String,
     xdg_surface: xdg_surface::XdgSurface,
     xdg_toplevel: xdg_toplevel::XdgToplevel,
-    buffer: Option<WaylandShmBuffer<SurfaceClient>>,
+    buffer: WaylandShmBuffer<SurfaceClient>,
     frame_callback: Option<wl_callback::WlCallback>,
+    test_state: Option<GuiTestSurfaceThreadState>,
 }
 
 #[derive(Debug)]
@@ -250,30 +239,41 @@ impl TopLevelWindow {
     pub fn new(
         tlw_delegate: DelegateId, surface: wl_surface::WlSurface,
         xdg_surface: xdg_surface::XdgSurface, xdg_toplevel: xdg_toplevel::XdgToplevel,
-        buffer: WaylandShmBuffer<SurfaceClient>,
+        buffer: WaylandShmBuffer<SurfaceClient>, test_state: Option<GuiTestSurfaceThreadState>,
     ) -> Self {
-        let typeface = Typeface::from_name("sans", FontStyle::normal()).unwrap();
-        let font = Font::from_typeface(typeface, 18.0);
+        let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
+        let mut font = Font::from_typeface(typeface, 18.0);
+        font.set_edging(skia_safe::font::Edging::SubpixelAntiAlias);
 
         Self(RefCell::new(TopLevelWindowInner {
             id: tlw_delegate,
             width: 0,
             height: 0,
             frame_number: 0,
+            last_msg: "".into(),
             surface,
             xdg_surface,
             xdg_toplevel,
-            buffer: Some(buffer),
+            buffer: buffer,
             frame_callback: None,
             font,
+            test_state,
         }))
+    }
+}
+
+impl IUnknown for TopLevelWindow {}
+impl Provider for TopLevelWindow {
+    fn provide<'a>(&'a self, demand: &mut std::any::Demand<'a>) {
+        demand.provide_ref::<dyn IWindow>(self);
+        demand.provide_ref::<dyn ITopLevelWindow>(self);
     }
 }
 
 impl IWindow for TopLevelWindow {
     fn finish_configure(&self, qhandle: &wayland_client::QueueHandle<SurfaceClient>) {
         let mut inner = self.0.borrow_mut();
-        inner.surface.attach(inner.buffer.as_ref().map(|b| &b.buffer), 0, 0);
+        inner.surface.attach(Some(&inner.buffer.buffer), 0, 0);
         if inner.frame_callback.is_none() && inner.width > 0 && inner.height > 0 {
             inner.frame_callback = Some(inner.surface.frame(qhandle, inner.id));
         }
@@ -284,15 +284,20 @@ impl IWindow for TopLevelWindow {
         let mut inner = self.0.borrow_mut();
         inner.frame_callback = None;
         inner.frame_number += 1;
+        let TopLevelWindowInner { ref mut test_state, ref mut last_msg, .. } = &mut *inner;
+        if let Some(test_state) = test_state.as_mut() {
+            while let Some(text) = test_state.reader.try_pop() {
+                *last_msg = text;
+            }
+        }
         if inner.width == 0 || inner.height == 0 {
             return;
         }
         // it feels silly even putting TODOs in this code but...
         // we definitely need a proper swap chain abstraction to manage in-use/free
         // buffers.
-        let buffer = inner.buffer.as_ref().unwrap();
         // TODO bad bad bad
-        let (ptr, len) = (buffer.handle.as_ptr(), inner.width * inner.height * 4);
+        let (ptr, len) = (inner.buffer.handle.as_ptr(), inner.width * inner.height * 4);
         let pixels = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len as usize) };
         let image_info = ImageInfo::new(
             ISize::new(inner.width, inner.height),
@@ -317,14 +322,17 @@ impl IWindow for TopLevelWindow {
         for i in 0..((((inner.frame_number % 120) as i32) - 60).abs() / 2) + 3 {
             canvas.draw_circle((inner.width / 2, inner.height / 2), 128.0 + 8.0 * i as f32, &paint);
         }
-        canvas.draw_str(
-            format!("frame {:?}", inner.frame_number),
-            (0, 24),
-            &inner.font,
-            &text_paint,
+        let txt = format!(
+            "{:>72} {:7}\n    [Adrastea Prototype Mk1 Online]\n\n    [VOICE] {:?}\n    > ",
+            "frame", inner.frame_number, inner.last_msg,
         );
+        let mut y = 24;
+        for line in txt.split('\n') {
+            canvas.draw_str(line, (0, y), &inner.font, &text_paint);
+            y += 24;
+        }
 
-        inner.surface.attach(Some(&buffer.buffer), 0, 0);
+        inner.surface.attach(Some(&inner.buffer.buffer), 0, 0);
         inner.frame_callback = Some(inner.surface.frame(&qhandle, inner.id));
         inner.surface.damage(0, 0, inner.width, inner.height);
         inner.surface.commit();
@@ -339,10 +347,8 @@ impl ITopLevelWindow for TopLevelWindow {
     ) {
         let mut inner = self.0.borrow_mut();
         if width != 0 && height != 0 && (width != inner.width || height != inner.height) {
-            let old_buffer = inner.buffer.take().unwrap();
             let buffer =
                 alloc.create_buffer(width, height, width * 4, wl_shm::Format::Abgr8888, qhandle);
-            old_buffer.buffer.destroy();
             let pixels = unsafe {
                 std::slice::from_raw_parts_mut(
                     buffer.handle.as_ptr() as *mut u32,
@@ -350,7 +356,7 @@ impl ITopLevelWindow for TopLevelWindow {
                 )
             };
             pixels[..width as usize * height as usize].fill(0xFF00FF00);
-            inner.buffer = Some(buffer);
+            inner.buffer = buffer;
             inner.height = height;
             inner.width = width;
         }
@@ -362,6 +368,7 @@ pub struct SurfaceClient {
     initialized: bool,
     post_bind_sync_complete: bool,
     delegate_table: BTreeMap<DelegateId, Box<dyn IUnknown>>,
+    test_state: Option<GuiTestSurfaceThreadState>,
     compositor: Option<wl_compositor::WlCompositor>,
     xdg_wm_base: Option<xdg_wm_base::XdgWmBase>,
     shm_allocator: Option<WaylandShmAllocator<Self>>,
@@ -376,7 +383,9 @@ pub struct SurfaceClient {
 }
 
 impl SurfaceClient {
-    pub fn connect_to_env() -> anyhow::Result<(EventQueue<Self>, Self)> {
+    pub fn connect_to_env(
+        test_state: Option<GuiTestSurfaceThreadState>,
+    ) -> anyhow::Result<(EventQueue<Self>, Self)> {
         let conn = Connection::connect_to_env()?;
         let display = conn.display();
         let event_queue = conn.new_event_queue();
@@ -389,6 +398,7 @@ impl SurfaceClient {
                 initialized: false,
                 post_bind_sync_complete: false,
                 delegate_table: BTreeMap::new(),
+                test_state,
                 compositor: None,
                 xdg_wm_base: None,
                 shm_allocator: None,
@@ -654,6 +664,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for SurfaceClient {
                     xdg_surface,
                     xdg_top_level,
                     buffer,
+                    state.test_state.take(),
                 )),
             );
 

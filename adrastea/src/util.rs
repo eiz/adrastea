@@ -15,6 +15,8 @@
 
 use core::{
     alloc::Layout,
+    any::{request_ref, Provider},
+    fmt::Debug,
     marker::PhantomData,
     mem::MaybeUninit,
     sync::atomic::{AtomicUsize, Ordering},
@@ -22,6 +24,14 @@ use core::{
 
 use alloc::{alloc::dealloc, sync::Arc};
 use parking_lot::{Condvar, Mutex};
+
+pub trait IUnknown: Provider + Debug {}
+
+impl dyn IUnknown + '_ {
+    pub fn query_interface<T: ?Sized + 'static>(&self) -> Option<&T> {
+        request_ref(self)
+    }
+}
 
 pub struct ElidingRangeIterator {
     end: usize,
