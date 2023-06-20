@@ -28,9 +28,7 @@ use std::os::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
-use skia_safe::{
-    AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface,
-};
+use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
 use wayland_client::{
     protocol::{
         wl_buffer, wl_callback, wl_compositor,
@@ -328,15 +326,6 @@ impl<T: IUnknown> ITopLevelSurface for TopLevelSurface<T> {
             inner.height = height;
             inner.width = width;
         }
-    }
-}
-
-#[derive(Debug)]
-struct DummyUnknown;
-impl IUnknown for DummyUnknown {}
-impl Provider for DummyUnknown {
-    fn provide<'a>(&'a self, _demand: &mut std::any::Demand<'a>) {
-        //
     }
 }
 
