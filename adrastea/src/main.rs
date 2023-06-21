@@ -806,6 +806,7 @@ impl Debug for GuiTestAudioThreadState {
 struct MainWindowInner {
     reader: AtomicRingReader<String>,
     frame_number: usize,
+    last_render: Duration,
     last_msg: String,
     font: Font,
 }
@@ -816,8 +817,14 @@ pub struct MainWindow {
 impl MainWindow {
     pub fn new(shared: Arc<GuiTestShared>, reader: AtomicRingReader<String>) -> Self {
         let typeface = Typeface::from_name("monospace", FontStyle::normal()).unwrap();
-        let mut font = Font::from_typeface(typeface, 18.0);
-        let inner = MainWindowInner { reader, frame_number: 0, last_msg: String::new(), font };
+        let font = Font::from_typeface(typeface, 18.0);
+        let inner = MainWindowInner {
+            reader,
+            frame_number: 0,
+            last_render: Duration::ZERO,
+            last_msg: String::new(),
+            font,
+        };
         Self { shared, inner: RefCell::new(inner) }
     }
 }
@@ -834,6 +841,7 @@ impl Provider for MainWindow {
 }
 impl ISkiaPaint for MainWindow {
     fn on_paint_skia(&self, canvas: &mut Canvas, width: f32, height: f32) {
+        let start = Instant::now();
         let mut inner = self.inner.borrow_mut();
         inner.frame_number += 1;
         while let Some(text) = inner.reader.try_pop() {
@@ -873,10 +881,12 @@ impl ISkiaPaint for MainWindow {
             canvas.draw_str("ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz 0123456789 `!@#$%^&*(){}[]~;',./<>?:\"_+", (0, y), &inner.font, &text_paint);
             y += 24;
         }
+        text_paint.set_color(Color::from_rgb(0x80, 0x80, 0xe0));
+        canvas.draw_str(format!("{:>15.4?}", inner.last_render), (0, y), &inner.font, &text_paint);
         if self.shared.vad_on.load(Ordering::Relaxed) {
-            text_paint.set_color(Color::from_rgb(0x80, 0x80, 0xe0));
             canvas.draw_str(format!("{:>60}", "VAD"), (0, 24), &inner.font, &text_paint);
         }
+        inner.last_render = start.elapsed();
     }
 }
 
@@ -1274,6 +1284,10 @@ fn skia_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn llama_test() -> anyhow::Result<()> {
+    todo!();
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1306,6 +1320,8 @@ fn main() -> anyhow::Result<()> {
         let (audio_state, surface_state) = gui_test_state();
         std::thread::spawn(move || streaming_test(Some(audio_state)));
         wayland_test(surface_state)?;
+    } else if args.len() >= 2 && args[1] == "llama" {
+        llama_test()?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }
