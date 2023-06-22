@@ -31,12 +31,20 @@ struct Identity {
 
 enum BinaryOp {
   ADD = 1,
+  SILU_MUL = 2,
 };
 
 struct Add {
   template <typename T>
   __device__ __forceinline__ T operator()(T const& left, T const& right) const {
     return left + right;
+  }
+};
+
+struct SiluMul {
+  template <typename T>
+  __device__ __forceinline__ T operator()(T const& left, T const& right) const {
+    return T(float(left) / (1.0f + expf(-left)) * float(right));
   }
 };
 
@@ -158,6 +166,11 @@ void __device__ __forceinline__ elementwise_binary_1d_generic(T* const output,
           stride_o, stride_l, stride_r,
           elementwise_binary_1d<T, Add>(output, left, right, stride_o, stride_l, stride_r, n));
       break;
+    case SILU_MUL:
+      STRIDE_1_BINARY_1D(
+          stride_o, stride_l, stride_r,
+          elementwise_binary_1d<T, SiluMul>(output, left, right, stride_o, stride_l, stride_r, n));
+      break;
     default:
       assert(false);
   }
@@ -187,6 +200,12 @@ void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
           stride_ox, stride_oy, stride_lx, stride_ly, stride_rx, stride_ry,
           elementwise_binary_2d<T, Add>(output, left, right, stride_ox, stride_oy, stride_lx,
                                         stride_ly, stride_rx, stride_ry, x, y));
+      break;
+    case SILU_MUL:
+      STRIDE_1_BINARY_2D(
+          stride_ox, stride_oy, stride_lx, stride_ly, stride_rx, stride_ry,
+          elementwise_binary_2d<T, SiluMul>(output, left, right, stride_ox, stride_oy, stride_lx,
+                                            stride_ly, stride_rx, stride_ry, x, y));
       break;
     default:
       assert(false);

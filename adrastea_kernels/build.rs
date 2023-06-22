@@ -68,7 +68,6 @@ fn main() {
         "microbench",
         "rms_norm",
         "rotary",
-        "silu",
         "softmax_rows",
         "square_fp32_16x16",
     ];

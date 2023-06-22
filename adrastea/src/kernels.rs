@@ -18,6 +18,7 @@ pub enum Conv1dActivation {
 #[repr(u32)]
 pub enum BinaryOp {
     Add = 1,
+    SiluMul = 2,
 }
 
 #[repr(u32)]

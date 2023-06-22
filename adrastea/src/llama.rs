@@ -3,11 +3,14 @@ use half::f16;
 use serde::Deserialize;
 
 use crate::{
-    kernels::{CommonKernels, MatmulLoad, MatmulMask, MatmulOptions, MatmulStore},
+    kernels::{BinaryOp, CommonKernels, MatmulMask, MatmulOptions, MatmulStore},
     pickle::{load_tensor, PickledModel},
     tensor::{Tensor, TensorLayout, TensorViewMut},
     util::round_up,
 };
+
+// TODO: last logits, kv cache, bring over many optimizations =(
+// bring back multi-gpu and quantization =(
 
 pub struct LlamaAttention {
     query: Tensor<f16>,
@@ -111,9 +114,10 @@ impl LlamaContext {
 
     pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state = Tensor::new_hip(&[tokens.len(), self.model.params.dim as usize])?;
+        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
-        // let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
+        let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
         self.kernels.embed(
             &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),
@@ -122,7 +126,19 @@ impl LlamaContext {
         for layer in &self.model.layers {
             self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
         }
-        todo!()
+        self.kernels.rms_norm(
+            &mut normed_state.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.model.norm.as_view(),
+            self.model.params.norm_eps,
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut logits.as_view_mut(),
+            &normed_state.as_view(),
+            &self.model.output.as_view(),
+            MatmulOptions::new(),
+        )?;
+        Ok(logits)
     }
 
     fn process_layer(
@@ -224,6 +240,17 @@ impl LlamaContext {
             &layer.ffn.w3.as_view().permute(&[0, 1, 3, 2]),
             MatmulOptions::new(),
         )?;
-        todo!();
+        self.kernels.elementwise_binary_2d_f16_inplace(
+            &mut ffn_w1.as_view_mut(),
+            &ffn_w3.as_view(),
+            BinaryOp::SiluMul,
+        )?;
+        self.kernels.matmul_f16_fast(
+            hidden_state,
+            &ffn_w1.as_view(),
+            &layer.ffn.w2.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new().store(MatmulStore::Add),
+        )?;
+        Ok(())
     }
 }
