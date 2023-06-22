@@ -19,11 +19,14 @@ use core::{
     fmt::Debug,
     marker::PhantomData,
     mem::MaybeUninit,
+    ops::{Add, Div, Mul, Sub},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use alloc::{alloc::dealloc, sync::Arc};
+use num_traits::One;
 use parking_lot::{Condvar, Mutex};
+use rustfft::num_traits::Num;
 
 pub trait IUnknown: Provider + Debug {}
 
@@ -68,8 +71,12 @@ impl Iterator for ElidingRangeIterator {
     }
 }
 
-pub fn ceil_div(a: u64, b: u64) -> u64 {
-    (a + b - 1) / b
+pub fn ceil_div<T: Num + Copy>(a: T, b: T) -> T {
+    (a + b - One::one()) / b
+}
+
+pub fn round_up<T: Num + Copy>(a: T, b: T) -> T {
+    ceil_div(a, b) * b
 }
 
 pub struct AtomicRing<T: Send> {

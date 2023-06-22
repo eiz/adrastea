@@ -29,6 +29,8 @@ enum class MatmulStoreOp {
   GELU_BIAS = 1,
   BETA_GELU_BIAS = 2,
   BETA_BIAS = 3,
+  SCALE = 4,
+  ADD = 5,
 };
 enum class MatmulMaskOp { NONE = 0, CAUSAL = 1 };
 
@@ -58,7 +60,14 @@ struct Scale {
  public:
   __device__ __forceinline__ Scale(T scale, Operator op) : scale(scale), op(op) {}
   __device__ __forceinline__ T operator()(T const value) const { return op(value) * scale; }
-
+  __device__ __forceinline__ float operator()(__half const& value,
+                                              __half const* const output,
+                                              int x,
+                                              int y,
+                                              int stride_ox,
+                                              int stride_oy) const {
+    return op(value, output, x, y, stride_ox, stride_oy) * scale;
+  }
   T scale;
   Operator op;
 };
@@ -127,6 +136,21 @@ struct Beta {
   }
 
   T beta;
+  Operator op;
+};
+
+template <typename T, typename O, typename Operator = Identity<T>>
+struct Add {
+  __device__ __forceinline__ Add(Operator op) : op(op) {}
+  __device__ __forceinline__ T operator()(T const value,
+                                          O const* const output,
+                                          int x,
+                                          int y,
+                                          int stride_ox,
+                                          int stride_oy) const {
+    return op(value, output, x, y, stride_ox, stride_oy) + output[x * stride_ox + y * stride_oy];
+  }
+
   Operator op;
 };
 
@@ -421,6 +445,16 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
       using bias_t = Bias<float, T, HalfToFloat<>>;                              \
       using beta_t = Beta<float, T, bias_t>;                                     \
       beta_t store_op{beta, bias_t(bias, HalfToFloat<>(Identity<T>()))};         \
+      MATMUL_GENERIC_LOAD_OP(op)                                                 \
+      break;                                                                     \
+    }                                                                            \
+    case MatmulStoreOp::SCALE: {                                                 \
+      auto store_op = Scale<T, Identity<T>>(scale, {});                          \
+      MATMUL_GENERIC_LOAD_OP(op)                                                 \
+      break;                                                                     \
+    }                                                                            \
+    case MatmulStoreOp::ADD: {                                                   \
+      auto store_op = Add<T, T, Identity<T>>({});                                \
       MATMUL_GENERIC_LOAD_OP(op)                                                 \
       break;                                                                     \
     }                                                                            \

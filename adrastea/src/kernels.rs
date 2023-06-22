@@ -46,6 +46,8 @@ pub enum MatmulStoreOp {
     GeluBias = 1,
     BetaGeluBias = 2,
     BetaBias = 3,
+    Scale = 4,
+    Add = 5,
 }
 
 pub enum MatmulStore<'a> {
@@ -53,6 +55,8 @@ pub enum MatmulStore<'a> {
     GeluBias(&'a TensorView<'a, f16>),
     BetaGeluBias(f32, &'a TensorView<'a, f16>),
     BetaBias(f32, &'a TensorView<'a, f16>),
+    Scale(f32),
+    Add,
 }
 
 impl<'a> MatmulStore<'a> {
@@ -62,6 +66,8 @@ impl<'a> MatmulStore<'a> {
             MatmulStore::GeluBias(_) => MatmulStoreOp::GeluBias,
             MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BetaGeluBias,
             MatmulStore::BetaBias(_, _) => MatmulStoreOp::BetaBias,
+            MatmulStore::Scale(_) => MatmulStoreOp::Scale,
+            MatmulStore::Add => MatmulStoreOp::Add,
         }
     }
 }
@@ -113,6 +119,13 @@ pub trait CommonKernels {
     fn layer_norm(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, eps: f32,
+    ) -> anyhow::Result<()>;
+    fn rms_norm(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        eps: f32,
+    ) -> anyhow::Result<()>;
+    fn rotary_inplace(
+        &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
     ) -> anyhow::Result<()>;
     fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
@@ -167,6 +180,17 @@ impl CommonKernels for MatmulTracer {
         bias: &TensorView<f16>, eps: f32,
     ) -> anyhow::Result<()> {
         self.kernels.layer_norm(output, input, weight, bias, eps)
+    }
+    fn rms_norm(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        self.kernels.rms_norm(output, input, weight, eps)
+    }
+    fn rotary_inplace(
+        &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
+    ) -> anyhow::Result<()> {
+        self.kernels.rotary_inplace(inout, n_heads, pos_offset, theta)
     }
     fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
@@ -226,6 +250,8 @@ pub struct GpuKernels {
     )>,
     layer_norm:
         Kernel<(*mut f16, *const f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
+    rms_norm: Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
+    rotary: Kernel<(*mut f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, f32)>,
     matmul_f16: Kernel<(
         *mut f16,
         *const f16,
@@ -284,6 +310,8 @@ impl GpuKernels {
     pub fn new(capability: i32) -> anyhow::Result<Self> {
         let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
         let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
+        let module_rms_norm = HipModule::find(capability, adrastea_kernels::rms_norm)?;
+        let module_rotary = HipModule::find(capability, adrastea_kernels::rotary)?;
         let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
         let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
         let module_softmax_rows = HipModule::find(capability, adrastea_kernels::softmax_rows)?;
@@ -291,6 +319,8 @@ impl GpuKernels {
         let kernels = GpuKernels {
             conv1d: Kernel::new(&module_conv1d, "conv1d")?,
             layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
+            rms_norm: Kernel::new(&module_rms_norm, "rms_norm")?,
+            rotary: Kernel::new(&module_rotary, "rotary")?,
             matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
             matmul_f16_fast: Kernel::new(&module_matmul, "matmul_f16_fast")?,
             elementwise_binary_2d_f16: Kernel::new(
@@ -407,6 +437,64 @@ impl CommonKernels for GpuKernels {
         Ok(())
     }
 
+    fn rms_norm(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        eps: f32,
+    ) -> anyhow::Result<()> {
+        self.rms_norm.launch(
+            LaunchParams {
+                blocks: (input.size(-2) as u32, 1, 1),
+                threads: (256, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                input.as_gpu_ptr(),
+                weight.as_gpu_ptr(),
+                output.size(-1) as i32,
+                output.size(-2) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                input.stride(-1) as i32,
+                input.stride(-2) as i32,
+                eps,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn rotary_inplace(
+        &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
+    ) -> anyhow::Result<()> {
+        self.rotary.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(inout.size(-1) as u64, 16) as u32,
+                    ceil_div(inout.size(-2) as u64, 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                inout.as_mut_gpu_ptr(),
+                inout.as_gpu_ptr(),
+                inout.size(-1) as i32,
+                inout.size(-2) as i32,
+                inout.stride(-1) as i32,
+                inout.stride(-2) as i32,
+                inout.stride(-1) as i32,
+                inout.stride(-2) as i32,
+                n_heads,
+                pos_offset,
+                theta,
+            ),
+        )?;
+        Ok(())
+    }
+
     fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
@@ -419,10 +507,15 @@ impl CommonKernels for GpuKernels {
             MatmulStore::GeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
             MatmulStore::BetaBias(_, bias) => Some(bias),
+            MatmulStore::Scale(_) => None,
+            MatmulStore::Add => None,
         };
-        let scale = match &options.load {
+        let mut scale = match &options.load {
             MatmulLoad::Identity => 1.0,
             MatmulLoad::Scale(scale) => *scale,
+        };
+        if let MatmulStore::Scale(store_scale) = &options.store {
+            scale *= store_scale;
         };
         let beta = match &options.store {
             MatmulStore::BetaGeluBias(beta, _) => *beta,
@@ -481,10 +574,15 @@ impl CommonKernels for GpuKernels {
             MatmulStore::GeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
             MatmulStore::BetaBias(_, bias) => Some(bias),
+            MatmulStore::Scale(_) => None,
+            MatmulStore::Add => None,
         };
-        let scale = match &options.load {
+        let mut scale = match &options.load {
             MatmulLoad::Identity => 1.0,
             MatmulLoad::Scale(scale) => *scale,
+        };
+        if let MatmulStore::Scale(store_scale) = &options.store {
+            scale *= store_scale;
         };
         let beta = match &options.store {
             MatmulStore::BetaGeluBias(beta, _) => *beta,

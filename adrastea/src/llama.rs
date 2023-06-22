@@ -3,9 +3,10 @@ use half::f16;
 use serde::Deserialize;
 
 use crate::{
-    kernels::CommonKernels,
+    kernels::{CommonKernels, MatmulLoad, MatmulMask, MatmulOptions, MatmulStore},
     pickle::{load_tensor, PickledModel},
-    tensor::Tensor,
+    tensor::{Tensor, TensorLayout, TensorViewMut},
+    util::round_up,
 };
 
 pub struct LlamaAttention {
@@ -70,7 +71,14 @@ pub struct LlamaParams {
     pub vocab_size: isize,
 }
 
+impl LlamaParams {
+    pub fn ffn_dim(&self) -> usize {
+        round_up(self.dim * 8 / 3, self.multiple_of) as usize
+    }
+}
+
 pub struct LlamaModel {
+    params: LlamaParams,
     layers: Vec<LlamaTransformerBlock>,
     output: Tensor<f16>,
     norm: Tensor<f16>,
@@ -83,6 +91,7 @@ impl LlamaModel {
             layers: (0..params.n_layers)
                 .map(|i| LlamaTransformerBlock::new(pickle, &format!("layers.{}", i)))
                 .collect::<anyhow::Result<_>>()?,
+            params,
             output: load_tensor(pickle, "output.weight")?,
             norm: load_tensor(pickle, "norm.weight")?,
             tok_embeddings: load_tensor(pickle, "tok_embeddings.weight")?,
@@ -101,6 +110,120 @@ impl LlamaContext {
     }
 
     pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
+        let mut hidden_state = Tensor::new_hip(&[tokens.len(), self.model.params.dim as usize])?;
+        let tokens_gpu =
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+        // let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
+        self.kernels.embed(
+            &mut hidden_state.as_view_mut(),
+            tokens_gpu.as_view(),
+            self.model.tok_embeddings.as_view(),
+        )?;
+        for layer in &self.model.layers {
+            self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
+        }
         todo!()
+    }
+
+    fn process_layer(
+        &self, hidden_state: &mut TensorViewMut<f16>, layer: &LlamaTransformerBlock,
+    ) -> anyhow::Result<()> {
+        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut query = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut key = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut value = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut qkv = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut ffn_w1 =
+            Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
+        let mut ffn_w3 =
+            Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
+        self.kernels.rms_norm(
+            &mut normed_state.as_view_mut(),
+            &hidden_state.as_view(),
+            &layer.attn_norm.as_view(),
+            self.model.params.norm_eps,
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut query.as_view_mut(),
+            &normed_state.as_view(),
+            &layer.attn.query.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        self.kernels.rotary_inplace(
+            &mut query.as_view_mut(),
+            self.model.params.n_heads as i32,
+            0,
+            10000.0,
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut key.as_view_mut(),
+            &normed_state.as_view(),
+            &layer.attn.key.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        self.kernels.rotary_inplace(
+            &mut key.as_view_mut(),
+            self.model.params.n_heads as i32,
+            0,
+            10000.0,
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut value.as_view_mut(),
+            &normed_state.as_view(),
+            &layer.attn.value.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        let heads = self.model.params.n_heads as isize;
+        let q_view =
+            query.as_view().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let k_view =
+            key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
+        let v_view =
+            value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        self.kernels.matmul_f16_fast(
+            &mut qk.as_view_mut(),
+            &q_view,
+            &k_view,
+            MatmulOptions::new()
+                .store(MatmulStore::Scale(
+                    1.0 / (self.model.params.dim as f32 / self.model.params.n_heads as f32).sqrt(),
+                ))
+                .mask(MatmulMask::Causal),
+        )?;
+        self.kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
+        let mut qkv_view =
+            qkv.as_view_mut().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        self.kernels.matmul_f16_fast(
+            &mut qkv_view,
+            &qk.as_view(),
+            &v_view,
+            MatmulOptions::new(),
+        )?;
+        self.kernels.matmul_f16_fast(
+            hidden_state,
+            &qkv.as_view(),
+            &layer.attn.out.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new().store(MatmulStore::Add),
+        )?;
+        self.kernels.rms_norm(
+            &mut normed_state.as_view_mut(),
+            &hidden_state.as_view(),
+            &layer.ffn_norm.as_view(),
+            self.model.params.norm_eps,
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut ffn_w1.as_view_mut(),
+            &normed_state.as_view(),
+            &layer.ffn.w1.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        self.kernels.matmul_f16_fast(
+            &mut ffn_w3.as_view_mut(),
+            &normed_state.as_view(),
+            &layer.ffn.w3.as_view().permute(&[0, 1, 3, 2]),
+            MatmulOptions::new(),
+        )?;
+        todo!();
     }
 }

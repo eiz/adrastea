@@ -18,6 +18,7 @@ half = "2"
 libspa-sys = "0.6.0"
 matrixmultiply = { version = "0.3.7", features = ["threading"] }
 memmap2 = "0.6.1"
+num-traits = "0.2.15"
 parking_lot = "0.12.1"
 pipewire = "0.6.0"
 rustfft = "6.1.0"

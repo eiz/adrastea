@@ -22,6 +22,7 @@ dependencies = [
  "libspa-sys",
  "matrixmultiply",
  "memmap2",
+ "num-traits",
  "parking_lot",
  "pipewire",
  "pipewire-sys",
