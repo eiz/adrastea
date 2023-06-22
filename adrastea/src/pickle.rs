@@ -22,9 +22,12 @@ use std::{
 };
 
 use anyhow::bail;
+use half::f16;
 use memmap2::Mmap;
 use serde::Deserialize;
 use zip::{CompressionMethod, ZipArchive};
+
+use crate::tensor::{Tensor, TensorLayout, TensorStorage};
 
 // ya ya ya bla bla undefined behavior. whatever. make sure nobody secretly boops your files
 // while they are in use
@@ -46,8 +49,7 @@ impl MappedBuffer {
 }
 
 fn value_at_path<'a>(
-    mut value: &'a serde_pickle::Value,
-    path: &[&str],
+    mut value: &'a serde_pickle::Value, path: &[&str],
 ) -> anyhow::Result<&'a serde_pickle::Value> {
     let mut i = 0;
     loop {
@@ -71,9 +73,8 @@ fn value_at_path<'a>(
 
 fn value_as_dict<'a>(
     value: &'a serde_pickle::Value,
-    path: &[&str],
 ) -> anyhow::Result<&'a BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>> {
-    match value_at_path(value, path)? {
+    match value_at_path(value, &[])? {
         serde_pickle::Value::Dict(map) => Ok(map),
         _ => bail!("expected dict"),
     }
@@ -86,8 +87,7 @@ pub trait ModelState<'de>: Deserialize<'de> {
     fn state_dict(&self) -> &serde_pickle::Value;
     fn into_metadata(self) -> Self::Metadata;
     fn load<P: AsRef<Path>>(
-        path: P,
-        params: Self::LoadParams,
+        path: P, params: Self::LoadParams,
     ) -> anyhow::Result<PickledModel<Self::Metadata>> {
         PickledModel::load_typed::<Self, P>(path, params)
     }
@@ -95,14 +95,7 @@ pub trait ModelState<'de>: Deserialize<'de> {
 
 type PyTensorStorage = (String, String, String, String, i64);
 // TODO this is probably gonna break when new fields are added (e.g. 'metadata' already exists now)
-type PyTensor = (
-    PyTensorStorage,
-    i64,
-    Vec<i64>,
-    Vec<i64>,
-    bool,
-    serde_pickle::Value,
-);
+type PyTensor = (PyTensorStorage, i64, Vec<i64>, Vec<i64>, bool, serde_pickle::Value);
 
 #[derive(Clone, Copy, Eq, Debug, PartialEq)]
 pub enum TensorDataType {
@@ -229,8 +222,7 @@ impl<'a, 'de> Deserialize<'de> for RawModel<'a> {
 
 impl PickledModel<()> {
     pub fn load_typed<'de, T: ModelState<'de>, P: AsRef<Path>>(
-        path: P,
-        params: T::LoadParams,
+        path: P, params: T::LoadParams,
     ) -> anyhow::Result<PickledModel<T::Metadata>> {
         let path = path.as_ref();
         let buf = MappedBuffer::open(path)?;
@@ -249,27 +241,35 @@ impl PickledModel<()> {
                 );
             }
         }
-        let content_range = filehash
-            .get("data.pkl")
-            .ok_or_else(|| anyhow::anyhow!("data.pkl not found"))?;
+        let content_range =
+            filehash.get("data.pkl").ok_or_else(|| anyhow::anyhow!("data.pkl not found"))?;
         let mut model: T = serde_pickle::from_slice(
             &buf.data()[content_range.clone()],
             serde_pickle::DeOptions::new(),
         )?;
         model.init(params);
-        let dict = value_as_dict(model.state_dict(), &[])?;
+        let dict = value_as_dict(model.state_dict())?;
         let tensors = tensors_from_dict(dict, filehash)?;
-        Ok(PickledModel {
-            mapping: buf,
-            tensors,
-            metadata: model.into_metadata(),
-        })
+        Ok(PickledModel { mapping: buf, tensors, metadata: model.into_metadata() })
     }
 
     pub fn load_file<P: AsRef<Path>>(
-        path: P,
-        dict_path: Option<&str>,
+        path: P, dict_path: Option<&str>,
     ) -> anyhow::Result<PickledModel<()>> {
         Self::load_typed::<RawModel, _>(path, dict_path)
     }
+}
+
+pub fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tensor<f16>> {
+    let pickled_tensor =
+        pickled.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
+    let mut tensor =
+        Tensor::new_hip_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
+    match tensor.storage_mut() {
+        TensorStorage::Hip(ref mut b) => {
+            b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(tensor)
 }

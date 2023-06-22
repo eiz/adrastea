@@ -23,6 +23,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use pickle::load_tensor;
 use skia_safe::{
     paint::Style, Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
 };
@@ -41,6 +42,7 @@ use simt_hip::{
 use crate::{
     audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
+    llama::{LlamaModel, LlamaParams},
     pickle::{ModelState, PickledModel},
     tensor::Tensor,
     whisper::{
@@ -52,6 +54,7 @@ extern crate alloc;
 
 pub mod audio;
 pub mod kernels;
+pub mod llama;
 pub mod mel;
 pub mod pickle;
 pub mod rt_alloc;
@@ -1284,8 +1287,14 @@ fn skia_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn llama_test() -> anyhow::Result<()> {
-    todo!();
+fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    let path = path.as_ref();
+    // TODO: support the various sharded model formats.
+    let model = PickledModel::load_file(path.join("consolidated.00.pth"), None)?;
+    let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
+    let model = LlamaModel::new(&model, params)?;
+    println!("loaded the thing");
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1320,8 +1329,8 @@ fn main() -> anyhow::Result<()> {
         let (audio_state, surface_state) = gui_test_state();
         std::thread::spawn(move || streaming_test(Some(audio_state)));
         wayland_test(surface_state)?;
-    } else if args.len() >= 2 && args[1] == "llama" {
-        llama_test()?
+    } else if args.len() >= 3 && args[1] == "llama" {
+        llama_test(&args[2])?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
     }

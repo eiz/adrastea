@@ -27,7 +27,7 @@ use crate::{
         MatmulStore,
     },
     mel,
-    pickle::{self, PickledModel},
+    pickle::{self, load_tensor, PickledModel},
     tensor::{Tensor, TensorLayout, TensorStorage, TensorView, TensorViewMut},
 };
 
@@ -552,18 +552,4 @@ impl WhisperContext {
         )?;
         Ok(logits)
     }
-}
-
-fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tensor<f16>> {
-    let pickled_tensor =
-        pickled.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
-    let mut tensor =
-        Tensor::new_hip_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
-    match tensor.storage_mut() {
-        TensorStorage::Hip(ref mut b) => {
-            b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
-        }
-        _ => unreachable!(),
-    }
-    Ok(tensor)
 }
