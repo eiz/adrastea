@@ -1,7 +1,9 @@
+use alloc::sync::Arc;
 use half::f16;
 use serde::Deserialize;
 
 use crate::{
+    kernels::CommonKernels,
     pickle::{load_tensor, PickledModel},
     tensor::Tensor,
 };
@@ -85,5 +87,20 @@ impl LlamaModel {
             norm: load_tensor(pickle, "norm.weight")?,
             tok_embeddings: load_tensor(pickle, "tok_embeddings.weight")?,
         })
+    }
+}
+
+pub struct LlamaContext {
+    model: Arc<LlamaModel>,
+    kernels: Arc<dyn CommonKernels>,
+}
+
+impl LlamaContext {
+    pub fn new(model: Arc<LlamaModel>, kernels: Arc<dyn CommonKernels>) -> Self {
+        Self { model, kernels }
+    }
+
+    pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
+        todo!()
     }
 }

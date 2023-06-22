@@ -42,7 +42,7 @@ use simt_hip::{
 use crate::{
     audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
-    llama::{LlamaModel, LlamaParams},
+    llama::{LlamaContext, LlamaModel, LlamaParams},
     pickle::{ModelState, PickledModel},
     tensor::Tensor,
     whisper::{
@@ -1289,10 +1289,17 @@ fn skia_test() -> anyhow::Result<()> {
 
 fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
+    let phys = HipPhysicalDevice::get(0)?;
+    let device = Arc::new(HipDevice::new(phys)?);
+    let _scope = device.lock()?;
+    // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
+    // use a better way
+    let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
+
     // TODO: support the various sharded model formats.
     let model = PickledModel::load_file(path.join("consolidated.00.pth"), None)?;
     let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
-    let model = LlamaModel::new(&model, params)?;
+    let context = LlamaContext::new(Arc::new(LlamaModel::new(&model, params)?), kernels);
     println!("loaded the thing");
     Ok(())
 }
