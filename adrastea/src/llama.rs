@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use half::f16;
+use sentencepiece::SentencePieceProcessor;
 use serde::Deserialize;
 
 use crate::{
@@ -86,19 +87,32 @@ pub struct LlamaModel {
     output: Tensor<f16>,
     norm: Tensor<f16>,
     tok_embeddings: Tensor<f16>,
+    tokenizer: SentencePieceProcessor,
 }
 
 impl LlamaModel {
-    pub fn new(pickle: &PickledModel<()>, params: LlamaParams) -> anyhow::Result<Self> {
+    pub fn new(
+        pickle: &PickledModel<()>, mut params: LlamaParams, tokenizer: SentencePieceProcessor,
+    ) -> anyhow::Result<Self> {
+        params.vocab_size = tokenizer.len() as isize;
         Ok(Self {
             layers: (0..params.n_layers)
                 .map(|i| LlamaTransformerBlock::new(pickle, &format!("layers.{}", i)))
                 .collect::<anyhow::Result<_>>()?,
             params,
+            tokenizer,
             output: load_tensor(pickle, "output.weight")?,
             norm: load_tensor(pickle, "norm.weight")?,
             tok_embeddings: load_tensor(pickle, "tok_embeddings.weight")?,
         })
+    }
+
+    pub fn params(&self) -> &LlamaParams {
+        &self.params
+    }
+
+    pub fn tokenizer(&self) -> &SentencePieceProcessor {
+        &self.tokenizer
     }
 }
 
@@ -112,6 +126,14 @@ impl LlamaContext {
         Self { model, kernels }
     }
 
+    pub fn model(&self) -> &Arc<LlamaModel> {
+        &self.model
+    }
+
+    pub fn kernels(&self) -> &Arc<dyn CommonKernels> {
+        &self.kernels
+    }
+
     pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state = Tensor::new_hip(&[tokens.len(), self.model.params.dim as usize])?;
         let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
@@ -123,6 +145,7 @@ impl LlamaContext {
             tokens_gpu.as_view(),
             self.model.tok_embeddings.as_view(),
         )?;
+
         for layer in &self.model.layers {
             self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
         }
@@ -135,7 +158,7 @@ impl LlamaContext {
         self.kernels.matmul_f16_fast(
             &mut logits.as_view_mut(),
             &normed_state.as_view(),
-            &self.model.output.as_view(),
+            &self.model.output.as_view().permute(&[0, 1, 3, 2]),
             MatmulOptions::new(),
         )?;
         Ok(logits)

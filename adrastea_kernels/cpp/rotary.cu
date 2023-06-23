@@ -3,8 +3,8 @@
 // TODO: this kernel should be fused out of existence.
 extern "C" __global__ void rotary(__half* output,
                                   __half* input,
-                                  int length_y,
                                   int length_x,
+                                  int length_y,
                                   int stride_ox,
                                   int stride_oy,
                                   int stride_ix,

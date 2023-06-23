@@ -333,6 +333,8 @@ impl GpuKernels {
             _modules: vec![
                 module_conv1d,
                 module_layer_norm,
+                module_rms_norm,
+                module_rotary,
                 module_elementwise,
                 module_matmul,
                 module_softmax_rows,
@@ -442,6 +444,8 @@ impl CommonKernels for GpuKernels {
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         eps: f32,
     ) -> anyhow::Result<()> {
+        assert_eq!(input.size(-1), output.size(-1));
+        assert_eq!(input.size(-2), output.size(-2));
         self.rms_norm.launch(
             LaunchParams {
                 blocks: (input.size(-2) as u32, 1, 1),

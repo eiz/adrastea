@@ -14,7 +14,7 @@ extern "C" __global__ void rms_norm(__half* output,
                                     float eps) {
   int row = BLOCK_IDX_X;
   int tid = THREAD_IDX_X;
-  int in_row_idx = row * stride_ix;
+  int in_row_idx = row * stride_iy;
   int out_row_idx = row * stride_oy;
   int warp_id = tid / 32;
   bool warp_leader = (tid % 32) == 0;

@@ -24,6 +24,7 @@ use core::{
     time::Duration,
 };
 use pickle::load_tensor;
+use sentencepiece::SentencePieceProcessor;
 use skia_safe::{
     paint::Style, Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
 };
@@ -1299,8 +1300,34 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     // TODO: support the various sharded model formats.
     let model = PickledModel::load_file(path.join("consolidated.00.pth"), None)?;
     let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
-    let context = LlamaContext::new(Arc::new(LlamaModel::new(&model, params)?), kernels);
-    println!("loaded the thing");
+    let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
+    let end_of_text = 1;
+    let mut context =
+        LlamaContext::new(Arc::new(LlamaModel::new(&model, params, tokenizer)?), kernels);
+    let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
+    for _i in 0..200 {
+        let logits = context.decode(&token_buffer)?.into_cpu()?;
+        let logits_vec = logits.storage().as_cpu();
+        let last_logits =
+            &logits_vec[logits_vec.len() - context.model().params().vocab_size as usize..];
+        let argmax = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap()
+            .0;
+        if argmax as usize == end_of_text {
+            break;
+        }
+        println!(
+            "text {:?}",
+            context
+                .model()
+                .tokenizer()
+                .decode_piece_ids(&token_buffer.iter().map(|x| *x as u32).collect::<Vec<_>>())
+        );
+        token_buffer.push(argmax as i32);
+    }
     Ok(())
 }
 
