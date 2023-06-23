@@ -1178,7 +1178,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     }
 
     bench("matmul_f16_2048_4096_4096_rrr", || {
-        kernels.matmul_f16(
+        kernels.matmul_f16_slow(
             &mut out.as_view_mut(),
             &left.as_view(),
             &right.as_view(),
@@ -1188,7 +1188,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Ok(2 * 2048 * 4096 * 4096)
     })?;
     bench("matmul_f16_2048_4096_4096_rrc", || {
-        kernels.matmul_f16(
+        kernels.matmul_f16_slow(
             &mut out.as_view_mut(),
             &left.as_view(),
             &right.as_view().permute(&[1, 0]),
@@ -1198,7 +1198,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Ok(2 * 2048 * 4096 * 4096)
     })?;
     bench("matmul_f16_fast_2048_4096_4096_rrr", || {
-        kernels.matmul_f16_fast(
+        kernels.matmul_f16(
             &mut out.as_view_mut(),
             &left.as_view(),
             &right.as_view(),
@@ -1208,7 +1208,7 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Ok(2 * 2048 * 4096 * 4096)
     })?;
     bench("matmul_f16_fast_2048_4096_4096_rrc", || {
-        kernels.matmul_f16_fast(
+        kernels.matmul_f16(
             &mut out.as_view_mut(),
             &left.as_view(),
             &right.as_view().permute(&[1, 0]),

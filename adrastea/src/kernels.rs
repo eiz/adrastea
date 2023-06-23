@@ -128,11 +128,11 @@ pub trait CommonKernels {
     fn rotary_inplace(
         &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
     ) -> anyhow::Result<()>;
-    fn matmul_f16(
+    fn matmul_f16_slow(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()>;
-    fn matmul_f16_fast(
+    fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()>;
@@ -193,6 +193,20 @@ impl CommonKernels for MatmulTracer {
     ) -> anyhow::Result<()> {
         self.kernels.rotary_inplace(inout, n_heads, pos_offset, theta)
     }
+    fn matmul_f16_slow(
+        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
+        options: MatmulOptions,
+    ) -> anyhow::Result<()> {
+        let left_layout = left.layout();
+        let right_layout = right.layout();
+        let output_layout = output.layout();
+        self.shape_set.lock().insert((
+            left_layout.clone(),
+            right_layout.clone(),
+            output_layout.clone(),
+        ));
+        self.kernels.matmul_f16_slow(output, left, right, options)
+    }
     fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
@@ -206,20 +220,6 @@ impl CommonKernels for MatmulTracer {
             output_layout.clone(),
         ));
         self.kernels.matmul_f16(output, left, right, options)
-    }
-    fn matmul_f16_fast(
-        &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
-        options: MatmulOptions,
-    ) -> anyhow::Result<()> {
-        let left_layout = left.layout();
-        let right_layout = right.layout();
-        let output_layout = output.layout();
-        self.shape_set.lock().insert((
-            left_layout.clone(),
-            right_layout.clone(),
-            output_layout.clone(),
-        ));
-        self.kernels.matmul_f16_fast(output, left, right, options)
     }
     fn softmax_rows_inplace(
         &self, output: &mut TensorViewMut<f16>, temperature: f32,
@@ -253,7 +253,7 @@ pub struct GpuKernels {
         Kernel<(*mut f16, *const f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
     rms_norm: Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
     rotary: Kernel<(*mut f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, f32)>,
-    matmul_f16: Kernel<(
+    matmul_f16_slow: Kernel<(
         *mut f16,
         *const f16,
         *const f16,
@@ -277,7 +277,7 @@ pub struct GpuKernels {
         u32,
         u32,
     )>,
-    matmul_f16_fast: Kernel<(
+    matmul_f16: Kernel<(
         *mut f16,
         *const f16,
         *const f16,
@@ -322,8 +322,8 @@ impl GpuKernels {
             layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
             rms_norm: Kernel::new(&module_rms_norm, "rms_norm")?,
             rotary: Kernel::new(&module_rotary, "rotary")?,
-            matmul_f16: Kernel::new(&module_matmul, "matmul_f16")?,
-            matmul_f16_fast: Kernel::new(&module_matmul, "matmul_f16_fast")?,
+            matmul_f16_slow: Kernel::new(&module_matmul, "matmul_f16")?,
+            matmul_f16: Kernel::new(&module_matmul, "matmul_f16_fast")?,
             elementwise_binary_2d_f16: Kernel::new(
                 &module_elementwise,
                 "elementwise_binary_2d_f16",
@@ -500,7 +500,7 @@ impl CommonKernels for GpuKernels {
         Ok(())
     }
 
-    fn matmul_f16(
+    fn matmul_f16_slow(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()> {
@@ -528,7 +528,7 @@ impl CommonKernels for GpuKernels {
             _ => 0.0,
         };
         let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
-        self.matmul_f16.launch(
+        self.matmul_f16_slow.launch(
             LaunchParams {
                 blocks: (
                     ceil_div(output.size(-1) as u64, 16) as u32,
@@ -567,7 +567,7 @@ impl CommonKernels for GpuKernels {
         Ok(())
     }
 
-    fn matmul_f16_fast(
+    fn matmul_f16(
         &self, output: &mut TensorViewMut<f16>, left: &TensorView<f16>, right: &TensorView<f16>,
         options: MatmulOptions,
     ) -> anyhow::Result<()> {
@@ -598,7 +598,7 @@ impl CommonKernels for GpuKernels {
         const N_TILE: u32 = 32;
         const M_TILE: u32 = 16;
         let bias_ptr = bias.map(|b| b.as_gpu_ptr()).unwrap_or(std::ptr::null());
-        self.matmul_f16_fast.launch(
+        self.matmul_f16.launch(
             LaunchParams {
                 blocks: (
                     ceil_div(output.size(-1) as u64, N_TILE as u64) as u32,
