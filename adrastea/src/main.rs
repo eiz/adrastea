@@ -1331,6 +1331,10 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
+    todo!()
+}
+
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1365,8 +1369,10 @@ fn main() -> anyhow::Result<()> {
         wayland_test(surface_state)?;
     } else if args.len() >= 3 && args[1] == "llama" {
         llama_test(&args[2])?
+    } else if args.len() >= 3 && args[1] == "clip" {
+        clip_test(&args[2])?
     } else {
-        println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland");
+        println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland, skia, combined, llama, clip");
     }
     Ok(())
 }
