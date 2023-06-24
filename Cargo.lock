@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "serde-pickle"
 version = "1.1.1"
-source = "git+https://github.com/eiz/serde-pickle?branch=mack/persid#f061bb00d8f85897caec23d41043bf0acc020ea2"
+source = "git+https://github.com/eiz/serde-pickle?branch=mack/persid#aad26bb2118d1ca9a591ecb40049e325c53f4e29"
 dependencies = [
  "byteorder",
  "iter-read",

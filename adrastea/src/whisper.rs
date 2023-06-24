@@ -28,7 +28,7 @@ use crate::{
     },
     mel,
     pickle::{self, load_tensor, PickledModel},
-    tensor::{Tensor, TensorLayout, TensorStorage, TensorView, TensorViewMut},
+    tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
 };
 
 pub const WHISPER_SAMPLE_RATE: u32 = 16000;
@@ -369,13 +369,13 @@ impl WhisperContext {
         self.kernels.matmul_f16(
             &mut mlp_hidden.as_view_mut(),
             &ln_out.as_view(),
-            &layer.mlp_0.weight.as_view().permute(&[0, 1, 3, 2]),
+            &layer.mlp_0.weight.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::BetaGeluBias(0.0, &layer.mlp_0.bias.as_view())),
         )?;
         self.kernels.matmul_f16(
             hidden_state,
             &mlp_hidden.as_view(),
-            &layer.mlp_2.weight.as_view().permute(&[0, 1, 3, 2]),
+            &layer.mlp_2.weight.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &layer.mlp_2.bias.as_view())),
         )?;
         Ok(())
@@ -394,19 +394,19 @@ impl WhisperContext {
         self.kernels.matmul_f16(
             &mut query.as_view_mut(),
             ln_out,
-            &attn.query.weight.as_view().permute(&[0, 1, 3, 2]),
+            &attn.query.weight.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.query.bias.as_view())),
         )?;
         self.kernels.matmul_f16(
             &mut key.as_view_mut(),
             kv_input,
-            &attn.key.as_view().permute(&[0, 1, 3, 2]),
+            &attn.key.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.matmul_f16(
             &mut value.as_view_mut(),
             kv_input,
-            &attn.value.weight.as_view().permute(&[0, 1, 3, 2]),
+            &attn.value.weight.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.value.bias.as_view())),
         )?;
         let q_view =
@@ -435,7 +435,7 @@ impl WhisperContext {
         self.kernels.matmul_f16(
             hidden_state,
             &qkv.as_view(),
-            &attn.out.weight.as_view().permute(&[0, 1, 3, 2]),
+            &attn.out.weight.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &attn.out.bias.as_view())),
         )?;
         Ok(())
@@ -542,7 +542,7 @@ impl WhisperContext {
         self.kernels.matmul_f16(
             &mut logits.as_view_mut(),
             &ln_out.as_view(),
-            &self.model.decoder.token_embedding.as_view().permute(&[0, 1, 3, 2]),
+            &self.model.decoder.token_embedding.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         Ok(logits)

@@ -158,7 +158,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             &mut logits.as_view_mut(),
             &normed_state.as_view(),
-            &self.model.output.as_view().permute(&[0, 1, 3, 2]),
+            &self.model.output.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         Ok(logits)
@@ -185,7 +185,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             &mut query.as_view_mut(),
             &normed_state.as_view(),
-            &layer.attn.query.as_view().permute(&[0, 1, 3, 2]),
+            &layer.attn.query.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.rotary_inplace(
@@ -197,7 +197,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             &mut key.as_view_mut(),
             &normed_state.as_view(),
-            &layer.attn.key.as_view().permute(&[0, 1, 3, 2]),
+            &layer.attn.key.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.rotary_inplace(
@@ -209,7 +209,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             &mut value.as_view_mut(),
             &normed_state.as_view(),
-            &layer.attn.value.as_view().permute(&[0, 1, 3, 2]),
+            &layer.attn.value.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         let heads = self.model.params.n_heads as isize;
@@ -237,7 +237,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             hidden_state,
             &qkv.as_view(),
-            &layer.attn.out.as_view().permute(&[0, 1, 3, 2]),
+            &layer.attn.out.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::Add),
         )?;
         self.kernels.rms_norm(
@@ -249,13 +249,13 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             &mut ffn_w1.as_view_mut(),
             &normed_state.as_view(),
-            &layer.ffn.w1.as_view().permute(&[0, 1, 3, 2]),
+            &layer.ffn.w1.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.matmul_f16(
             &mut ffn_w3.as_view_mut(),
             &normed_state.as_view(),
-            &layer.ffn.w3.as_view().permute(&[0, 1, 3, 2]),
+            &layer.ffn.w3.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.elementwise_binary_2d_f16_inplace(
@@ -266,7 +266,7 @@ impl LlamaContext {
         self.kernels.matmul_f16(
             hidden_state,
             &ffn_w1.as_view(),
-            &layer.ffn.w2.as_view().permute(&[0, 1, 3, 2]),
+            &layer.ffn.w2.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::Add),
         )?;
         Ok(())

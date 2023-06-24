@@ -1332,7 +1332,11 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 }
 
 fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
-    todo!()
+    let path = path.as_ref();
+    let model = PickledModel::load_file(path, None)?;
+
+    println!("{:?}", model.tensors);
+    todo!();
 }
 
 fn main() -> anyhow::Result<()> {

@@ -25,6 +25,7 @@ use anyhow::bail;
 use half::f16;
 use memmap2::Mmap;
 use serde::Deserialize;
+use smallvec::SmallVec;
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::tensor::{Tensor, TensorLayout, TensorStorage};
@@ -100,6 +101,7 @@ type PyTensor = (PyTensorStorage, i64, Vec<i64>, Vec<i64>, bool, serde_pickle::V
 #[derive(Clone, Copy, Eq, Debug, PartialEq)]
 pub enum TensorDataType {
     I8,
+    I64,
     F16,
     F32,
     F64,
@@ -109,6 +111,7 @@ impl TensorDataType {
     pub fn element_size(&self) -> usize {
         match self {
             TensorDataType::I8 => 1,
+            TensorDataType::I64 => 8,
             TensorDataType::F16 => 2,
             TensorDataType::F32 => 4,
             TensorDataType::F64 => 8,
@@ -119,34 +122,9 @@ impl TensorDataType {
 #[derive(Debug, Clone)]
 pub struct PickledTensor {
     pub dtype: TensorDataType,
-    pub shape: [usize; 4],
-    pub stride: [usize; 4],
+    pub shape: SmallVec<[usize; 7]>,
+    pub stride: SmallVec<[usize; 7]>,
     pub range: Range<usize>,
-}
-
-fn expand_dims_4d(dims: &[usize]) -> anyhow::Result<[usize; 4]> {
-    let result = match dims.len() {
-        0 => bail!("no dimensions"),
-        1 => [1, 1, 1, dims[0]],
-        2 => [1, 1, dims[0], dims[1]],
-        3 => [1, dims[0], dims[1], dims[2]],
-        4 => [dims[0], dims[1], dims[2], dims[3]],
-        _ => bail!("too many dimensions"),
-    };
-    Ok(result)
-}
-
-fn expand_stride_4d(dims: &[usize], strides: &[usize]) -> anyhow::Result<[usize; 4]> {
-    let dims_product = dims.iter().product::<usize>();
-    let result = match strides.len() {
-        0 => bail!("no dimensions"),
-        1 => [dims_product, dims_product, dims_product, strides[0]],
-        2 => [dims_product, dims_product, strides[0], strides[1]],
-        3 => [dims_product, strides[0], strides[1], strides[2]],
-        4 => [strides[0], strides[1], strides[2], strides[3]],
-        _ => bail!("too many dimensions"),
-    };
-    Ok(result)
 }
 
 fn tensors_from_dict(
@@ -166,17 +144,17 @@ fn tensors_from_dict(
                     .ok_or_else(|| anyhow::anyhow!("tensor data not found: {}", data_idx))?;
                 let size = size.iter().map(|x| *x as usize).collect::<Vec<_>>();
                 let stride = stride.iter().map(|x| *x as usize).collect::<Vec<_>>();
-                let size4d = expand_dims_4d(&size)?;
-                let stride4d = expand_stride_4d(&size, &stride)?;
                 tensorhash.insert(
                     s.clone(),
                     PickledTensor {
                         dtype: match dtype.as_str() {
+                            "float" => TensorDataType::F32,
                             "half" => TensorDataType::F16,
+                            "long" => TensorDataType::I64,
                             _ => bail!("unsupported dtype: {}", dtype),
                         },
-                        shape: size4d,
-                        stride: stride4d,
+                        shape: size.into(),
+                        stride: stride.into(),
                         range: tensor_data.clone(),
                     },
                 );
