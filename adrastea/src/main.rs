@@ -23,10 +23,11 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use pickle::load_tensor;
+use memmap2::Mmap;
 use sentencepiece::SentencePieceProcessor;
 use skia_safe::{
-    paint::Style, Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
+    paint::Style, Canvas, Color, Data, EncodedImageFormat, Font, FontStyle, Image, Paint, Surface,
+    Typeface,
 };
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
 use util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
@@ -1331,11 +1332,24 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {
+    let file = File::open(path)?;
+    let map = unsafe { Mmap::map(&file)? };
+    let data = unsafe { Data::new_bytes(&map) };
+    Ok(Image::from_encoded(data)
+        .ok_or_else(|| anyhow::anyhow!("failed to load image"))?
+        .to_raster_image(None)
+        .ok_or_else(|| anyhow::anyhow!("failed to load image"))?)
+}
+
 fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let model = PickledModel::load_file(path, None)?;
+    let image = load_image_eager("/home/eiz/clip_test.jpg")?;
+    let pixmap = image.peek_pixels();
 
-    println!("{:#?}", model.tensors);
+    dbg!(&image);
+    dbg!(&pixmap);
     todo!();
 }
 
