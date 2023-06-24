@@ -1335,7 +1335,7 @@ fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let model = PickledModel::load_file(path, None)?;
 
-    println!("{:?}", model.tensors);
+    println!("{:#?}", model.tensors);
     todo!();
 }
 

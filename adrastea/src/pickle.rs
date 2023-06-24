@@ -130,8 +130,8 @@ pub struct PickledTensor {
 fn tensors_from_dict(
     dict: &BTreeMap<serde_pickle::HashableValue, serde_pickle::Value>,
     filehash: HashMap<String, Range<usize>>,
-) -> Result<HashMap<String, PickledTensor>, anyhow::Error> {
-    let mut tensorhash = HashMap::new();
+) -> Result<BTreeMap<String, PickledTensor>, anyhow::Error> {
+    let mut tensorhash = BTreeMap::new();
     for (k, v) in dict.iter() {
         if let serde_pickle::HashableValue::String(ref s) = k {
             if s != "_metadata" {
@@ -166,7 +166,7 @@ fn tensors_from_dict(
 
 pub struct PickledModel<T> {
     pub mapping: MappedBuffer,
-    pub tensors: HashMap<String, PickledTensor>,
+    pub tensors: BTreeMap<String, PickledTensor>,
     pub metadata: T,
 }
 
