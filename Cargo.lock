@@ -35,6 +35,7 @@ dependencies = [
  "simt_hip",
  "simt_hip_sys",
  "simt_rocblas_sys",
+ "skia-bindings",
  "skia-safe",
  "smallvec",
  "tiktoken-rs",

@@ -25,9 +25,10 @@ use core::{
 };
 use memmap2::Mmap;
 use sentencepiece::SentencePieceProcessor;
+use skia_bindings::SkFilterMode;
 use skia_safe::{
-    paint::Style, Canvas, Color, Data, EncodedImageFormat, Font, FontStyle, Image, Paint, Surface,
-    Typeface,
+    paint::Style, Canvas, Color, CubicResampler, Data, EncodedImageFormat, Font, FontStyle, Image,
+    Paint, SamplingOptions, Surface, Typeface,
 };
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
 use util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
@@ -1342,14 +1343,39 @@ fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {
         .ok_or_else(|| anyhow::anyhow!("failed to load image"))?)
 }
 
+fn resize_dims(src_height: i32, src_width: i32, target_size: i32) -> (i32, i32) {
+    if src_height <= src_width {
+        (target_size, (target_size as f32 * src_width as f32 / src_height as f32) as i32)
+    } else {
+        ((target_size as f32 * src_height as f32 / src_width as f32) as i32, target_size)
+    }
+}
+
 fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let model = PickledModel::load_file(path, None)?;
     let image = load_image_eager("/home/eiz/clip_test.jpg")?;
-    let pixmap = image.peek_pixels();
+    let pixdims = image.dimensions();
+    let (new_height, new_width) = resize_dims(pixdims.height, pixdims.width, 224);
+    let mut surface = Surface::new_raster_n32_premul((224, 224)).unwrap();
+    let canvas = surface.canvas();
 
-    dbg!(&image);
-    dbg!(&pixmap);
+    canvas.scale((
+        new_width as f32 / pixdims.width as f32,
+        new_height as f32 / pixdims.height as f32,
+    ));
+    canvas.draw_image_with_sampling_options(
+        image,
+        (-((new_width - 224) / 2), -((new_height - 224) / 2)),
+        CubicResampler::catmull_rom(),
+        None,
+    );
+    let snap = surface.image_snapshot();
+    let context = surface.direct_context();
+    let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
+    let mut f = File::create("/home/eiz/clip_crop.png")?;
+    f.write_all(data.as_bytes()).unwrap();
+
     todo!();
 }
 
@@ -1448,5 +1474,11 @@ mod tests {
         let initial = iota(256);
         let reshaped = initial.as_view().shape_cast(&[16, 1]);
         println!("{:?}", reshaped);
+    }
+
+    #[test]
+    fn resize_dims_works() {
+        assert_eq!(super::resize_dims(480, 640, 224), (224, 298));
+        assert_eq!(super::resize_dims(640, 480, 224), (298, 224));
     }
 }
