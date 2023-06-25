@@ -1,13 +1,63 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, os::raw::c_void};
 
 use half::f16;
 use parking_lot::Mutex;
-use simt_hip::{HipModule, Kernel, LaunchParams};
+use simt_hip::{HipModule, Kernel, KernelParam, LaunchParams};
 
 use crate::{
-    tensor::{TensorLayout, TensorView, TensorViewMut},
+    tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
     util::ceil_div,
 };
+
+fn encode_ptr(data: *mut c_void, n_dims: usize) -> u64 {
+    let mut ptr = data as u64;
+    assert!(n_dims <= 7);
+    assert!(ptr & 0x7 == 0);
+    ptr |= n_dims as u64;
+    ptr
+}
+
+#[repr(C)]
+pub struct TensorGpuDescriptor {
+    pub ptr: u64,
+    pub shape: [u32; 7],
+    pub strides: [u32; 7],
+}
+
+impl KernelParam for TensorGpuDescriptor {}
+
+impl TensorGpuDescriptor {
+    pub fn as_gpu_ptr(&self) -> *mut c_void {
+        (self.ptr & !0x7) as *mut c_void
+    }
+    pub fn n_dims(&self) -> usize {
+        (self.ptr & 0x7) as usize
+    }
+}
+
+impl<T: Copy> From<&TensorView<'_, T>> for TensorGpuDescriptor {
+    fn from(tensor: &TensorView<T>) -> Self {
+        let mut shape = [0; 7];
+        let mut strides = [0; 7];
+        for (i, (&dim, &stride)) in
+            tensor.layout().dims.iter().rev().zip(tensor.layout().strides.iter().rev()).enumerate()
+        {
+            shape[i] = dim as u32;
+            strides[i] = stride as u32;
+        }
+        Self {
+            ptr: encode_ptr(tensor.as_gpu_ptr() as *const _ as *mut _, tensor.layout().dims.len()),
+            shape,
+            strides,
+        }
+    }
+}
+
+impl<T: Copy> From<&mut TensorViewMut<'_, T>> for TensorGpuDescriptor {
+    fn from(tensor: &mut TensorViewMut<T>) -> Self {
+        (&tensor.as_view()).into()
+    }
+}
 
 #[repr(u32)]
 pub enum Conv1dActivation {
@@ -236,15 +286,10 @@ impl CommonKernels for MatmulTracer {
 pub struct GpuKernels {
     _modules: Vec<HipModule>,
     conv1d: Kernel<(
-        *mut f16,
-        *const f16,
-        *const f16,
-        *const f16,
-        i32,
-        i32,
-        i32,
-        i32,
-        i32,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
         i32,
         i32,
         i32,
@@ -363,15 +408,10 @@ impl CommonKernels for GpuKernels {
                 stream: None,
             },
             (
-                output.as_mut_gpu_ptr(),
-                input.as_gpu_ptr(),
-                weight.as_gpu_ptr(),
-                bias.as_gpu_ptr(),
-                input.size(-2) as i32,
-                output.size(-2) as i32,
-                kernel_size,
-                input.size(-1) as i32,
-                output.size(-1) as i32,
+                output.into(),
+                input.into(),
+                weight.into(),
+                bias.into(),
                 stride,
                 padding,
                 activation as i32,

@@ -291,6 +291,7 @@ pub struct WhisperContext {
 
 impl WhisperContext {
     pub fn new(model: Arc<WhisperModel>, kernels: Arc<dyn CommonKernels>) -> anyhow::Result<Self> {
+        println!("{:?}", model.encoder.conv1.weight.layout());
         Ok(Self {
             kernels,
             mel_transform: mel::LogMelSpectrogramTransform::new(
