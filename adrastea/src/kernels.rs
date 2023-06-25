@@ -161,8 +161,7 @@ pub trait CommonKernels {
     // TODO: replace with conv2d, lol
     fn conv1d(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
-        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
-        activation: Conv1dActivation,
+        bias: &TensorView<f16>, stride: i32, padding: i32, activation: Conv1dActivation,
     ) -> anyhow::Result<()>;
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
@@ -216,10 +215,9 @@ impl MatmulTracer {
 impl CommonKernels for MatmulTracer {
     fn conv1d(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
-        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
-        activation: Conv1dActivation,
+        bias: &TensorView<f16>, stride: i32, padding: i32, activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
-        self.kernels.conv1d(output, input, weight, bias, kernel_size, stride, padding, activation)
+        self.kernels.conv1d(output, input, weight, bias, stride, padding, activation)
     }
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
@@ -393,8 +391,7 @@ impl GpuKernels {
 impl CommonKernels for GpuKernels {
     fn conv1d(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
-        bias: &TensorView<f16>, kernel_size: i32, stride: i32, padding: i32,
-        activation: Conv1dActivation,
+        bias: &TensorView<f16>, stride: i32, padding: i32, activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
         self.conv1d.launch(
             LaunchParams {
