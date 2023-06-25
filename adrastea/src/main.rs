@@ -1353,7 +1353,7 @@ fn resize_dims(src_height: i32, src_width: i32, target_size: i32) -> (i32, i32) 
     }
 }
 
-fn pixmap_as_planes(pixmap: Pixmap) -> Tensor<f32> {
+fn pixmap_as_planes(pixmap: Pixmap, channel_mean: &[f32], channel_stddev: &[f32]) -> Tensor<f32> {
     let dims = pixmap.dimensions();
     let (w, h) = (dims.width as usize, dims.height as usize);
     let mut planes = vec![0.0f32; h * w * 3];
@@ -1361,9 +1361,11 @@ fn pixmap_as_planes(pixmap: Pixmap) -> Tensor<f32> {
         // god's one correct pixel format. the goat
         skia_safe::ColorType::BGRA8888 => {
             for (i, pixel) in pixmap.pixels::<[u8; 4]>().unwrap().iter().enumerate() {
-                planes[i] = pixel[2] as f32 / 255.0;
-                planes[(w * h) + i] = pixel[1] as f32 / 255.0;
-                planes[(w * h * 2) + i] = pixel[0] as f32 / 255.0;
+                planes[i] = ((pixel[2] as f32 / 255.0) - channel_mean[0]) / channel_stddev[0];
+                planes[(w * h) + i] =
+                    ((pixel[1] as f32 / 255.0) - channel_mean[1]) / channel_stddev[1];
+                planes[(w * h * 2) + i] =
+                    ((pixel[0] as f32 / 255.0) - channel_mean[2]) / channel_stddev[2];
             }
         }
         _ => todo!("unsupported color type"),
@@ -1397,7 +1399,11 @@ fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     // TODO: this does not give the same results as PIL =/
     canvas.draw_image_with_sampling_options(image, (0, 0), CubicResampler::catmull_rom(), None);
     let pixmap = surface.peek_pixels().unwrap();
-    let values = pixmap_as_planes(pixmap);
+    let values = pixmap_as_planes(
+        pixmap,
+        &[0.48145466, 0.4578275, 0.40821073],
+        &[0.26862954, 0.26130258, 0.27577711],
+    );
     println!("{:>7.4?}", values);
     let snap = surface.image_snapshot();
     let context = surface.direct_context();
