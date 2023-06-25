@@ -25,12 +25,14 @@ use core::{
 };
 use memmap2::Mmap;
 use sentencepiece::SentencePieceProcessor;
-use skia_bindings::SkFilterMode;
+use skia_bindings::{SkAlphaType, SkFilterMode, SkMipmapMode};
 use skia_safe::{
-    paint::Style, Canvas, Color, CubicResampler, Data, EncodedImageFormat, Font, FontStyle, Image,
-    Paint, SamplingOptions, Surface, Typeface,
+    paint::Style, Canvas, Color, ColorSpace, ColorType, CubicResampler, Data, EncodedImageFormat,
+    Font, FontStyle, Image, ImageFilter, ImageInfo, Paint, Pixmap, Rect, SamplingOptions, Surface,
+    Typeface,
 };
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
+use tensor::TensorLayout;
 use util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
 use wayland::{ISkiaPaint, SurfaceClient};
 
@@ -1351,25 +1353,52 @@ fn resize_dims(src_height: i32, src_width: i32, target_size: i32) -> (i32, i32) 
     }
 }
 
+fn pixmap_as_planes(pixmap: Pixmap) -> Tensor<f32> {
+    let dims = pixmap.dimensions();
+    let (w, h) = (dims.width as usize, dims.height as usize);
+    let mut planes = vec![0.0f32; h * w * 3];
+    match pixmap.color_type() {
+        // god's one correct pixel format. the goat
+        skia_safe::ColorType::BGRA8888 => {
+            for (i, pixel) in pixmap.pixels::<[u8; 4]>().unwrap().iter().enumerate() {
+                planes[i] = pixel[2] as f32 / 255.0;
+                planes[(w * h) + i] = pixel[1] as f32 / 255.0;
+                planes[(w * h * 2) + i] = pixel[0] as f32 / 255.0;
+            }
+        }
+        _ => todo!("unsupported color type"),
+    }
+    Tensor::from_vec(planes, TensorLayout::row_major(&[3, h, w]))
+}
+
 fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let model = PickledModel::load_file(path, None)?;
     let image = load_image_eager("/home/eiz/clip_test.jpg")?;
     let pixdims = image.dimensions();
     let (new_height, new_width) = resize_dims(pixdims.height, pixdims.width, 224);
-    let mut surface = Surface::new_raster_n32_premul((224, 224)).unwrap();
+    let mut surface = Surface::new_raster(
+        &ImageInfo::new(
+            (224, 224),
+            ColorType::BGRA8888,
+            SkAlphaType::Premul,
+            ColorSpace::new_srgb(),
+        ),
+        0,
+        None,
+    )
+    .unwrap();
     let canvas = surface.canvas();
-
+    canvas.translate((-((new_width - 224) / 2), -((new_height - 224) / 2)));
     canvas.scale((
         new_width as f32 / pixdims.width as f32,
         new_height as f32 / pixdims.height as f32,
     ));
-    canvas.draw_image_with_sampling_options(
-        image,
-        (-((new_width - 224) / 2), -((new_height - 224) / 2)),
-        CubicResampler::catmull_rom(),
-        None,
-    );
+    // TODO: this does not give the same results as PIL =/
+    canvas.draw_image_with_sampling_options(image, (0, 0), CubicResampler::catmull_rom(), None);
+    let pixmap = surface.peek_pixels().unwrap();
+    let values = pixmap_as_planes(pixmap);
+    println!("{:>7.4?}", values);
     let snap = surface.image_snapshot();
     let context = surface.direct_context();
     let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
