@@ -191,6 +191,9 @@ pub trait CommonKernels {
     fn embed(
         &self, output: &mut TensorViewMut<f16>, tokens: TensorView<i32>, embed: TensorView<f16>,
     ) -> anyhow::Result<()>;
+    fn fp32_to_fp16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f32>,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct MatmulTracer {
@@ -279,6 +282,11 @@ impl CommonKernels for MatmulTracer {
     ) -> anyhow::Result<()> {
         self.kernels.embed(output, tokens, embed)
     }
+    fn fp32_to_fp16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f32>,
+    ) -> anyhow::Result<()> {
+        self.kernels.fp32_to_fp16(output, input)
+    }
 }
 
 pub struct GpuKernels {
@@ -348,11 +356,13 @@ pub struct GpuKernels {
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
     embed: Kernel<(*mut f16, *const i32, i32, i32, *const f16)>,
+    fp32_to_fp16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor)>,
 }
 
 impl GpuKernels {
     pub fn new(capability: i32) -> anyhow::Result<Self> {
         let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
+        let module_convert = HipModule::find(capability, adrastea_kernels::convert)?;
         let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
         let module_rms_norm = HipModule::find(capability, adrastea_kernels::rms_norm)?;
         let module_rotary = HipModule::find(capability, adrastea_kernels::rotary)?;
@@ -373,8 +383,10 @@ impl GpuKernels {
             )?,
             softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
             embed: Kernel::new(&module_embed, "embed")?,
+            fp32_to_fp16: Kernel::new(&module_convert, "fp32_to_fp16")?,
             _modules: vec![
                 module_conv1d,
+                module_convert,
                 module_layer_norm,
                 module_rms_norm,
                 module_rotary,
@@ -718,6 +730,29 @@ impl CommonKernels for GpuKernels {
                 output.size(-2) as i32,
                 embed.as_gpu_ptr(),
             ),
+        )?;
+        Ok(())
+    }
+
+    fn fp32_to_fp16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f32>,
+    ) -> anyhow::Result<()> {
+        self.fp32_to_fp16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u32, 32),
+                    if output.layout().dims.len() > 1 {
+                        ceil_div(output.size(-2) as u32, 32)
+                    } else {
+                        1
+                    },
+                    1,
+                ),
+                threads: (32, 32, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (output.into(), input.into()),
         )?;
         Ok(())
     }

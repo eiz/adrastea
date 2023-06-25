@@ -58,6 +58,7 @@ use crate::{
 extern crate alloc;
 
 pub mod audio;
+pub mod clip;
 pub mod kernels;
 pub mod llama;
 pub mod mel;
@@ -1335,85 +1336,6 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {
-    let file = File::open(path)?;
-    let map = unsafe { Mmap::map(&file)? };
-    let data = unsafe { Data::new_bytes(&map) };
-    Ok(Image::from_encoded(data)
-        .ok_or_else(|| anyhow::anyhow!("failed to load image"))?
-        .to_raster_image(None)
-        .ok_or_else(|| anyhow::anyhow!("failed to load image"))?)
-}
-
-fn resize_dims(src_height: i32, src_width: i32, target_size: i32) -> (i32, i32) {
-    if src_height <= src_width {
-        (target_size, (target_size as f32 * src_width as f32 / src_height as f32) as i32)
-    } else {
-        ((target_size as f32 * src_height as f32 / src_width as f32) as i32, target_size)
-    }
-}
-
-fn pixmap_as_planes(pixmap: Pixmap, channel_mean: &[f32], channel_stddev: &[f32]) -> Tensor<f32> {
-    let dims = pixmap.dimensions();
-    let (w, h) = (dims.width as usize, dims.height as usize);
-    let mut planes = vec![0.0f32; h * w * 3];
-    match pixmap.color_type() {
-        // god's one correct pixel format. the goat
-        skia_safe::ColorType::BGRA8888 => {
-            for (i, pixel) in pixmap.pixels::<[u8; 4]>().unwrap().iter().enumerate() {
-                planes[i] = ((pixel[2] as f32 / 255.0) - channel_mean[0]) / channel_stddev[0];
-                planes[(w * h) + i] =
-                    ((pixel[1] as f32 / 255.0) - channel_mean[1]) / channel_stddev[1];
-                planes[(w * h * 2) + i] =
-                    ((pixel[0] as f32 / 255.0) - channel_mean[2]) / channel_stddev[2];
-            }
-        }
-        _ => todo!("unsupported color type"),
-    }
-    Tensor::from_vec(planes, TensorLayout::row_major(&[3, h, w]))
-}
-
-fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
-    let path = path.as_ref();
-    let model = PickledModel::load_file(path, None)?;
-    let image = load_image_eager("/home/eiz/clip_test.jpg")?;
-    let pixdims = image.dimensions();
-    let (new_height, new_width) = resize_dims(pixdims.height, pixdims.width, 224);
-    let mut surface = Surface::new_raster(
-        &ImageInfo::new(
-            (224, 224),
-            ColorType::BGRA8888,
-            SkAlphaType::Premul,
-            ColorSpace::new_srgb(),
-        ),
-        0,
-        None,
-    )
-    .unwrap();
-    let canvas = surface.canvas();
-    canvas.translate((-((new_width - 224) / 2), -((new_height - 224) / 2)));
-    canvas.scale((
-        new_width as f32 / pixdims.width as f32,
-        new_height as f32 / pixdims.height as f32,
-    ));
-    // TODO: this does not give the same results as PIL =/
-    canvas.draw_image_with_sampling_options(image, (0, 0), CubicResampler::catmull_rom(), None);
-    let pixmap = surface.peek_pixels().unwrap();
-    let values = pixmap_as_planes(
-        pixmap,
-        &[0.48145466, 0.4578275, 0.40821073],
-        &[0.26862954, 0.26130258, 0.27577711],
-    );
-    println!("{:>7.4?}", values);
-    let snap = surface.image_snapshot();
-    let context = surface.direct_context();
-    let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
-    let mut f = File::create("/home/eiz/clip_crop.png")?;
-    f.write_all(data.as_bytes()).unwrap();
-
-    todo!();
-}
-
 fn main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
@@ -1449,7 +1371,7 @@ fn main() -> anyhow::Result<()> {
     } else if args.len() >= 3 && args[1] == "llama" {
         llama_test(&args[2])?
     } else if args.len() >= 3 && args[1] == "clip" {
-        clip_test(&args[2])?
+        clip::clip_test(&args[2])?
     } else {
         println!("test commands: cuda, hip, load, wav, vulkan, microbenchmark, audio, wayland, skia, combined, llama, clip");
     }
@@ -1509,11 +1431,5 @@ mod tests {
         let initial = iota(256);
         let reshaped = initial.as_view().shape_cast(&[16, 1]);
         println!("{:?}", reshaped);
-    }
-
-    #[test]
-    fn resize_dims_works() {
-        assert_eq!(super::resize_dims(480, 640, 224), (224, 298));
-        assert_eq!(super::resize_dims(640, 480, 224), (298, 224));
     }
 }

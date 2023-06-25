@@ -238,7 +238,9 @@ impl PickledModel<()> {
     }
 }
 
-pub fn load_tensor<T>(pickled: &PickledModel<T>, name: &str) -> anyhow::Result<Tensor<f16>> {
+pub fn load_tensor<T, N: Copy + Default>(
+    pickled: &PickledModel<T>, name: &str,
+) -> anyhow::Result<Tensor<N>> {
     let pickled_tensor =
         pickled.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
     let mut tensor =

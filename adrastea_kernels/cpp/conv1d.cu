@@ -12,38 +12,6 @@ struct GeluActivation {
   }
 };
 
-// tryin something out here
-// low 3 bits of ptr = n_dims
-// strides/shape are in reverse order (the dimension normally known as width is shape[0])
-template <typename T>
-struct TensorView {
-  uint64_t ptr;
-  uint32_t shape[7];
-  uint32_t strides[7];
-
-  __device__ __forceinline__ T* as_ptr() { return reinterpret_cast<T*>(ptr & ~7); }
-  __device__ __forceinline__ size_t n_dims() { return ptr & 7; }
-
-  // traditional NCHW dimension names
-  __device__ __forceinline__ uint32_t width() { return shape[0]; }
-  __device__ __forceinline__ uint32_t height() { return shape[1]; }
-  __device__ __forceinline__ uint32_t channels() { return shape[2]; }
-  __device__ __forceinline__ uint32_t batches() { return shape[3]; }
-
-  __device__ __forceinline__ T& operator()(uint32_t x) { return as_ptr()[x * strides[0]]; }
-  __device__ __forceinline__ T& operator()(uint32_t y, uint32_t x) {
-    return as_ptr()[y * strides[1] + x * strides[0]];
-  }
-  __device__ __forceinline__ T& operator()(uint32_t c, uint32_t y, uint32_t x) {
-    return as_ptr()[c * strides[2] + y * strides[1] + x * strides[0]];
-  }
-  __device__ __forceinline__ T& operator()(uint32_t n, uint32_t c, uint32_t y, uint32_t x) {
-    return as_ptr()[n * strides[3] + c * strides[2] + y * strides[1] + x * strides[0]];
-  }
-};
-
-using TensorViewF16 = TensorView<__half>;
-
 // literally the slowest possible conv1d implementation. reference.
 template <typename Activation>
 __device__ void conv1d(TensorViewF16 output,
@@ -80,5 +48,54 @@ extern "C" __global__ void conv1d(TensorViewF16 output,
     conv1d<IdentityActivation>(output, input, weights, bias, stride, padding);
   } else if (activation == GELU) {
     conv1d<GeluActivation>(output, input, weights, bias, stride, padding);
+  }
+}
+
+// broken kernel
+template <typename Activation>
+__device__ void conv2d(TensorViewF16 output,
+                       TensorViewF16 input,
+                       TensorViewF16 weights,
+                       TensorViewF16 bias,
+                       int stride_x,
+                       int stride_y,
+                       int padding_x,
+                       int padding_y) {
+  Activation activation;
+  int ox = BLOCK_IDX_X * BLOCK_DIM_X + THREAD_IDX_X;
+  int oy = BLOCK_IDX_Y * BLOCK_DIM_Y + THREAD_IDX_Y;
+  int oc = BLOCK_IDX_Z * BLOCK_DIM_Z + THREAD_IDX_Z;
+  if (oc >= output.channels() || oy >= output.height() || ox >= output.width()) {
+    return;
+  }
+  float sum = __half2float(bias(oc));
+  int start_x = ox * stride_x - padding_x;
+  int end_x = start_x + weights.width();
+  int start_y = oy * stride_y - padding_y;
+  int end_y = start_y + weights.height();
+  for (int c_in = 0; c_in < input.channels(); ++c_in) {
+    for (int y = max(0, start_y); y < min(input.height(), end_y); ++y) {
+      for (int x = max(0, start_x); x < min(input.width(), end_x); ++x) {
+        sum += __half2float(input(c_in, y, x) * weights(oy, c_in, y - start_y, x - start_x));
+      }
+    }
+  }
+  output(oc, oy, ox) = activation(sum);
+}
+
+extern "C" __global__ void conv2d(TensorViewF16 output,
+                                  TensorViewF16 input,
+                                  TensorViewF16 weights,
+                                  TensorViewF16 bias,
+                                  int stride_x,
+                                  int stride_y,
+                                  int padding_x,
+                                  int padding_y,
+                                  ActivationType activation) {
+  if (activation == IDENTITY) {
+    conv2d<IdentityActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
+                               padding_y);
+  } else if (activation == GELU) {
+    conv2d<GeluActivation>(output, input, weights, bias, stride_x, stride_y, padding_x, padding_y);
   }
 }
