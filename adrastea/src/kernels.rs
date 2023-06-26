@@ -148,9 +148,14 @@ pub trait CommonKernels {
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, stride: i32, padding: i32, activation: Conv1dActivation,
     ) -> anyhow::Result<()>;
-    fn conv2d(
+    fn conv2d_f16(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()>;
+    fn conv2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, weight: &TensorView<f32>,
+        bias: &TensorView<f32>, stride: (i32, i32), padding: (i32, i32),
         activation: Conv1dActivation,
     ) -> anyhow::Result<()>;
     fn elementwise_binary_2d_f16_inplace(
@@ -184,6 +189,12 @@ pub trait CommonKernels {
     fn fp32_to_fp16(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f32>,
     ) -> anyhow::Result<()>;
+    fn error_stats_f16(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f16>, rhs: &TensorView<f16>,
+    ) -> anyhow::Result<()>;
+    fn error_stats_f32(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f32>, rhs: &TensorView<f32>,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct MatmulTracer {
@@ -212,14 +223,20 @@ impl CommonKernels for MatmulTracer {
     ) -> anyhow::Result<()> {
         self.kernels.conv1d(output, input, weight, bias, stride, padding, activation)
     }
-    fn conv2d(
+    fn conv2d_f16(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
         activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
-        self.kernels.conv2d(output, input, weight, bias, stride, padding, activation)
+        self.kernels.conv2d_f16(output, input, weight, bias, stride, padding, activation)
     }
-
+    fn conv2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, weight: &TensorView<f32>,
+        bias: &TensorView<f32>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.kernels.conv2d_f32(output, input, weight, bias, stride, padding, activation)
+    }
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()> {
@@ -285,6 +302,16 @@ impl CommonKernels for MatmulTracer {
     ) -> anyhow::Result<()> {
         self.kernels.fp32_to_fp16(output, input)
     }
+    fn error_stats_f16(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f16>, rhs: &TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        self.kernels.error_stats_f16(output, lhs, rhs)
+    }
+    fn error_stats_f32(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f32>, rhs: &TensorView<f32>,
+    ) -> anyhow::Result<()> {
+        self.kernels.error_stats_f32(output, lhs, rhs)
+    }
 }
 
 pub struct GpuKernels {
@@ -298,7 +325,18 @@ pub struct GpuKernels {
         i32,
         i32,
     )>,
-    conv2d: Kernel<(
+    conv2d_f16: Kernel<(
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+    )>,
+    conv2d_f32: Kernel<(
         TensorGpuDescriptor,
         TensorGpuDescriptor,
         TensorGpuDescriptor,
@@ -366,6 +404,8 @@ pub struct GpuKernels {
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
     embed: Kernel<(*mut f16, *const i32, i32, i32, *const f16)>,
     fp32_to_fp16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor)>,
+    error_stats_f16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor, TensorGpuDescriptor)>,
+    error_stats_f32: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor, TensorGpuDescriptor)>,
 }
 
 impl GpuKernels {
@@ -379,9 +419,11 @@ impl GpuKernels {
         let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
         let module_softmax_rows = HipModule::find(capability, adrastea_kernels::softmax_rows)?;
         let module_embed = HipModule::find(capability, adrastea_kernels::embed)?;
+        let module_error_stats = HipModule::find(capability, adrastea_kernels::error_stats)?;
         let kernels = GpuKernels {
             conv1d: Kernel::new(&module_conv1d, "conv1d")?,
-            conv2d: Kernel::new(&module_conv1d, "conv2d")?,
+            conv2d_f16: Kernel::new(&module_conv1d, "conv2d_f16")?,
+            conv2d_f32: Kernel::new(&module_conv1d, "conv2d_f32")?,
             layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
             rms_norm: Kernel::new(&module_rms_norm, "rms_norm")?,
             rotary: Kernel::new(&module_rotary, "rotary")?,
@@ -394,6 +436,8 @@ impl GpuKernels {
             softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
             embed: Kernel::new(&module_embed, "embed")?,
             fp32_to_fp16: Kernel::new(&module_convert, "fp32_to_fp16")?,
+            error_stats_f16: Kernel::new(&module_error_stats, "error_stats_f16")?,
+            error_stats_f32: Kernel::new(&module_error_stats, "error_stats_f32")?,
             _modules: vec![
                 module_conv1d,
                 module_convert,
@@ -404,6 +448,7 @@ impl GpuKernels {
                 module_matmul,
                 module_softmax_rows,
                 module_embed,
+                module_error_stats,
             ],
         };
         Ok(kernels)
@@ -439,12 +484,43 @@ impl CommonKernels for GpuKernels {
         Ok(())
     }
 
-    fn conv2d(
+    fn conv2d_f16(
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
         activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
-        self.conv2d.launch(
+        self.conv2d_f16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    ceil_div(output.size(-3) as u64, 4) as u32,
+                ),
+                threads: (16, 16, 4),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.into(),
+                input.into(),
+                weight.into(),
+                bias.into(),
+                stride.0,
+                stride.1,
+                padding.0,
+                padding.1,
+                activation as i32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn conv2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, weight: &TensorView<f32>,
+        bias: &TensorView<f32>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.conv2d_f32.launch(
             LaunchParams {
                 blocks: (
                     ceil_div(output.size(-1) as u64, 16) as u32,
@@ -794,6 +870,42 @@ impl CommonKernels for GpuKernels {
                 stream: None,
             },
             (output.into(), input.into()),
+        )?;
+        Ok(())
+    }
+
+    fn error_stats_f16(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f16>, rhs: &TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        let lhs = lhs.shape_cast(&[-1]);
+        let rhs = rhs.shape_cast(&[-1]);
+        assert_eq!(lhs.size(-1), rhs.size(-1));
+        self.error_stats_f16.launch(
+            LaunchParams {
+                blocks: (ceil_div(lhs.size(-1) as u32, 1024), 1, 1),
+                threads: (1024, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (output.into(), (&lhs).into(), (&rhs).into()),
+        )?;
+        Ok(())
+    }
+
+    fn error_stats_f32(
+        &self, output: &mut TensorViewMut<f32>, lhs: &TensorView<f32>, rhs: &TensorView<f32>,
+    ) -> anyhow::Result<()> {
+        let lhs = lhs.shape_cast(&[-1]);
+        let rhs = rhs.shape_cast(&[-1]);
+        assert_eq!(lhs.size(-1), rhs.size(-1));
+        self.error_stats_f16.launch(
+            LaunchParams {
+                blocks: (ceil_div(lhs.size(-1) as u32, 1024), 1, 1),
+                threads: (1024, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (output.into(), (&lhs).into(), (&rhs).into()),
         )?;
         Ok(())
     }

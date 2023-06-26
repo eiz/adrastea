@@ -63,3 +63,41 @@ struct TensorView {
 };
 using TensorViewF16 = TensorView<__half>;
 using TensorViewF32 = TensorView<float>;
+
+namespace iter {
+struct stack_frame {
+  int dim_idx;
+  int idx;
+};
+}  // namespace iter
+
+template <typename T, typename Fn>
+__device__ __forceinline__ void iter_dims(TensorView<T>& tv, Fn fn, int atom_dim = 0) {
+  iter::stack_frame dim_stack[7];
+  iter::stack_frame* bos = &dim_stack[7];
+  iter::stack_frame* tos = &dim_stack[6];
+  tos->dim_idx = tv.dims - 1;
+  tos->idx = 0;
+#define POP()        \
+  do {               \
+    tos++;           \
+    if (tos < bos) { \
+      tos->idx++;    \
+    }                \
+  } while (0)
+  while (tos < bos) {
+    if (tos->dim_idx <= atom_dim) {
+      fn(bos, tos);
+      POP();
+    } else {
+      if (tos->idx >= tv.shape[tos->dim_idx]) {
+        POP();
+        continue;
+      }
+      tos--;
+      tos->dim_idx = tos[1].dim_idx - 1;
+      tos->idx = 0;
+    }
+  }
+#undef POP
+}

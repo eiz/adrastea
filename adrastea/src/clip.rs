@@ -132,7 +132,8 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let mut patch_embeds = Tensor::new_hip(&[1024, 16, 16])?;
     let zero_bias = Tensor::new_hip(&[1024])?;
     println!("values {:>7.4?}", values);
-    kernels.conv2d(
+    println!("patch_embedding {:?}", vt.patch_embedding.layout());
+    kernels.conv2d_f16(
         &mut patch_embeds.as_view_mut(),
         &values.as_view(),
         &vt.patch_embedding.as_view(),
@@ -147,9 +148,54 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+    use simt_hip::{HipDevice, HipPhysicalDevice};
+
+    use crate::{
+        kernels::{CommonKernels, GpuKernels},
+        pickle::{load_tensor, PickledModel},
+        tensor::Tensor,
+    };
+
     #[test]
     fn resize_dims_works() {
         assert_eq!(super::resize_dims(480, 640, 224), (224, 298));
         assert_eq!(super::resize_dims(640, 480, 224), (298, 224));
+    }
+
+    #[test]
+    fn conv2d_matches_pytorch() -> anyhow::Result<()> {
+        let phys = HipPhysicalDevice::get(0)?;
+        let device = Arc::new(HipDevice::new(phys)?);
+        let _scope = device.lock()?;
+        let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
+        let model = PickledModel::load_file("/tmp/clip_tests.pt", None)?;
+        let pixel_values: Tensor<f32> = load_tensor(&model, "clip.conv2d.pixel_values")?;
+        let weight: Tensor<f32> = load_tensor(&model, "clip.conv2d.weight")?;
+        let expected_result: Tensor<f32> = load_tensor(&model, "clip.conv2d.result")?;
+        let mut actual_result = Tensor::new_hip(&[1024, 16, 16])?;
+        let mut err_stats_gpu = Tensor::new_hip(&[3])?;
+        let bias = Tensor::new_hip(&[1024])?;
+        kernels.conv2d_f32(
+            &mut actual_result.as_view_mut(),
+            &pixel_values.as_view(),
+            &weight.as_view(),
+            &bias.as_view(),
+            (14, 14),
+            (0, 0),
+            crate::kernels::Conv1dActivation::None,
+        )?;
+        kernels.error_stats_f32(
+            &mut err_stats_gpu.as_view_mut(),
+            &actual_result.as_view(),
+            &expected_result.as_view(),
+        )?;
+        let err_stats = err_stats_gpu.into_cpu()?;
+        let err_stats = err_stats.storage().as_cpu();
+        println!("expected result {:>7.4?}", expected_result);
+        println!("actual result {:>7.4?}", actual_result);
+        println!("err_stats {:?}", err_stats);
+        assert!(err_stats[0] < 0.001);
+        Ok(())
     }
 }

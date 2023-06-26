@@ -63,6 +63,7 @@ fn main() {
         "elementwise",
         "embed",
         "embed_uint8",
+        "error_stats",
         "layer_norm",
         "matmul",
         "matmul_nt_fp16u8",

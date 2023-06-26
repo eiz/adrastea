@@ -52,11 +52,11 @@ extern "C" __global__ void conv1d(TensorViewF16 output,
 }
 
 // broken kernel
-template <typename Activation>
-__device__ void conv2d(TensorViewF16 output,
-                       TensorViewF16 input,
-                       TensorViewF16 weights,
-                       TensorViewF16 bias,
+template <typename T, typename Activation>
+__device__ void conv2d(TensorView<T> output,
+                       TensorView<T> input,
+                       TensorView<T> weights,
+                       TensorView<T> bias,
                        int stride_x,
                        int stride_y,
                        int padding_x,
@@ -68,7 +68,7 @@ __device__ void conv2d(TensorViewF16 output,
   if (oc >= output.channels() || oy >= output.height() || ox >= output.width()) {
     return;
   }
-  float sum = __half2float(bias(oc));
+  float sum = float(bias(oc));
   int start_x = ox * stride_x - padding_x;
   int end_x = start_x + weights.width();
   int start_y = oy * stride_y - padding_y;
@@ -76,26 +76,45 @@ __device__ void conv2d(TensorViewF16 output,
   for (int c_in = 0; c_in < input.channels(); ++c_in) {
     for (int y = max(0, start_y); y < min(input.height(), end_y); ++y) {
       for (int x = max(0, start_x); x < min(input.width(), end_x); ++x) {
-        sum += __half2float(input(c_in, y, x) * weights(oy, c_in, y - start_y, x - start_x));
+        sum += float(input(c_in, y, x) * weights(oy, c_in, y - start_y, x - start_x));
       }
     }
   }
   output(oc, oy, ox) = activation(sum);
 }
 
-extern "C" __global__ void conv2d(TensorViewF16 output,
-                                  TensorViewF16 input,
-                                  TensorViewF16 weights,
-                                  TensorViewF16 bias,
-                                  int stride_x,
-                                  int stride_y,
-                                  int padding_x,
-                                  int padding_y,
-                                  ActivationType activation) {
+extern "C" __global__ void conv2d_f16(TensorViewF16 output,
+                                      TensorViewF16 input,
+                                      TensorViewF16 weights,
+                                      TensorViewF16 bias,
+                                      int stride_x,
+                                      int stride_y,
+                                      int padding_x,
+                                      int padding_y,
+                                      ActivationType activation) {
   if (activation == IDENTITY) {
-    conv2d<IdentityActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
-                               padding_y);
+    conv2d<half, IdentityActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
+                                     padding_y);
   } else if (activation == GELU) {
-    conv2d<GeluActivation>(output, input, weights, bias, stride_x, stride_y, padding_x, padding_y);
+    conv2d<half, GeluActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
+                                 padding_y);
+  }
+}
+
+extern "C" __global__ void conv2d_f32(TensorViewF32 output,
+                                      TensorViewF32 input,
+                                      TensorViewF32 weights,
+                                      TensorViewF32 bias,
+                                      int stride_x,
+                                      int stride_y,
+                                      int padding_x,
+                                      int padding_y,
+                                      ActivationType activation) {
+  if (activation == IDENTITY) {
+    conv2d<float, IdentityActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
+                                      padding_y);
+  } else if (activation == GELU) {
+    conv2d<float, GeluActivation>(output, input, weights, bias, stride_x, stride_y, padding_x,
+                                  padding_y);
   }
 }
