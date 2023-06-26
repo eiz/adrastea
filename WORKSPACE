@@ -14,11 +14,11 @@ py_repositories()
 load("@rules_python//python:repositories.bzl", "python_register_toolchains")
 
 python_register_toolchains(
-    name = "python3_9",
-    python_version = "3.9",
+    name = "python3_11",
+    python_version = "3.11",
 )
 
-load("@python3_9//:defs.bzl", "interpreter")
+load("@python3_11//:defs.bzl", "interpreter")
 
 load("@rules_python//python:pip.bzl", "pip_parse")
 
