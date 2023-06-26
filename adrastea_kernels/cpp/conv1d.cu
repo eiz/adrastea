@@ -76,7 +76,7 @@ __device__ void conv2d(TensorView<T> output,
   for (int c_in = 0; c_in < input.channels(); ++c_in) {
     for (int y = max(0, start_y); y < min(input.height(), end_y); ++y) {
       for (int x = max(0, start_x); x < min(input.width(), end_x); ++x) {
-        sum += float(input(c_in, y, x) * weights(oy, c_in, y - start_y, x - start_x));
+        sum += float(input(c_in, y, x) * weights(oc, c_in, y - start_y, x - start_x));
       }
     }
   }

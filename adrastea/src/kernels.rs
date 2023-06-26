@@ -882,7 +882,7 @@ impl CommonKernels for GpuKernels {
         assert_eq!(lhs.size(-1), rhs.size(-1));
         self.error_stats_f16.launch(
             LaunchParams {
-                blocks: (ceil_div(lhs.size(-1) as u32, 1024), 1, 1),
+                blocks: (128, 1, 1),
                 threads: (1024, 1, 1),
                 shared_mem: 0,
                 stream: None,
@@ -898,9 +898,9 @@ impl CommonKernels for GpuKernels {
         let lhs = lhs.shape_cast(&[-1]);
         let rhs = rhs.shape_cast(&[-1]);
         assert_eq!(lhs.size(-1), rhs.size(-1));
-        self.error_stats_f16.launch(
+        self.error_stats_f32.launch(
             LaunchParams {
-                blocks: (ceil_div(lhs.size(-1) as u32, 1024), 1, 1),
+                blocks: (128, 1, 1),
                 threads: (1024, 1, 1),
                 shared_mem: 0,
                 stream: None,
