@@ -5,35 +5,19 @@ use parking_lot::Mutex;
 use simt_hip::{HipModule, Kernel, KernelParam, LaunchParams};
 
 use crate::{
-    tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
+    tensor::{TensorLayout, TensorView, TensorViewMut},
     util::ceil_div,
 };
 
-fn encode_ptr(data: *mut c_void, n_dims: usize) -> u64 {
-    let mut ptr = data as u64;
-    assert!(n_dims <= 7);
-    assert!(ptr & 0x7 == 0);
-    ptr |= n_dims as u64;
-    ptr
-}
-
 #[repr(C)]
 pub struct TensorGpuDescriptor {
-    pub ptr: u64,
+    pub ptr: *mut c_void,
+    pub dims: u32,
     pub shape: [u32; 7],
     pub strides: [u32; 7],
 }
 
 impl KernelParam for TensorGpuDescriptor {}
-
-impl TensorGpuDescriptor {
-    pub fn as_gpu_ptr(&self) -> *mut c_void {
-        (self.ptr & !0x7) as *mut c_void
-    }
-    pub fn n_dims(&self) -> usize {
-        (self.ptr & 0x7) as usize
-    }
-}
 
 impl<T: Copy> From<&TensorView<'_, T>> for TensorGpuDescriptor {
     fn from(tensor: &TensorView<T>) -> Self {
@@ -46,7 +30,8 @@ impl<T: Copy> From<&TensorView<'_, T>> for TensorGpuDescriptor {
             strides[i] = stride as u32;
         }
         Self {
-            ptr: encode_ptr(tensor.as_gpu_ptr() as *const _ as *mut _, tensor.layout().dims.len()),
+            ptr: tensor.as_gpu_ptr() as *const _ as *mut _,
+            dims: tensor.layout().dims.len() as u32,
             shape,
             strides,
         }
@@ -163,6 +148,11 @@ pub trait CommonKernels {
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         bias: &TensorView<f16>, stride: i32, padding: i32, activation: Conv1dActivation,
     ) -> anyhow::Result<()>;
+    fn conv2d(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()>;
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()>;
@@ -222,6 +212,14 @@ impl CommonKernels for MatmulTracer {
     ) -> anyhow::Result<()> {
         self.kernels.conv1d(output, input, weight, bias, stride, padding, activation)
     }
+    fn conv2d(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.kernels.conv2d(output, input, weight, bias, stride, padding, activation)
+    }
+
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()> {
@@ -300,6 +298,17 @@ pub struct GpuKernels {
         i32,
         i32,
     )>,
+    conv2d: Kernel<(
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        TensorGpuDescriptor,
+        i32,
+        i32,
+        i32,
+        i32,
+        i32,
+    )>,
     layer_norm:
         Kernel<(*mut f16, *const f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
     rms_norm: Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
@@ -372,6 +381,7 @@ impl GpuKernels {
         let module_embed = HipModule::find(capability, adrastea_kernels::embed)?;
         let kernels = GpuKernels {
             conv1d: Kernel::new(&module_conv1d, "conv1d")?,
+            conv2d: Kernel::new(&module_conv1d, "conv2d")?,
             layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
             rms_norm: Kernel::new(&module_rms_norm, "rms_norm")?,
             rotary: Kernel::new(&module_rotary, "rotary")?,
@@ -408,7 +418,7 @@ impl CommonKernels for GpuKernels {
         self.conv1d.launch(
             LaunchParams {
                 blocks: (
-                    ceil_div(input.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-1) as u64, 16) as u32,
                     ceil_div(output.size(-2) as u64, 16) as u32,
                     1,
                 ),
@@ -423,6 +433,37 @@ impl CommonKernels for GpuKernels {
                 bias.into(),
                 stride,
                 padding,
+                activation as i32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn conv2d(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
+        bias: &TensorView<f16>, stride: (i32, i32), padding: (i32, i32),
+        activation: Conv1dActivation,
+    ) -> anyhow::Result<()> {
+        self.conv2d.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1) as u64, 16) as u32,
+                    ceil_div(output.size(-2) as u64, 16) as u32,
+                    ceil_div(output.size(-3) as u64, 4) as u32,
+                ),
+                threads: (16, 16, 4),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.into(),
+                input.into(),
+                weight.into(),
+                bias.into(),
+                stride.0,
+                stride.1,
+                padding.0,
+                padding.1,
                 activation as i32,
             ),
         )?;

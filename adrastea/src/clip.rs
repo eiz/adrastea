@@ -15,6 +15,8 @@ use crate::{
     tensor::{Tensor, TensorLayout},
 };
 
+// this implements the 🤗 version of CLIP
+
 fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Tensor<f16>> {
     let mut output = Tensor::new_hip_layout(tensor.layout().clone())?;
     kernels.fp32_to_fp16(&mut output.as_view_mut(), &tensor.as_view())?;
@@ -111,20 +113,35 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     // TODO: this does not give the same results as PIL =/
     canvas.draw_image_with_sampling_options(image, (0, 0), CubicResampler::catmull_rom(), None);
     let pixmap = surface.peek_pixels().unwrap();
-    let values = pixmap_as_planes(
-        pixmap,
-        &[0.48145466, 0.4578275, 0.40821073],
-        &[0.26862954, 0.26130258, 0.27577711],
-    );
+    let values = to_f16(
+        &*kernels,
+        pixmap_as_planes(
+            pixmap,
+            &[0.48145466, 0.4578275, 0.40821073],
+            &[0.26862954, 0.26130258, 0.27577711],
+        )
+        .into_hip()?,
+    )?;
     println!("{:>7.4?}", values);
     let snap = surface.image_snapshot();
     let context = surface.direct_context();
     let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
     let mut f = File::create("/home/eiz/clip_crop.png")?;
     f.write_all(data.as_bytes()).unwrap();
-    println!("{:#?}", model.tensors);
     let vt = ClipVisionTransformer::new(&model, &*kernels, "vision_model")?;
-
+    let mut patch_embeds = Tensor::new_hip(&[1024, 16, 16])?;
+    let zero_bias = Tensor::new_hip(&[1024])?;
+    println!("values {:>7.4?}", values);
+    kernels.conv2d(
+        &mut patch_embeds.as_view_mut(),
+        &values.as_view(),
+        &vt.patch_embedding.as_view(),
+        &zero_bias.as_view(),
+        (14, 14),
+        (0, 0),
+        crate::kernels::Conv1dActivation::None,
+    )?;
+    println!("patch_embeds {:>7.4?}", patch_embeds);
     todo!();
 }
 
