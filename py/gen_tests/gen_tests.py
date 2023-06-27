@@ -1,4 +1,3 @@
-import code
 from collections import OrderedDict
 import sys
 
@@ -18,6 +17,3 @@ test_cases["clip.conv2d.pixel_values"] = pixel_values
 test_cases["clip.conv2d.weight"] = weight
 test_cases["clip.conv2d.result"] = result
 torch.save(test_cases, sys.argv[1])
-code.interact(local={v:eval(v) for v in dir()})
-print(f"{result}")
-print(f"{sys.argv}")

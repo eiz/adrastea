@@ -143,6 +143,7 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         crate::kernels::Conv1dActivation::None,
     )?;
     println!("patch_embeds {:>7.4?}", patch_embeds);
+    let v_patch_embeds = patch_embeds.as_view().shape_cast(&[1024, 256]).permute(&[1, 0]);
     todo!();
 }
 

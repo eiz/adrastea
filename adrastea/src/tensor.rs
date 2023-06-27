@@ -156,6 +156,15 @@ pub enum TensorStoragePtr<T> {
     Hip(simt_hip_sys::hipDeviceptr_t),
 }
 
+impl<T> TensorStoragePtr<T> {
+    pub fn offset(&self, offset: usize) -> Self {
+        match self {
+            TensorStoragePtr::Cpu(ptr) => TensorStoragePtr::Cpu(unsafe { ptr.add(offset) }),
+            TensorStoragePtr::Hip(ptr) => TensorStoragePtr::Hip(unsafe { ptr.add(offset) }),
+        }
+    }
+}
+
 impl<T> Copy for TensorStoragePtr<T> {}
 impl<T> Clone for TensorStoragePtr<T> {
     fn clone(&self) -> Self {
@@ -167,6 +176,15 @@ impl<T> Clone for TensorStoragePtr<T> {
 pub enum TensorStoragePtrMut<T> {
     Cpu(*mut T),
     Hip(simt_hip_sys::hipDeviceptr_t),
+}
+
+impl<T> TensorStoragePtrMut<T> {
+    pub fn offset(&self, offset: usize) -> Self {
+        match self {
+            TensorStoragePtrMut::Cpu(ptr) => TensorStoragePtrMut::Cpu(unsafe { ptr.add(offset) }),
+            TensorStoragePtrMut::Hip(ptr) => TensorStoragePtrMut::Hip(unsafe { ptr.add(offset) }),
+        }
+    }
 }
 
 impl<T> Copy for TensorStoragePtrMut<T> {}
@@ -415,6 +433,15 @@ impl<'a, T> TensorView<'a, T> {
         }
     }
 
+    pub fn as_cpu_slice(&self) -> &[T] {
+        match self.ptr {
+            TensorStoragePtr::Hip(_) => panic!("not a cpu tensor"),
+            TensorStoragePtr::Cpu(p) => unsafe {
+                std::slice::from_raw_parts(p, self.layout.largest_address() + 1)
+            },
+        }
+    }
+
     pub fn layout(&self) -> &TensorLayout {
         &self.layout
     }
@@ -433,6 +460,15 @@ impl<'a, T> TensorView<'a, T> {
 
     pub fn shape_cast(&self, shape: &[isize]) -> Self {
         Self { ptr: self.ptr, layout: self.layout.shape_cast(shape), _dead: PhantomData }
+    }
+
+    pub fn skip(&self, dims: &[isize]) -> Self {
+        let (offset, layout) = self.layout.skip(dims);
+        Self { ptr: self.ptr.offset(offset), layout: layout, _dead: PhantomData }
+    }
+
+    pub fn take(&self, dims: &[isize]) -> Self {
+        Self { ptr: self.ptr, layout: self.layout.take(dims), _dead: PhantomData }
     }
 }
 
@@ -469,6 +505,15 @@ impl<'a, T> TensorViewMut<'a, T> {
         }
     }
 
+    pub fn as_cpu_slice(&self) -> &[T] {
+        match self.ptr {
+            TensorStoragePtrMut::Hip(_) => panic!("not a cpu tensor"),
+            TensorStoragePtrMut::Cpu(p) => unsafe {
+                std::slice::from_raw_parts(p, self.layout.largest_address() + 1)
+            },
+        }
+    }
+
     pub fn layout(&self) -> &TensorLayout {
         &self.layout
     }
@@ -488,10 +533,91 @@ impl<'a, T> TensorViewMut<'a, T> {
     pub fn shape_cast(&mut self, shape: &[isize]) -> Self {
         Self { ptr: self.ptr, layout: self.layout.shape_cast(shape), _dead: PhantomData }
     }
+
+    pub fn skip<'b>(&'b mut self, dims: &[isize]) -> TensorViewMut<'b, T> {
+        let (offset, layout) = self.layout.skip(dims);
+        Self { ptr: self.ptr.offset(offset), layout: layout, _dead: PhantomData }
+    }
+
+    pub fn take<'b>(&'b mut self, dims: &[isize]) -> TensorViewMut<'b, T> {
+        Self { ptr: self.ptr, layout: self.layout.take(dims), _dead: PhantomData }
+    }
 }
 
 impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.as_view().fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::tensor::{Tensor, TensorLayout};
+
+    #[test]
+    fn shape_cast() {
+        let tensor = Tensor::from_vec(
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0,
+            ],
+            TensorLayout::row_major(&[4, 4]),
+        );
+
+        println!("{:?}", tensor);
+        println!("");
+        println!("{:>5?}", tensor.as_view().shape_cast(&[-1, 8]));
+    }
+
+    fn iota(n: usize) -> Tensor<i32> {
+        Tensor::from_vec((0..n).map(|x| x as i32).collect(), TensorLayout::row_major(&[n]))
+    }
+
+    #[test]
+    #[should_panic]
+    fn shape_cast_must_preserve_volume() {
+        let initial = iota(256);
+        let reshaped = initial.as_view().shape_cast(&[16, 1]);
+        println!("{:?}", reshaped);
+    }
+
+    #[test]
+    fn skip_and_take() {
+        let mut initial = iota(256);
+        let reshaped = initial.as_view().shape_cast(&[16, 16]);
+        let skipped = reshaped.skip(&[15, 0]);
+        assert_eq!(skipped.size(-2), 1);
+        assert_eq!(skipped.size(-1), 16);
+        assert_eq!(
+            skipped.as_cpu_slice(),
+            &[240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
+        );
+        println!("{:?}", skipped.as_cpu_slice());
+        let skipped = reshaped.skip(&[1, 0]);
+        let taken = skipped.take(&[1, 16]);
+        assert_eq!(taken.size(-2), 1);
+        assert_eq!(taken.size(-1), 16);
+        assert_eq!(
+            taken.as_cpu_slice(),
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        );
+
+        let mut reshaped = initial.as_view_mut().shape_cast(&[16, 16]);
+        let skipped = reshaped.skip(&[15, 0]);
+        assert_eq!(skipped.size(-2), 1);
+        assert_eq!(skipped.size(-1), 16);
+        assert_eq!(
+            skipped.as_cpu_slice(),
+            &[240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255]
+        );
+        println!("{:?}", skipped.as_cpu_slice());
+        let mut skipped = reshaped.skip(&[1, 0]);
+        let taken = skipped.take(&[1, 16]);
+        assert_eq!(taken.size(-2), 1);
+        assert_eq!(taken.size(-1), 16);
+        assert_eq!(
+            taken.as_cpu_slice(),
+            &[16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        );
     }
 }
