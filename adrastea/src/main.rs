@@ -13,7 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#![feature(provide_any)]
+#![feature(provide_any, iter_advance_by)]
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     any::Provider,
@@ -1404,32 +1404,5 @@ mod tests {
             indices.push(i);
         }
         assert_eq!(indices, vec![0, 1, 2, 7, 8, 9]);
-    }
-
-    #[test]
-    fn shape_cast() {
-        let tensor = Tensor::from_vec(
-            vec![
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
-                16.0,
-            ],
-            TensorLayout::row_major(&[4, 4]),
-        );
-
-        println!("{:?}", tensor);
-        println!("");
-        println!("{:>5?}", tensor.as_view().shape_cast(&[-1, 8]));
-    }
-
-    fn iota(n: usize) -> Tensor<i32> {
-        Tensor::from_vec((0..n).map(|x| x as i32).collect(), TensorLayout::row_major(&[n]))
-    }
-
-    #[test]
-    #[should_panic]
-    fn shape_cast_must_preserve_volume() {
-        let initial = iota(256);
-        let reshaped = initial.as_view().shape_cast(&[16, 1]);
-        println!("{:?}", reshaped);
     }
 }

@@ -136,26 +136,42 @@ fn tensors_from_dict(
         if let serde_pickle::HashableValue::String(ref s) = k {
             if s != "_metadata" {
                 let v: PyTensor = serde_pickle::from_value::<PyTensor>(v.clone())?;
-                // TODO: storage offset
-                let (storage, _storage_offset, size, stride, _requires_grad, _backwards_hooks) = v;
+                let (storage, storage_offset, size, stride, _requires_grad, _backwards_hooks) = v;
                 let (_storage, dtype, data_idx, _location, _size) = storage;
-                let tensor_data = filehash
+                let mut tensor_data = filehash
                     .get(&data_idx)
-                    .ok_or_else(|| anyhow::anyhow!("tensor data not found: {}", data_idx))?;
+                    .ok_or_else(|| anyhow::anyhow!("tensor data not found: {}", data_idx))?
+                    .clone();
+                let (dtype, el_size) = match dtype.as_str() {
+                    "float" => (TensorDataType::F32, 4),
+                    "half" => (TensorDataType::F16, 2),
+                    "long" => (TensorDataType::I64, 8),
+                    _ => bail!("unsupported dtype: {}", dtype),
+                };
+                if storage_offset > 0 {
+                    tensor_data
+                        .advance_by(storage_offset as usize * el_size)
+                        .expect("invalid storage offset");
+                }
                 let size = size.iter().map(|x| *x as usize).collect::<Vec<_>>();
                 let stride = stride.iter().map(|x| *x as usize).collect::<Vec<_>>();
+                if size.len() != 0 {
+                    let layout = TensorLayout::new(&size, &stride);
+                    if tensor_data.len() > (layout.largest_address() + 1) * el_size {
+                        tensor_data
+                            .advance_back_by(
+                                tensor_data.len() - (layout.largest_address() + 1) * el_size,
+                            )
+                            .expect("invalid tensor size");
+                    }
+                }
                 tensorhash.insert(
                     s.clone(),
                     PickledTensor {
-                        dtype: match dtype.as_str() {
-                            "float" => TensorDataType::F32,
-                            "half" => TensorDataType::F16,
-                            "long" => TensorDataType::I64,
-                            _ => bail!("unsupported dtype: {}", dtype),
-                        },
+                        dtype,
                         shape: size.into(),
                         stride: stride.into(),
-                        range: tensor_data.clone(),
+                        range: tensor_data,
                     },
                 );
             }
