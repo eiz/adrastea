@@ -10,7 +10,7 @@ use skia_safe::{
 };
 
 use crate::{
-    kernels::{CommonKernels, GpuKernels},
+    kernels::{CommonKernels, GpuKernels, UnaryOp},
     pickle::{load_tensor, PickledModel},
     tensor::{Tensor, TensorLayout},
 };
@@ -129,12 +129,20 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let mut f = File::create("/home/eiz/clip_crop.png")?;
     f.write_all(data.as_bytes()).unwrap();
     let vt = ClipVisionTransformer::new(&model, &*kernels, "vision_model")?;
-    let mut patch_embeds = Tensor::new_hip(&[1024, 16, 16])?;
+    let mut hidden_state = Tensor::new_hip(&[257, 1024])?;
+    let mut class_embed = hidden_state.as_view_mut();
+    let mut class_embed = class_embed.take(&[1, 1024]);
+    kernels.elementwise_unary_2d_f16(
+        &mut class_embed,
+        &vt.class_embedding.as_view().shape_cast(&[1, 1024]),
+        UnaryOp::Identity,
+    )?;
+    let mut patch_embeds = hidden_state.as_view_mut();
+    let mut patch_embeds =
+        patch_embeds.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
     let zero_bias = Tensor::new_hip(&[1024])?;
-    println!("values {:>7.4?}", values);
-    println!("patch_embedding {:?}", vt.patch_embedding.layout());
     kernels.conv2d_f16(
-        &mut patch_embeds.as_view_mut(),
+        &mut patch_embeds,
         &values.as_view(),
         &vt.patch_embedding.as_view(),
         &zero_bias.as_view(),
@@ -142,8 +150,6 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
         (0, 0),
         crate::kernels::Conv1dActivation::None,
     )?;
-    println!("patch_embeds {:>7.4?}", patch_embeds);
-    let v_patch_embeds = patch_embeds.as_view().shape_cast(&[1024, 256]).permute(&[1, 0]);
     todo!();
 }
 
@@ -153,7 +159,7 @@ mod tests {
     use simt_hip::{HipDevice, HipPhysicalDevice};
 
     use crate::{
-        kernels::{CommonKernels, GpuKernels},
+        kernels::{CommonKernels, GpuKernels, UnaryOp},
         pickle::{load_tensor, PickledModel},
         tensor::Tensor,
     };
@@ -173,12 +179,24 @@ mod tests {
         let model = PickledModel::load_file("/tmp/clip_tests.pt", None)?;
         let pixel_values: Tensor<f32> = load_tensor(&model, "clip.conv2d.pixel_values")?;
         let weight: Tensor<f32> = load_tensor(&model, "clip.conv2d.weight")?;
-        let expected_result: Tensor<f32> = load_tensor(&model, "clip.conv2d.result")?;
-        let mut actual_result = Tensor::new_hip(&[1024, 16, 16])?;
+        let class_embed: Tensor<f32> = load_tensor(&model, "clip.class_embed")?;
+        let expected_class_patch_embed: Tensor<f32> =
+            load_tensor(&model, "clip.class_patch_embed")?;
+        let mut embedding = Tensor::new_hip(&[257, 1024])?;
+        let mut class_embed_dest = embedding.as_view_mut();
+        let mut class_embed_dest = class_embed_dest.take(&[1, 1024]);
+        kernels.elementwise_unary_2d_f32(
+            &mut class_embed_dest,
+            &class_embed.as_view().shape_cast(&[1, 1024]),
+            UnaryOp::Identity,
+        )?;
+        let mut actual_result = embedding.as_view_mut();
+        let mut actual_result =
+            actual_result.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
         let mut err_stats_gpu = Tensor::new_hip(&[3])?;
         let bias = Tensor::new_hip(&[1024])?;
         kernels.conv2d_f32(
-            &mut actual_result.as_view_mut(),
+            &mut actual_result,
             &pixel_values.as_view(),
             &weight.as_view(),
             &bias.as_view(),
@@ -188,13 +206,13 @@ mod tests {
         )?;
         kernels.error_stats_f32(
             &mut err_stats_gpu.as_view_mut(),
-            &actual_result.as_view(),
-            &expected_result.as_view(),
+            &embedding.as_view(),
+            &expected_class_patch_embed.as_view(),
         )?;
         let err_stats = err_stats_gpu.into_cpu()?;
         let err_stats = err_stats.storage().as_cpu();
-        println!("expected result {:>7.4?}", expected_result);
-        println!("actual result {:>7.4?}", actual_result);
+        println!("expected result {:>7.4?}", expected_class_patch_embed);
+        println!("actual result {:>7.4?}", embedding);
         println!("err_stats {:?}", err_stats);
         assert!(err_stats[0] < 0.001);
         Ok(())

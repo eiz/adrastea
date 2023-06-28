@@ -153,7 +153,7 @@ impl TensorLayout {
 #[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtr<T> {
     Cpu(*const T),
-    Hip(simt_hip_sys::hipDeviceptr_t),
+    Hip(*const T),
 }
 
 impl<T> TensorStoragePtr<T> {
@@ -175,7 +175,7 @@ impl<T> Clone for TensorStoragePtr<T> {
 #[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtrMut<T> {
     Cpu(*mut T),
-    Hip(simt_hip_sys::hipDeviceptr_t),
+    Hip(*mut T),
 }
 
 impl<T> TensorStoragePtrMut<T> {
@@ -240,7 +240,7 @@ impl<T> Tensor<T> {
         TensorView {
             ptr: match &self.storage {
                 TensorStorage::Cpu(v) => TensorStoragePtr::Cpu(v.as_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr),
+                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr as *const T),
             },
             layout: self.layout.clone(),
             _dead: PhantomData,
@@ -251,7 +251,7 @@ impl<T> Tensor<T> {
         TensorViewMut {
             ptr: match &mut self.storage {
                 TensorStorage::Cpu(v) => TensorStoragePtrMut::Cpu(v.as_mut_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr),
+                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr as *mut T),
             },
             layout: self.layout.clone(),
             _dead: PhantomData,
@@ -464,7 +464,7 @@ impl<'a, T> TensorView<'a, T> {
 
     pub fn skip(&self, dims: &[isize]) -> Self {
         let (offset, layout) = self.layout.skip(dims);
-        Self { ptr: self.ptr.offset(offset), layout: layout, _dead: PhantomData }
+        Self { ptr: self.ptr.offset(offset), layout, _dead: PhantomData }
     }
 
     pub fn take(&self, dims: &[isize]) -> Self {
@@ -536,7 +536,7 @@ impl<'a, T> TensorViewMut<'a, T> {
 
     pub fn skip<'b>(&'b mut self, dims: &[isize]) -> TensorViewMut<'b, T> {
         let (offset, layout) = self.layout.skip(dims);
-        Self { ptr: self.ptr.offset(offset), layout: layout, _dead: PhantomData }
+        Self { ptr: self.ptr.offset(offset), layout, _dead: PhantomData }
     }
 
     pub fn take<'b>(&'b mut self, dims: &[isize]) -> TensorViewMut<'b, T> {

@@ -235,6 +235,19 @@ void __global__ elementwise_unary_2d_f16(half* const output,
                                      stride_ix, stride_iy, op);
 }
 
+void __global__ elementwise_unary_2d_f32(float* const output,
+                                         float const* const input,
+                                         int length_x,
+                                         int length_y,
+                                         int const stride_ox,
+                                         int const stride_oy,
+                                         int const stride_ix,
+                                         int const stride_iy,
+                                         UnaryOp op) {
+  elementwise_unary_2d_generic<float>(output, input, length_x, length_y, stride_ox, stride_oy,
+                                      stride_ix, stride_iy, op);
+}
+
 void __global__ elementwise_binary_1d_f16(half* const output,
                                           half const* const left,
                                           half const* const right,

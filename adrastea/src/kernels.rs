@@ -9,6 +9,8 @@ use crate::{
     util::ceil_div,
 };
 
+// TODO new kernel system
+
 #[repr(C)]
 pub struct TensorGpuDescriptor {
     pub ptr: *mut c_void,
@@ -54,6 +56,11 @@ pub enum Conv1dActivation {
 pub enum BinaryOp {
     Add = 1,
     SiluMul = 2,
+}
+
+#[repr(u32)]
+pub enum UnaryOp {
+    Identity = 1,
 }
 
 #[repr(u32)]
@@ -158,6 +165,12 @@ pub trait CommonKernels {
         bias: &TensorView<f32>, stride: (i32, i32), padding: (i32, i32),
         activation: Conv1dActivation,
     ) -> anyhow::Result<()>;
+    fn elementwise_unary_2d_f16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, op: UnaryOp,
+    ) -> anyhow::Result<()>;
+    fn elementwise_unary_2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, op: UnaryOp,
+    ) -> anyhow::Result<()>;
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
     ) -> anyhow::Result<()>;
@@ -236,6 +249,16 @@ impl CommonKernels for MatmulTracer {
         activation: Conv1dActivation,
     ) -> anyhow::Result<()> {
         self.kernels.conv2d_f32(output, input, weight, bias, stride, padding, activation)
+    }
+    fn elementwise_unary_2d_f16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, op: UnaryOp,
+    ) -> anyhow::Result<()> {
+        self.kernels.elementwise_unary_2d_f16(output, input, op)
+    }
+    fn elementwise_unary_2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, op: UnaryOp,
+    ) -> anyhow::Result<()> {
+        self.kernels.elementwise_unary_2d_f32(output, input, op)
     }
     fn elementwise_binary_2d_f16_inplace(
         &self, inout_left: &mut TensorViewMut<f16>, right: &TensorView<f16>, op: BinaryOp,
@@ -401,6 +424,8 @@ pub struct GpuKernels {
     )>,
     elementwise_binary_2d_f16:
         Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
+    elementwise_unary_2d_f16: Kernel<(*mut f16, *const f16, i32, i32, i32, i32, i32, i32, u32)>,
+    elementwise_unary_2d_f32: Kernel<(*mut f32, *const f32, i32, i32, i32, i32, i32, i32, u32)>,
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
     embed: Kernel<(*mut f16, *const i32, i32, i32, *const f16)>,
     fp32_to_fp16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor)>,
@@ -433,6 +458,8 @@ impl GpuKernels {
                 &module_elementwise,
                 "elementwise_binary_2d_f16",
             )?,
+            elementwise_unary_2d_f16: Kernel::new(&module_elementwise, "elementwise_unary_2d_f16")?,
+            elementwise_unary_2d_f32: Kernel::new(&module_elementwise, "elementwise_unary_2d_f32")?,
             softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
             embed: Kernel::new(&module_embed, "embed")?,
             fp32_to_fp16: Kernel::new(&module_convert, "fp32_to_fp16")?,
@@ -541,6 +568,64 @@ impl CommonKernels for GpuKernels {
                 padding.0,
                 padding.1,
                 activation as i32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn elementwise_unary_2d_f16(
+        &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, op: UnaryOp,
+    ) -> anyhow::Result<()> {
+        self.elementwise_unary_2d_f16.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1), 16) as u32,
+                    ceil_div(output.size(-2), 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                input.as_gpu_ptr(),
+                output.size(-1) as i32,
+                output.size(-2) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                input.stride(-1) as i32,
+                input.stride(-2) as i32,
+                op as u32,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn elementwise_unary_2d_f32(
+        &self, output: &mut TensorViewMut<f32>, input: &TensorView<f32>, op: UnaryOp,
+    ) -> anyhow::Result<()> {
+        self.elementwise_unary_2d_f32.launch(
+            LaunchParams {
+                blocks: (
+                    ceil_div(output.size(-1), 16) as u32,
+                    ceil_div(output.size(-2), 16) as u32,
+                    1,
+                ),
+                threads: (16, 16, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (
+                output.as_mut_gpu_ptr(),
+                input.as_gpu_ptr(),
+                output.size(-1) as i32,
+                output.size(-2) as i32,
+                output.stride(-1) as i32,
+                output.stride(-2) as i32,
+                input.stride(-1) as i32,
+                input.stride(-2) as i32,
+                op as u32,
             ),
         )?;
         Ok(())
