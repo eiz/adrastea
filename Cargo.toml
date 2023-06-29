@@ -4,7 +4,6 @@ resolver = "2"
 
 [patch.crates-io]
 serde-pickle = { git = "https://github.com/eiz/serde-pickle", branch = "mack/persid" }
-half = { git = "https://github.com/eiz/half-rs", branch = "mack/format-options-2.2.1" }
 tiktoken-rs = { git = "https://github.com/eiz/tiktoken-rs", branch = "mack/whisper" }
 pipewire = { git = "https://github.com/eiz/pipewire-rs", branch = "mack/public-raw-ctx" }
 pipewire-sys = { git = "https://github.com/eiz/pipewire-rs", branch = "mack/public-raw-ctx" }
