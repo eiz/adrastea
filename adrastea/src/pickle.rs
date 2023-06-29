@@ -22,7 +22,6 @@ use std::{
 };
 
 use anyhow::bail;
-use half::f16;
 use memmap2::Mmap;
 use serde::Deserialize;
 use smallvec::SmallVec;
