@@ -31,6 +31,7 @@ enum class MatmulStoreOp {
   BETA_BIAS = 3,
   SCALE = 4,
   ADD = 5,
+  QUICK_GELU_BIAS = 6,
 };
 enum class MatmulMaskOp { NONE = 0, CAUSAL = 1 };
 
@@ -117,6 +118,26 @@ struct Gelu {
     auto inner = op(value, output, x, y, stride_ox, stride_oy);
     return 0.5f * inner *
            (1.0f + tanhf(0.7978845608028654f * (inner + 0.044715f * inner * inner * inner)));
+  }
+
+  Operator op;
+};
+
+__device__ __forceinline__ float sigmoid(float x) {
+  return 1.0f / (1.0f + expf(-x));
+}
+
+template <typename T, typename O, typename Operator = Identity<T>>
+struct QuickGelu {
+  __device__ __forceinline__ QuickGelu(Operator op) : op(op) {}
+  __device__ __forceinline__ T operator()(T const value,
+                                          O const* const output,
+                                          int x,
+                                          int y,
+                                          int stride_ox,
+                                          int stride_oy) const {
+    auto inner = op(value, output, x, y, stride_ox, stride_oy);
+    return inner * sigmoid(1.702f * inner);
   }
 
   Operator op;
@@ -438,6 +459,13 @@ void __device__ matmul_fast(MATMUL_COMMON_PARAMS(T),
       using gelu_t = Gelu<float, T, bias_t>;                                     \
       using beta_t = Beta<float, T, gelu_t>;                                     \
       beta_t store_op{beta, gelu_t(bias_t(bias, HalfToFloat<>(Identity<T>())))}; \
+      MATMUL_GENERIC_LOAD_OP(op)                                                 \
+      break;                                                                     \
+    }                                                                            \
+    case MatmulStoreOp::QUICK_GELU_BIAS: {                                       \
+      using bias_t = Bias<float, T, HalfToFloat<>>;                              \
+      using quickgelu_t = QuickGelu<float, T, bias_t>;                           \
+      quickgelu_t store_op{bias_t(bias, HalfToFloat<>(Identity<T>()))};          \
       MATMUL_GENERIC_LOAD_OP(op)                                                 \
       break;                                                                     \
     }                                                                            \

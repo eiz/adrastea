@@ -91,11 +91,13 @@ pub enum MatmulStoreOp {
     BetaBias = 3,
     Scale = 4,
     Add = 5,
+    QuickGeluBias = 6,
 }
 
 pub enum MatmulStore<'a> {
     Identity,
     GeluBias(&'a TensorView<'a, f16>),
+    QuickGeluBias(&'a TensorView<'a, f16>),
     BetaGeluBias(f32, &'a TensorView<'a, f16>),
     BetaBias(f32, &'a TensorView<'a, f16>),
     Scale(f32),
@@ -107,6 +109,7 @@ impl<'a> MatmulStore<'a> {
         match self {
             MatmulStore::Identity => MatmulStoreOp::Identity,
             MatmulStore::GeluBias(_) => MatmulStoreOp::GeluBias,
+            MatmulStore::QuickGeluBias(_) => MatmulStoreOp::QuickGeluBias,
             MatmulStore::BetaGeluBias(_, _) => MatmulStoreOp::BetaGeluBias,
             MatmulStore::BetaBias(_, _) => MatmulStoreOp::BetaBias,
             MatmulStore::Scale(_) => MatmulStoreOp::Scale,
@@ -761,6 +764,7 @@ impl CommonKernels for GpuKernels {
         let bias = match &options.store {
             MatmulStore::Identity => None,
             MatmulStore::GeluBias(bias) => Some(bias),
+            MatmulStore::QuickGeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
             MatmulStore::BetaBias(_, bias) => Some(bias),
             MatmulStore::Scale(_) => None,
@@ -828,6 +832,7 @@ impl CommonKernels for GpuKernels {
         let bias = match &options.store {
             MatmulStore::Identity => None,
             MatmulStore::GeluBias(bias) => Some(bias),
+            MatmulStore::QuickGeluBias(bias) => Some(bias),
             MatmulStore::BetaGeluBias(_, bias) => Some(bias),
             MatmulStore::BetaBias(_, bias) => Some(bias),
             MatmulStore::Scale(_) => None,

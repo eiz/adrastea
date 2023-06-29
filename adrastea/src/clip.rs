@@ -7,13 +7,15 @@ use serde::Deserialize;
 use simt_hip::{HipDevice, HipPhysicalDevice};
 use skia_safe::{
     AlphaType, ColorSpace, ColorType, CubicResampler, Data, EncodedImageFormat, Image, ImageInfo,
-    MipmapMode, Pixmap, SamplingOptions, Surface,
+    Pixmap, Surface,
 };
 
 use crate::{
-    kernels::{BinaryOp, CommonKernels, GpuKernels, UnaryOp},
+    kernels::{
+        BinaryOp, CommonKernels, GpuKernels, MatmulMask, MatmulOptions, MatmulStore, UnaryOp,
+    },
     pickle::{load_tensor, PickledModel},
-    tensor::{Tensor, TensorLayout},
+    tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
 };
 
 // this implements the 🤗 version of CLIP
@@ -24,7 +26,7 @@ fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Te
     Ok(output)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ClipVisionParams {
     image_size: i32,
     patch_size: i32,
@@ -32,14 +34,14 @@ struct ClipVisionParams {
     num_hidden_layers: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ClipTextParams {
     num_attention_heads: i32,
     num_hidden_layers: i32,
     vocab_size: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ClipParams {
     projection_dim: i32,
     vision_config: ClipVisionParams,
@@ -62,19 +64,19 @@ impl ClipLayerNorm {
 }
 
 struct ClipAttention {
-    query: Tensor<f16>,
-    key: Tensor<f16>,
-    value: Tensor<f16>,
-    out: Tensor<f16>,
+    query: ClipLinear,
+    key: ClipLinear,
+    value: ClipLinear,
+    out: ClipLinear,
 }
 
 impl ClipAttention {
     pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
-            query: builder.load_tensor_f16(&format!("{}.q_proj.weight", prefix))?,
-            key: builder.load_tensor_f16(&format!("{}.k_proj.weight", prefix))?,
-            value: builder.load_tensor_f16(&format!("{}.v_proj.weight", prefix))?,
-            out: builder.load_tensor_f16(&format!("{}.out_proj.weight", prefix))?,
+            query: ClipLinear::new(builder, &format!("{}.q_proj", prefix))?,
+            key: ClipLinear::new(builder, &format!("{}.k_proj", prefix))?,
+            value: ClipLinear::new(builder, &format!("{}.v_proj", prefix))?,
+            out: ClipLinear::new(builder, &format!("{}.out_proj", prefix))?,
         })
     }
 }
@@ -93,12 +95,12 @@ impl ClipLinear {
     }
 }
 
-struct ClipFeedForward {
+struct ClipMLP {
     fc1: ClipLinear,
     fc2: ClipLinear,
 }
 
-impl ClipFeedForward {
+impl ClipMLP {
     pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             fc1: ClipLinear::new(builder, &format!("{}.fc1", prefix))?,
@@ -111,7 +113,7 @@ struct ClipVisionTransformerBlock {
     layer_norm1: ClipLayerNorm,
     attn: ClipAttention,
     layer_norm2: ClipLayerNorm,
-    mlp: ClipFeedForward,
+    mlp: ClipMLP,
 }
 
 impl ClipVisionTransformerBlock {
@@ -120,7 +122,7 @@ impl ClipVisionTransformerBlock {
             layer_norm1: ClipLayerNorm::new(builder, &format!("{}.layer_norm1", prefix))?,
             attn: ClipAttention::new(builder, &format!("{}.self_attn", prefix))?,
             layer_norm2: ClipLayerNorm::new(builder, &format!("{}.layer_norm2", prefix))?,
-            mlp: ClipFeedForward::new(builder, &format!("{}.mlp", prefix))?,
+            mlp: ClipMLP::new(builder, &format!("{}.mlp", prefix))?,
         })
     }
 }
@@ -144,6 +146,7 @@ impl<'a> ClipModelBuilder<'a> {
 }
 
 struct ClipVisionTransformer {
+    params: ClipVisionParams,
     class_embedding: Tensor<f16>,
     patch_embedding: Tensor<f16>,
     pre_layernorm: ClipLayerNorm,
@@ -172,6 +175,7 @@ impl ClipVisionTransformer {
                     )
                 })
                 .collect::<anyhow::Result<_>>()?,
+            params: builder.params.vision_config.clone(),
         })
     }
 }
@@ -214,6 +218,220 @@ fn pixmap_as_planes(pixmap: Pixmap, channel_mean: &[f32], channel_stddev: &[f32]
     Tensor::from_vec(planes, TensorLayout::row_major(&[3, h, w]))
 }
 
+struct ClipImage(Tensor<f16>);
+
+trait LazyClipImage {
+    fn load(&self, kernels: &dyn CommonKernels) -> anyhow::Result<ClipImage>;
+}
+
+impl<P: AsRef<Path>> LazyClipImage for P {
+    // this should likely be factored such that it just loads the image and puts
+    // it into the right representation (planar float) and then the resize and
+    // normalization is done in the model
+    fn load(&self, kernels: &dyn CommonKernels) -> anyhow::Result<ClipImage> {
+        let image = load_image_eager(self.as_ref())?;
+        let pixdims = image.dimensions();
+        let (new_height, new_width) = resize_dims(pixdims.height, pixdims.width, 224);
+        let mut surface = Surface::new_raster(
+            &ImageInfo::new(
+                (224, 224),
+                ColorType::BGRA8888,
+                AlphaType::Premul,
+                ColorSpace::new_srgb(),
+            ),
+            0,
+            None,
+        )
+        .unwrap();
+        let canvas = surface.canvas();
+        canvas.translate((-((new_width - 224) / 2), -((new_height - 224) / 2)));
+        canvas.scale((
+            new_width as f32 / pixdims.width as f32,
+            new_height as f32 / pixdims.height as f32,
+        ));
+        // TODO: this does not give the same results as PIL =/
+        canvas.draw_image_with_sampling_options(image, (0, 0), CubicResampler::catmull_rom(), None);
+        let pixmap = surface.peek_pixels().unwrap();
+        let values = to_f16(
+            kernels,
+            pixmap_as_planes(
+                pixmap,
+                &[0.48145466, 0.4578275, 0.40821073],
+                &[0.26862954, 0.26130258, 0.27577711],
+            )
+            .into_hip()?,
+        )?;
+        println!("{:>7.4?}", values);
+        let snap = surface.image_snapshot();
+        let context = surface.direct_context();
+        let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
+        let mut f = File::create("/home/eiz/clip_crop.png")?;
+        f.write_all(data.as_bytes()).unwrap();
+        Ok(ClipImage(values))
+    }
+}
+
+struct ClipVisionContext {
+    model: Arc<ClipVisionTransformer>,
+    kernels: Arc<dyn CommonKernels>,
+}
+
+impl ClipVisionContext {
+    pub fn new(model: Arc<ClipVisionTransformer>, kernels: Arc<dyn CommonKernels>) -> Self {
+        Self { model, kernels }
+    }
+
+    pub fn encode(&self, image: impl LazyClipImage) -> anyhow::Result<Tensor<f16>> {
+        let image = image.load(&*self.kernels)?;
+        let mut embedding = Tensor::new_hip(&[257, 1024])?;
+        let mut class_embed = embedding.as_view_mut();
+        let mut class_embed = class_embed.take(&[1, 1024]);
+        self.kernels.elementwise_unary_2d_f16(
+            &mut class_embed,
+            &self.model.class_embedding.as_view().shape_cast(&[1, 1024]),
+            UnaryOp::Identity,
+        )?;
+        let mut patch_embeds = embedding.as_view_mut();
+        let mut patch_embeds =
+            patch_embeds.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
+        let zero_bias = Tensor::new_hip(&[1024])?;
+        self.kernels.conv2d_f16(
+            &mut patch_embeds,
+            &image.0.as_view(),
+            &self.model.patch_embedding.as_view(),
+            &zero_bias.as_view(),
+            (14, 14),
+            (0, 0),
+            crate::kernels::Conv1dActivation::None,
+        )?;
+        self.kernels.elementwise_binary_2d_f16_inplace(
+            &mut embedding.as_view_mut(),
+            &self.model.position_embedding.as_view(),
+            BinaryOp::Add,
+        )?;
+        let mut hidden_state = Tensor::new_hip(&[257, 1024])?;
+        self.kernels.layer_norm(
+            &mut hidden_state.as_view_mut(),
+            &embedding.as_view(),
+            &self.model.pre_layernorm.weight.as_view(),
+            &self.model.pre_layernorm.bias.as_view(),
+            1.0e-5,
+        )?;
+        for layer in &self.model.layers {
+            self.process_layer(&mut hidden_state.as_view_mut(), layer, MatmulMask::None)?;
+        }
+        let mut output_norm = Tensor::new_hip(&[1, 1024])?;
+        self.kernels.layer_norm(
+            &mut output_norm.as_view_mut(),
+            &hidden_state.as_view().take(&[1, 1024]),
+            &self.model.post_layernorm.weight.as_view(),
+            &self.model.post_layernorm.bias.as_view(),
+            1.0e-5,
+        )?;
+        Ok(output_norm)
+    }
+
+    fn process_layer(
+        &self, hidden_state: &mut TensorViewMut<f16>, layer: &ClipVisionTransformerBlock,
+        mask: MatmulMask,
+    ) -> anyhow::Result<()> {
+        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
+        self.kernels.layer_norm(
+            &mut normed.as_view_mut(),
+            &hidden_state.as_view(),
+            &layer.layer_norm1.weight.as_view(),
+            &layer.layer_norm1.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.residual_attention(hidden_state, &normed.as_view(), &layer.attn, mask)?;
+        self.kernels.layer_norm(
+            &mut normed.as_view_mut(),
+            &hidden_state.as_view(),
+            &layer.layer_norm2.weight.as_view(),
+            &layer.layer_norm2.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.residual_mlp(hidden_state, &normed.as_view(), &layer.mlp)?;
+        Ok(())
+    }
+
+    fn residual_attention(
+        &self, hidden_state: &mut TensorViewMut<f16>, normed: &TensorView<f16>,
+        attn: &ClipAttention, mask: MatmulMask,
+    ) -> anyhow::Result<()> {
+        let heads = self.model.params.num_attention_heads as isize;
+        let mut query = Tensor::new_hip(&normed.layout().dims)?;
+        let mut key = Tensor::new_hip(&normed.layout().dims)?;
+        let mut value = Tensor::new_hip(&normed.layout().dims)?;
+        let mut qkv = Tensor::new_hip(&normed.layout().dims)?;
+        self.kernels.matmul_f16(
+            &mut query.as_view_mut(),
+            normed,
+            &attn.query.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.query.bias.as_view())),
+        )?;
+        self.kernels.matmul_f16(
+            &mut key.as_view_mut(),
+            normed,
+            &attn.key.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.key.bias.as_view())),
+        )?;
+        self.kernels.matmul_f16(
+            &mut value.as_view_mut(),
+            normed,
+            &attn.value.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.value.bias.as_view())),
+        )?;
+        let q_view =
+            query.as_view().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let k_view =
+            key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
+        let v_view =
+            value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        self.kernels.matmul_f16(
+            &mut qk.as_view_mut(),
+            &q_view,
+            &k_view,
+            MatmulOptions::new()
+                .store(MatmulStore::Scale(
+                    1.0 / (hidden_state.size(-1) as f32 / heads as f32).sqrt(),
+                ))
+                .mask(mask),
+        )?;
+        self.kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
+        let mut qkv_view =
+            qkv.as_view_mut().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        self.kernels.matmul_f16(&mut qkv_view, &qk.as_view(), &v_view, MatmulOptions::new())?;
+        self.kernels.matmul_f16(
+            hidden_state,
+            &qkv.as_view(),
+            &attn.out.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &attn.out.bias.as_view())),
+        )?;
+        Ok(())
+    }
+
+    fn residual_mlp(
+        &self, hidden_state: &mut TensorViewMut<f16>, normed: &TensorView<f16>, mlp: &ClipMLP,
+    ) -> anyhow::Result<()> {
+        let mut mlp_hidden = Tensor::new_hip(&[hidden_state.size(-2), mlp.fc1.weight.size(-2)])?;
+        self.kernels.matmul_f16(
+            &mut mlp_hidden.as_view_mut(),
+            normed,
+            &mlp.fc1.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::QuickGeluBias(&mlp.fc1.bias.as_view())),
+        )?;
+        self.kernels.matmul_f16(
+            hidden_state,
+            &mlp_hidden.as_view(),
+            &mlp.fc2.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &mlp.fc2.bias.as_view())),
+        )?;
+        Ok(())
+    }
+}
+
 pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let phys = HipPhysicalDevice::get(0)?;
@@ -222,79 +440,10 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
     let model = PickledModel::load_file(path.join("pytorch_model.bin"), None)?;
     let params: ClipParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
-    let image = load_image_eager("/home/eiz/clip_test.jpg")?;
-    let pixdims = image.dimensions();
-    let (new_height, new_width) = resize_dims(pixdims.height, pixdims.width, 224);
-    let mut surface = Surface::new_raster(
-        &ImageInfo::new((224, 224), ColorType::BGRA8888, AlphaType::Premul, ColorSpace::new_srgb()),
-        0,
-        None,
-    )
-    .unwrap();
-    let canvas = surface.canvas();
-    canvas.translate((-((new_width - 224) / 2), -((new_height - 224) / 2)));
-    canvas.scale((
-        new_width as f32 / pixdims.width as f32,
-        new_height as f32 / pixdims.height as f32,
-    ));
-    let mut sample_options: SamplingOptions = CubicResampler::catmull_rom().into();
-    sample_options.mipmap = MipmapMode::Linear;
-    println!("{:?}", sample_options);
-    // TODO: this does not give the same results as PIL =/
-    canvas.draw_image_with_sampling_options(image, (0, 0), sample_options, None);
-    let pixmap = surface.peek_pixels().unwrap();
-    let values = to_f16(
-        &*kernels,
-        pixmap_as_planes(
-            pixmap,
-            &[0.48145466, 0.4578275, 0.40821073],
-            &[0.26862954, 0.26130258, 0.27577711],
-        )
-        .into_hip()?,
-    )?;
-    println!("{:>7.4?}", values);
-    let snap = surface.image_snapshot();
-    let context = surface.direct_context();
-    let data = snap.encode(context, EncodedImageFormat::PNG, None).unwrap();
-    let mut f = File::create("/home/eiz/clip_crop.png")?;
-    f.write_all(data.as_bytes()).unwrap();
     let builder = ClipModelBuilder::new(&model, &*kernels, &params);
     let vt = ClipVisionTransformer::new(&builder, "vision_model")?;
-    let mut embedding = Tensor::new_hip(&[257, 1024])?;
-    let mut class_embed = embedding.as_view_mut();
-    let mut class_embed = class_embed.take(&[1, 1024]);
-    kernels.elementwise_unary_2d_f16(
-        &mut class_embed,
-        &vt.class_embedding.as_view().shape_cast(&[1, 1024]),
-        UnaryOp::Identity,
-    )?;
-    let mut patch_embeds = embedding.as_view_mut();
-    let mut patch_embeds =
-        patch_embeds.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
-    let zero_bias = Tensor::new_hip(&[1024])?;
-    kernels.conv2d_f16(
-        &mut patch_embeds,
-        &values.as_view(),
-        &vt.patch_embedding.as_view(),
-        &zero_bias.as_view(),
-        (14, 14),
-        (0, 0),
-        crate::kernels::Conv1dActivation::None,
-    )?;
-    kernels.elementwise_binary_2d_f16_inplace(
-        &mut embedding.as_view_mut(),
-        &vt.position_embedding.as_view(),
-        BinaryOp::Add,
-    )?;
-    let mut hidden_state = Tensor::new_hip(&[257, 1024])?;
-    kernels.layer_norm(
-        &mut hidden_state.as_view_mut(),
-        &embedding.as_view(),
-        &vt.pre_layernorm.weight.as_view(),
-        &vt.pre_layernorm.bias.as_view(),
-        1.0e-5,
-    )?;
-    println!("initial hidden state {:>7.4?}", hidden_state);
+    let context = ClipVisionContext::new(Arc::new(vt), kernels);
+    context.encode("/home/eiz/clip_gold.png")?;
     todo!();
 }
 
