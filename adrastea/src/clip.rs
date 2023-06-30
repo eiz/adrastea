@@ -34,11 +34,34 @@ use crate::{
 };
 
 // this implements the 🤗 version of CLIP
+// specifically clip-vit-large-patch14 atm
+
+struct ClipTokenizer {
+    vocab: Vec<String>,
+}
 
 fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Tensor<f16>> {
     let mut output = Tensor::new_hip_layout(tensor.layout().clone())?;
     kernels.fp32_to_fp16(&mut output.as_view_mut(), &tensor.as_view())?;
     Ok(output)
+}
+
+struct ClipModelLoader<'a> {
+    pickle: &'a PickledModel<()>,
+    kernels: &'a dyn CommonKernels,
+    params: &'a ClipParams,
+}
+
+impl<'a> ClipModelLoader<'a> {
+    pub fn new(
+        pickle: &'a PickledModel<()>, kernels: &'a dyn CommonKernels, params: &'a ClipParams,
+    ) -> Self {
+        Self { pickle, kernels, params }
+    }
+
+    pub fn load_tensor_f16(&self, name: &str) -> anyhow::Result<Tensor<f16>> {
+        to_f16(self.kernels, load_tensor(self.pickle, name)?)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -70,7 +93,7 @@ struct ClipLayerNorm {
 }
 
 impl ClipLayerNorm {
-    pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             weight: builder.load_tensor_f16(&format!("{}.weight", prefix))?,
             bias: builder.load_tensor_f16(&format!("{}.bias", prefix))?,
@@ -86,7 +109,7 @@ struct ClipAttention {
 }
 
 impl ClipAttention {
-    pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             query: ClipLinear::new(builder, &format!("{}.q_proj", prefix))?,
             key: ClipLinear::new(builder, &format!("{}.k_proj", prefix))?,
@@ -102,7 +125,7 @@ struct ClipLinear {
 }
 
 impl ClipLinear {
-    pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             weight: builder.load_tensor_f16(&format!("{}.weight", prefix))?,
             bias: builder.load_tensor_f16(&format!("{}.bias", prefix))?,
@@ -116,7 +139,7 @@ struct ClipMLP {
 }
 
 impl ClipMLP {
-    pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             fc1: ClipLinear::new(builder, &format!("{}.fc1", prefix))?,
             fc2: ClipLinear::new(builder, &format!("{}.fc2", prefix))?,
@@ -124,39 +147,21 @@ impl ClipMLP {
     }
 }
 
-struct ClipVisionTransformerBlock {
+struct ClipTransformerBlock {
     layer_norm1: ClipLayerNorm,
     attn: ClipAttention,
     layer_norm2: ClipLayerNorm,
     mlp: ClipMLP,
 }
 
-impl ClipVisionTransformerBlock {
-    pub fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+impl ClipTransformerBlock {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             layer_norm1: ClipLayerNorm::new(builder, &format!("{}.layer_norm1", prefix))?,
             attn: ClipAttention::new(builder, &format!("{}.self_attn", prefix))?,
             layer_norm2: ClipLayerNorm::new(builder, &format!("{}.layer_norm2", prefix))?,
             mlp: ClipMLP::new(builder, &format!("{}.mlp", prefix))?,
         })
-    }
-}
-
-struct ClipModelBuilder<'a> {
-    pickle: &'a PickledModel<()>,
-    kernels: &'a dyn CommonKernels,
-    params: &'a ClipParams,
-}
-
-impl<'a> ClipModelBuilder<'a> {
-    pub fn new(
-        pickle: &'a PickledModel<()>, kernels: &'a dyn CommonKernels, params: &'a ClipParams,
-    ) -> Self {
-        Self { pickle, kernels, params }
-    }
-
-    pub fn load_tensor_f16(&self, name: &str) -> anyhow::Result<Tensor<f16>> {
-        to_f16(self.kernels, load_tensor(self.pickle, name)?)
     }
 }
 
@@ -167,11 +172,11 @@ struct ClipVisionTransformer {
     pre_layernorm: ClipLayerNorm,
     position_embedding: Tensor<f16>,
     post_layernorm: ClipLayerNorm,
-    layers: Vec<ClipVisionTransformerBlock>,
+    layers: Vec<ClipTransformerBlock>,
 }
 
 impl ClipVisionTransformer {
-    fn new(builder: &ClipModelBuilder, prefix: &str) -> anyhow::Result<Self> {
+    fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             class_embedding: builder
                 .load_tensor_f16(&format!("{}.embeddings.class_embedding", prefix))?,
@@ -184,15 +189,19 @@ impl ClipVisionTransformer {
             post_layernorm: ClipLayerNorm::new(builder, &format!("{}.post_layernorm", prefix))?,
             layers: (0..builder.params.vision_config.num_hidden_layers)
                 .map(|i| {
-                    ClipVisionTransformerBlock::new(
-                        builder,
-                        &format!("{}.encoder.layers.{}", prefix, i),
-                    )
+                    ClipTransformerBlock::new(builder, &format!("{}.encoder.layers.{}", prefix, i))
                 })
                 .collect::<anyhow::Result<_>>()?,
             params: builder.params.vision_config.clone(),
         })
     }
+}
+
+struct ClipTextTransformer {
+    position_embedding: Tensor<f16>,
+    token_embedding: Tensor<f32>,
+    layers: Vec<ClipTransformerBlock>,
+    //
 }
 
 fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {
@@ -347,7 +356,7 @@ impl ClipVisionContext {
     }
 
     fn process_layer(
-        &self, hidden_state: &mut TensorViewMut<f16>, layer: &ClipVisionTransformerBlock,
+        &self, hidden_state: &mut TensorViewMut<f16>, layer: &ClipTransformerBlock,
         mask: MatmulMask,
     ) -> anyhow::Result<()> {
         let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
@@ -455,9 +464,10 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
     let model = PickledModel::load_file(path.join("pytorch_model.bin"), None)?;
     let params: ClipParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
-    let builder = ClipModelBuilder::new(&model, &*kernels, &params);
+    let builder = ClipModelLoader::new(&model, &*kernels, &params);
     let vt = ClipVisionTransformer::new(&builder, "vision_model")?;
     let context = ClipVisionContext::new(Arc::new(vt), kernels);
+    println!("{:#?}", params);
     context.encode("/home/eiz/clip_gold.png")?;
     todo!();
 }
