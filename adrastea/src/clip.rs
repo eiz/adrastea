@@ -13,11 +13,40 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::{fs::File, io::Write, path::Path};
+// Portions of this file are derived from the CLIP project.
+//
+// Copyright (c) 2021 OpenAI
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
 
-use alloc::sync::Arc;
+use core::ops::Range;
+use std::{fs::File, io::Write, path::Path, time::Instant};
+
+use alloc::{
+    collections::{BTreeMap, BinaryHeap},
+    sync::Arc,
+};
+use anyhow::bail;
+use bstr::{BString, ByteSlice};
 use half::f16;
 use memmap2::Mmap;
+use regex::Regex;
 use serde::Deserialize;
 use simt_hip::{HipDevice, HipPhysicalDevice};
 use skia_safe::{
@@ -36,8 +65,179 @@ use crate::{
 // this implements the 🤗 version of CLIP
 // specifically clip-vit-large-patch14 atm
 
+fn utf8_len(chr: u8) -> usize {
+    const LOOKUP: &[usize] = &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4];
+    LOOKUP[(chr >> 4) as usize]
+}
+
+#[derive(Debug, Clone)]
+struct Symbol {
+    prev: i32,
+    next: i32,
+    text: Range<usize>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Bigram {
+    left: i32,
+    right: i32,
+    score: usize,
+    len: usize,
+}
+
+impl Ord for Bigram {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+            .then(other.score.cmp(&self.score))
+            .then(self.left.cmp(&other.left))
+    }
+}
+
+impl PartialOrd for Bigram {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct ClipVocabulary {
+    token_lookup: BTreeMap<BString, usize>,
+    tokens: Vec<String>,
+    word_regex: Arc<Regex>,
+}
+
+impl ClipVocabulary {
+    pub fn new() -> Self {
+        const VOCAB_BYTES: &[u8] = include_bytes!("../../assets/clip_vocab.json");
+        let tokens: Vec<String> =
+            serde_json::from_slice(VOCAB_BYTES).expect("malformed internal vocabulary");
+        let mut token_lookup = BTreeMap::new();
+        for string in &tokens {
+            token_lookup.insert(string.as_bytes().into(), token_lookup.len());
+        }
+        Self {
+            token_lookup,
+            tokens,
+            word_regex: Arc::new(Regex::new(
+                r#"<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+"#,
+            ).unwrap()),
+        }
+    }
+}
+
+// CLIP's tokenizer is a bit ... odd ... and this code does not attempt to
+// faithfully reproduce the exact result of the original Python code, which
+// among other things depends on the 'ftfy' unicode hack-fix library and html
+// unescaping.
+//
+// This is adapted from the tokenizer code I wrote for llama.cpp. Which itself
+// is very similar to the original SentencePiece BPE tokenization algorithm. It
+// should produce similar'ish output to the original clip code
 struct ClipTokenizer {
-    vocab: Vec<String>,
+    vocab: Arc<ClipVocabulary>,
+    symbols: Vec<Symbol>,
+    work_queue: BinaryHeap<Bigram>,
+}
+
+impl ClipTokenizer {
+    pub fn new(vocab: Arc<ClipVocabulary>) -> Self {
+        Self { vocab, symbols: Vec::new(), work_queue: BinaryHeap::new() }
+    }
+
+    pub fn encode(&mut self, text: &str) -> anyhow::Result<Vec<i32>> {
+        let mut result = vec![];
+        let word_regex = self.vocab.word_regex.clone();
+        for rmatch in word_regex.find_iter(&text.to_lowercase()) {
+            self.tokenize_word(&mut result, &format!("{}</w>", rmatch.as_str()))?;
+        }
+        Ok(result)
+    }
+
+    pub fn decode(&self, tokens: &[i32]) -> String {
+        let mut result = String::new();
+        let mut first = true;
+        for token in tokens {
+            result.push_str(&self.vocab.tokens[*token as usize].replace("</w>", " "));
+        }
+        if result.ends_with(' ') {
+            result.pop();
+        }
+        result
+    }
+
+    fn tokenize_word(&mut self, result: &mut Vec<i32>, word: &str) -> anyhow::Result<()> {
+        // split the string into utf8 characters
+        let word = word.as_bytes();
+        let mut index = 0;
+        let mut offs = 0;
+        while offs < word.len() {
+            let mut char_len = utf8_len(word[offs]).min(word.len() - offs);
+            if offs + char_len == word.len() - 4 {
+                // special case: the magic </w> is part of the last symbol
+                char_len += 4;
+            }
+            let sym = Symbol {
+                prev: index - 1,
+                next: if offs + char_len == word.len() { -1 } else { index + 1 },
+                text: offs..offs + char_len,
+            };
+            offs += char_len;
+            index += 1;
+            self.symbols.push(sym);
+        }
+        // initial bigrams
+        for i in 1..self.symbols.len() as i32 {
+            self.try_add_bigram(word, i - 1, i);
+        }
+        // keep performing the highest priority substitution for as long as we can
+        while let Some(bigram) = self.work_queue.pop() {
+            let mut left_sym = self.symbols[bigram.left as usize].clone();
+            let mut right_sym = self.symbols[bigram.right as usize].clone();
+            // one of the symbols was already merged, skip
+            if left_sym.text.len() == 0
+                || right_sym.text.len() == 0
+                || left_sym.text.len() + right_sym.text.len() != bigram.len
+            {
+                continue;
+            }
+            // merge the symbols
+            left_sym.text = left_sym.text.start..right_sym.text.end;
+            right_sym.text = 0..0;
+            left_sym.next = right_sym.next;
+            if right_sym.next >= 0 {
+                self.symbols[right_sym.next as usize].prev = bigram.left;
+            }
+            self.symbols[bigram.left as usize] = left_sym.clone();
+            self.symbols[bigram.right as usize] = right_sym.clone();
+            // search for more bigrams
+            self.try_add_bigram(word, left_sym.prev, bigram.left);
+            self.try_add_bigram(word, bigram.left, left_sym.next);
+        }
+        let mut i = 0;
+        while i != -1 {
+            let symbol = &self.symbols[i as usize];
+            let text = word[symbol.text.clone()].as_bstr();
+            if let Some(token) = self.vocab.token_lookup.get(text) {
+                result.push(*token as i32);
+            } else {
+                // TODO: I still don't fully get how bytes are supposed to work in this tokenizer
+                bail!("failed to encode {:?}", text);
+            }
+            i = symbol.next;
+        }
+        self.symbols.clear();
+        Ok(())
+    }
+
+    fn try_add_bigram(&mut self, word: &[u8], left: i32, right: i32) {
+        if left == -1 || right == -1 {
+            return;
+        }
+        let text =
+            &word[self.symbols[left as usize].text.start..self.symbols[right as usize].text.end];
+        if let Some(token_idx) = self.vocab.token_lookup.get(text.as_bstr()) {
+            self.work_queue.push(Bigram { left, right, score: *token_idx, len: text.len() })
+        }
+    }
 }
 
 fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Tensor<f16>> {
@@ -468,6 +668,10 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let vt = ClipVisionTransformer::new(&builder, "vision_model")?;
     let context = ClipVisionContext::new(Arc::new(vt), kernels);
     println!("{:#?}", params);
+    let mut tokenizer = ClipTokenizer::new(Arc::new(ClipVocabulary::new()));
+    let tokens = tokenizer.encode("hello world thumbwar")?;
+    println!("{:?}", tokens);
+    println!("{:?}", tokenizer.decode(&tokens));
     context.encode("/home/eiz/clip_gold.png")?;
     todo!();
 }
