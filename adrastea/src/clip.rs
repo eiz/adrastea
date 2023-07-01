@@ -42,8 +42,9 @@ use alloc::{
     collections::{BTreeMap, BinaryHeap},
     sync::Arc,
 };
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use bstr::{BString, ByteSlice};
+use byteorder::{ByteOrder, LittleEndian};
 use half::f16;
 use memmap2::Mmap;
 use regex::Regex;
@@ -258,6 +259,15 @@ impl<'a> ClipModelLoader<'a> {
         Self { pickle, kernels, params }
     }
 
+    pub fn load_scalar_f32(&self, name: &str) -> anyhow::Result<f32> {
+        let storage =
+            self.pickle.tensors.get(name).ok_or_else(|| anyhow!("missing tensor {}", name))?;
+        if storage.range.len() != 4 {
+            bail!("expected scalar tensor {}", name);
+        }
+        Ok(LittleEndian::read_f32(&self.pickle.mapping.data()[storage.range.clone()]))
+    }
+
     pub fn load_tensor_f16(&self, name: &str) -> anyhow::Result<Tensor<f16>> {
         to_f16(self.kernels, load_tensor(self.pickle, name)?)
     }
@@ -276,6 +286,7 @@ struct ClipTextParams {
     num_attention_heads: i32,
     num_hidden_layers: i32,
     vocab_size: i32,
+    hidden_size: i32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -497,10 +508,79 @@ impl ClipVisionTransformer {
 }
 
 struct ClipTextTransformer {
+    params: ClipTextParams,
     position_embedding: Tensor<f16>,
-    token_embedding: Tensor<f32>,
+    token_embedding: Tensor<f16>,
     layers: Vec<ClipTransformerBlock>,
-    //
+    final_layer_norm: ClipLayerNorm,
+}
+
+impl ClipTextTransformer {
+    fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            params: builder.params.text_config.clone(),
+            position_embedding: builder
+                .load_tensor_f16(&format!("{}.embeddings.position_embedding.weight", prefix))?,
+            token_embedding: builder
+                .load_tensor_f16(&format!("{}.embeddings.token_embedding.weight", prefix))?,
+            layers: (0..builder.params.text_config.num_hidden_layers)
+                .map(|i| {
+                    ClipTransformerBlock::new(builder, &format!("{}.encoder.layers.{}", prefix, i))
+                })
+                .collect::<anyhow::Result<_>>()?,
+            final_layer_norm: ClipLayerNorm::new(builder, &format!("{}.final_layer_norm", prefix))?,
+        })
+    }
+
+    pub fn forward(&self, kernels: &dyn CommonKernels, tokens: &[i32]) -> anyhow::Result<()> {
+        let mut hidden_state =
+            Tensor::new_hip(&[tokens.len() as usize, self.params.hidden_size as usize])?;
+        let tokens_gpu =
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+        kernels.embed(
+            &mut hidden_state.as_view_mut(),
+            tokens_gpu.as_view(),
+            self.token_embedding.as_view(),
+        )?;
+        kernels.elementwise_binary_2d_f16_inplace(
+            &mut hidden_state.as_view_mut(),
+            &self.position_embedding.as_view().take(&[tokens.len() as isize, -1]),
+            BinaryOp::Add,
+        )?;
+        for layer in &self.layers {
+            layer.forward(
+                kernels,
+                &mut hidden_state.as_view_mut(),
+                MatmulMask::Causal,
+                self.params.num_attention_heads as isize,
+            )?;
+        }
+        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
+        kernels.layer_norm(
+            &mut normed.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.final_layer_norm.weight.as_view(),
+            &self.final_layer_norm.bias.as_view(),
+            1.0e-5,
+        )?;
+        Ok(())
+    }
+}
+
+struct ClipJointEmbedding {
+    logit_scale: f32,
+    text_projection: Tensor<f16>,
+    visual_projection: Tensor<f16>,
+}
+
+impl ClipJointEmbedding {
+    fn new(builder: &ClipModelLoader) -> anyhow::Result<Self> {
+        Ok(Self {
+            logit_scale: builder.load_scalar_f32("logit_scale")?,
+            text_projection: builder.load_tensor_f16("text_projection.weight")?,
+            visual_projection: builder.load_tensor_f16("visual_projection.weight")?,
+        })
+    }
 }
 
 fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {
@@ -660,6 +740,21 @@ impl ClipVisionContext {
     }
 }
 
+struct ClipTextContext {
+    model: Arc<ClipTextTransformer>,
+    kernels: Arc<dyn CommonKernels>,
+}
+
+impl ClipTextContext {
+    pub fn new(model: Arc<ClipTextTransformer>, kernels: Arc<dyn CommonKernels>) -> Self {
+        Self { model, kernels }
+    }
+
+    pub fn encode(&self, text: &str) -> anyhow::Result<Tensor<f16>> {
+        todo!()
+    }
+}
+
 pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
     let phys = HipPhysicalDevice::get(0)?;
@@ -670,13 +765,16 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let params: ClipParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
     let builder = ClipModelLoader::new(&model, &*kernels, &params);
     let vt = ClipVisionTransformer::new(&builder, "vision_model")?;
-    let context = ClipVisionContext::new(Arc::new(vt), kernels);
+    let vision_ctx = ClipVisionContext::new(Arc::new(vt), kernels.clone());
+    let tt = ClipTextTransformer::new(&builder, "text_model")?;
+    let text_ctx = ClipTextContext::new(Arc::new(tt), kernels.clone());
+    let joint_embed = ClipJointEmbedding::new(&builder)?;
     println!("{:#?}", params);
     let mut tokenizer = ClipTokenizer::new(Arc::new(ClipVocabulary::new()));
     let tokens = tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx")?;
     println!("{:?}", tokens);
     println!("{:?}", tokenizer.decode(&tokens));
-    context.encode("/home/eiz/clip_gold.png")?;
+    vision_ctx.encode("/home/eiz/clip_gold.png")?;
     todo!();
 }
 

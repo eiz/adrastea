@@ -17,6 +17,7 @@ dependencies = [
  "anyhow",
  "ash",
  "bstr",
+ "byteorder",
  "cstr",
  "half",
  "libc",
