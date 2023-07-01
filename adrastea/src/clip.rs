@@ -36,7 +36,7 @@
 // SOFTWARE.
 
 use core::ops::Range;
-use std::{fs::File, io::Write, path::Path, time::Instant};
+use std::{fs::File, io::Write, path::Path};
 
 use alloc::{
     collections::{BTreeMap, BinaryHeap},
@@ -147,14 +147,15 @@ impl ClipTokenizer {
         let mut result = vec![];
         let word_regex = self.vocab.word_regex.clone();
         for rmatch in word_regex.find_iter(&text.to_lowercase()) {
-            self.tokenize_word(&mut result, &format!("{}</w>", rmatch.as_str()))?;
+            let err = self.tokenize_word(&mut result, &format!("{}</w>", rmatch.as_str()));
+            self.symbols.clear();
+            err?;
         }
         Ok(result)
     }
 
     pub fn decode(&self, tokens: &[i32]) -> String {
         let mut result = String::new();
-        let mut first = true;
         for token in tokens {
             result.push_str(&self.vocab.tokens[*token as usize].replace("</w>", " "));
         }
@@ -219,12 +220,10 @@ impl ClipTokenizer {
             if let Some(token) = self.vocab.token_lookup.get(text) {
                 result.push(*token as i32);
             } else {
-                // TODO: I still don't fully get how bytes are supposed to work in this tokenizer
                 bail!("failed to encode {:?}", text);
             }
             i = symbol.next;
         }
-        self.symbols.clear();
         Ok(())
     }
 
@@ -317,6 +316,62 @@ impl ClipAttention {
             out: ClipLinear::new(builder, &format!("{}.out_proj", prefix))?,
         })
     }
+
+    fn forward(
+        &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
+        normed: &TensorView<f16>, mask: MatmulMask, heads: isize,
+    ) -> anyhow::Result<()> {
+        let mut query = Tensor::new_hip(&normed.layout().dims)?;
+        let mut key = Tensor::new_hip(&normed.layout().dims)?;
+        let mut value = Tensor::new_hip(&normed.layout().dims)?;
+        let mut qkv = Tensor::new_hip(&normed.layout().dims)?;
+        kernels.matmul_f16(
+            &mut query.as_view_mut(),
+            normed,
+            &self.query.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &self.query.bias.as_view())),
+        )?;
+        kernels.matmul_f16(
+            &mut key.as_view_mut(),
+            normed,
+            &self.key.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &self.key.bias.as_view())),
+        )?;
+        kernels.matmul_f16(
+            &mut value.as_view_mut(),
+            normed,
+            &self.value.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &self.value.bias.as_view())),
+        )?;
+        let q_view =
+            query.as_view().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let k_view =
+            key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
+        let v_view =
+            value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        kernels.matmul_f16(
+            &mut qk.as_view_mut(),
+            &q_view,
+            &k_view,
+            MatmulOptions::new()
+                .store(MatmulStore::Scale(
+                    1.0 / (hidden_state.size(-1) as f32 / heads as f32).sqrt(),
+                ))
+                .mask(mask),
+        )?;
+        kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
+        let mut qkv_view =
+            qkv.as_view_mut().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
+        kernels.matmul_f16(&mut qkv_view, &qk.as_view(), &v_view, MatmulOptions::new())?;
+        kernels.matmul_f16(
+            hidden_state,
+            &qkv.as_view(),
+            &self.out.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &self.out.bias.as_view())),
+        )?;
+        Ok(())
+    }
 }
 
 struct ClipLinear {
@@ -345,6 +400,26 @@ impl ClipMLP {
             fc2: ClipLinear::new(builder, &format!("{}.fc2", prefix))?,
         })
     }
+
+    pub fn forward(
+        &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
+        normed: &TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        let mut mlp_hidden = Tensor::new_hip(&[hidden_state.size(-2), self.fc1.weight.size(-2)])?;
+        kernels.matmul_f16(
+            &mut mlp_hidden.as_view_mut(),
+            normed,
+            &self.fc1.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::QuickGeluBias(&self.fc1.bias.as_view())),
+        )?;
+        kernels.matmul_f16(
+            hidden_state,
+            &mlp_hidden.as_view(),
+            &self.fc2.weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &self.fc2.bias.as_view())),
+        )?;
+        Ok(())
+    }
 }
 
 struct ClipTransformerBlock {
@@ -362,6 +437,30 @@ impl ClipTransformerBlock {
             layer_norm2: ClipLayerNorm::new(builder, &format!("{}.layer_norm2", prefix))?,
             mlp: ClipMLP::new(builder, &format!("{}.mlp", prefix))?,
         })
+    }
+
+    pub fn forward(
+        &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
+        mask: MatmulMask, heads: isize,
+    ) -> anyhow::Result<()> {
+        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
+        kernels.layer_norm(
+            &mut normed.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.layer_norm1.weight.as_view(),
+            &self.layer_norm1.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.attn.forward(kernels, hidden_state, &normed.as_view(), mask, heads)?;
+        kernels.layer_norm(
+            &mut normed.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.layer_norm2.weight.as_view(),
+            &self.layer_norm2.bias.as_view(),
+            1.0e-5,
+        )?;
+        self.mlp.forward(kernels, hidden_state, &normed.as_view())?;
+        Ok(())
     }
 }
 
@@ -542,7 +641,12 @@ impl ClipVisionContext {
             1.0e-5,
         )?;
         for layer in &self.model.layers {
-            self.process_layer(&mut hidden_state.as_view_mut(), layer, MatmulMask::None)?;
+            layer.forward(
+                &*self.kernels,
+                &mut hidden_state.as_view_mut(),
+                MatmulMask::None,
+                self.model.params.num_attention_heads as isize,
+            )?;
         }
         let mut output_norm = Tensor::new_hip(&[1, 1024])?;
         self.kernels.layer_norm(
@@ -553,106 +657,6 @@ impl ClipVisionContext {
             1.0e-5,
         )?;
         Ok(output_norm)
-    }
-
-    fn process_layer(
-        &self, hidden_state: &mut TensorViewMut<f16>, layer: &ClipTransformerBlock,
-        mask: MatmulMask,
-    ) -> anyhow::Result<()> {
-        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
-        self.kernels.layer_norm(
-            &mut normed.as_view_mut(),
-            &hidden_state.as_view(),
-            &layer.layer_norm1.weight.as_view(),
-            &layer.layer_norm1.bias.as_view(),
-            1.0e-5,
-        )?;
-        self.residual_attention(hidden_state, &normed.as_view(), &layer.attn, mask)?;
-        self.kernels.layer_norm(
-            &mut normed.as_view_mut(),
-            &hidden_state.as_view(),
-            &layer.layer_norm2.weight.as_view(),
-            &layer.layer_norm2.bias.as_view(),
-            1.0e-5,
-        )?;
-        self.residual_mlp(hidden_state, &normed.as_view(), &layer.mlp)?;
-        Ok(())
-    }
-
-    fn residual_attention(
-        &self, hidden_state: &mut TensorViewMut<f16>, normed: &TensorView<f16>,
-        attn: &ClipAttention, mask: MatmulMask,
-    ) -> anyhow::Result<()> {
-        let heads = self.model.params.num_attention_heads as isize;
-        let mut query = Tensor::new_hip(&normed.layout().dims)?;
-        let mut key = Tensor::new_hip(&normed.layout().dims)?;
-        let mut value = Tensor::new_hip(&normed.layout().dims)?;
-        let mut qkv = Tensor::new_hip(&normed.layout().dims)?;
-        self.kernels.matmul_f16(
-            &mut query.as_view_mut(),
-            normed,
-            &attn.query.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.query.bias.as_view())),
-        )?;
-        self.kernels.matmul_f16(
-            &mut key.as_view_mut(),
-            normed,
-            &attn.key.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.key.bias.as_view())),
-        )?;
-        self.kernels.matmul_f16(
-            &mut value.as_view_mut(),
-            normed,
-            &attn.value.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &attn.value.bias.as_view())),
-        )?;
-        let q_view =
-            query.as_view().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        let k_view =
-            key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
-        let v_view =
-            value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
-        self.kernels.matmul_f16(
-            &mut qk.as_view_mut(),
-            &q_view,
-            &k_view,
-            MatmulOptions::new()
-                .store(MatmulStore::Scale(
-                    1.0 / (hidden_state.size(-1) as f32 / heads as f32).sqrt(),
-                ))
-                .mask(mask),
-        )?;
-        self.kernels.softmax_rows_inplace(&mut qk.as_view_mut(), 1.0)?;
-        let mut qkv_view =
-            qkv.as_view_mut().shape_cast(&[query.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        self.kernels.matmul_f16(&mut qkv_view, &qk.as_view(), &v_view, MatmulOptions::new())?;
-        self.kernels.matmul_f16(
-            hidden_state,
-            &qkv.as_view(),
-            &attn.out.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &attn.out.bias.as_view())),
-        )?;
-        Ok(())
-    }
-
-    fn residual_mlp(
-        &self, hidden_state: &mut TensorViewMut<f16>, normed: &TensorView<f16>, mlp: &ClipMLP,
-    ) -> anyhow::Result<()> {
-        let mut mlp_hidden = Tensor::new_hip(&[hidden_state.size(-2), mlp.fc1.weight.size(-2)])?;
-        self.kernels.matmul_f16(
-            &mut mlp_hidden.as_view_mut(),
-            normed,
-            &mlp.fc1.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::QuickGeluBias(&mlp.fc1.bias.as_view())),
-        )?;
-        self.kernels.matmul_f16(
-            hidden_state,
-            &mlp_hidden.as_view(),
-            &mlp.fc2.weight.as_view().permute(&[1, 0]),
-            MatmulOptions::new().store(MatmulStore::BetaBias(1.0, &mlp.fc2.bias.as_view())),
-        )?;
-        Ok(())
     }
 }
 
@@ -669,7 +673,7 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let context = ClipVisionContext::new(Arc::new(vt), kernels);
     println!("{:#?}", params);
     let mut tokenizer = ClipTokenizer::new(Arc::new(ClipVocabulary::new()));
-    let tokens = tokenizer.encode("hello world thumbwar")?;
+    let tokens = tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx")?;
     println!("{:?}", tokens);
     println!("{:?}", tokenizer.decode(&tokens));
     context.encode("/home/eiz/clip_gold.png")?;
