@@ -593,6 +593,36 @@ impl ClipJointEmbedding {
             visual_projection: builder.load_tensor_f16("visual_projection.weight")?,
         })
     }
+
+    pub fn embed_text(
+        &self, kernels: &dyn CommonKernels, embedding: &mut TensorViewMut<f16>,
+        text_features: Tensor<f16>,
+    ) -> anyhow::Result<()> {
+        kernels.matmul_f16(
+            embedding,
+            &text_features.as_view(),
+            &self.text_projection.as_view(),
+            MatmulOptions::new(),
+        )?;
+        todo!();
+        // kernels.l2_norm_inplace(embedding)?;
+        Ok(())
+    }
+
+    pub fn embed_image(
+        &self, kernels: &dyn CommonKernels, embedding: &mut TensorViewMut<f16>,
+        visual_features: Tensor<f16>,
+    ) -> anyhow::Result<()> {
+        kernels.matmul_f16(
+            embedding,
+            &visual_features.as_view(),
+            &self.visual_projection.as_view(),
+            MatmulOptions::new(),
+        )?;
+        todo!();
+        // kernels.l2_norm_inplace(embedding)?;
+        Ok(())
+    }
 }
 
 fn load_image_eager<P: AsRef<Path>>(path: P) -> anyhow::Result<Image> {

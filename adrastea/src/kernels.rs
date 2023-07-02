@@ -438,22 +438,20 @@ pub struct GpuKernels {
 
 impl GpuKernels {
     pub fn new(capability: i32) -> anyhow::Result<Self> {
-        let module_conv1d = HipModule::find(capability, adrastea_kernels::conv1d)?;
+        let module_convolution = HipModule::find(capability, adrastea_kernels::convolution)?;
         let module_convert = HipModule::find(capability, adrastea_kernels::convert)?;
-        let module_layer_norm = HipModule::find(capability, adrastea_kernels::layer_norm)?;
-        let module_rms_norm = HipModule::find(capability, adrastea_kernels::rms_norm)?;
         let module_rotary = HipModule::find(capability, adrastea_kernels::rotary)?;
         let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
         let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
-        let module_softmax_rows = HipModule::find(capability, adrastea_kernels::softmax_rows)?;
+        let module_normalize = HipModule::find(capability, adrastea_kernels::normalize)?;
         let module_embed = HipModule::find(capability, adrastea_kernels::embed)?;
         let module_error_stats = HipModule::find(capability, adrastea_kernels::error_stats)?;
         let kernels = GpuKernels {
-            conv1d: Kernel::new(&module_conv1d, "conv1d")?,
-            conv2d_f16: Kernel::new(&module_conv1d, "conv2d_f16")?,
-            conv2d_f32: Kernel::new(&module_conv1d, "conv2d_f32")?,
-            layer_norm: Kernel::new(&module_layer_norm, "layer_norm")?,
-            rms_norm: Kernel::new(&module_rms_norm, "rms_norm")?,
+            conv1d: Kernel::new(&module_convolution, "conv1d")?,
+            conv2d_f16: Kernel::new(&module_convolution, "conv2d_f16")?,
+            conv2d_f32: Kernel::new(&module_convolution, "conv2d_f32")?,
+            layer_norm: Kernel::new(&module_normalize, "layer_norm")?,
+            rms_norm: Kernel::new(&module_normalize, "rms_norm")?,
             rotary: Kernel::new(&module_rotary, "rotary")?,
             matmul_f16_slow: Kernel::new(&module_matmul, "matmul_f16")?,
             matmul_f16: Kernel::new(&module_matmul, "matmul_f16_fast")?,
@@ -463,20 +461,18 @@ impl GpuKernels {
             )?,
             elementwise_unary_2d_f16: Kernel::new(&module_elementwise, "elementwise_unary_2d_f16")?,
             elementwise_unary_2d_f32: Kernel::new(&module_elementwise, "elementwise_unary_2d_f32")?,
-            softmax_rows: Kernel::new(&module_softmax_rows, "softmax_rows")?,
+            softmax_rows: Kernel::new(&module_normalize, "softmax_rows")?,
             embed: Kernel::new(&module_embed, "embed")?,
             fp32_to_fp16: Kernel::new(&module_convert, "fp32_to_fp16")?,
             error_stats_f16: Kernel::new(&module_error_stats, "error_stats_f16")?,
             error_stats_f32: Kernel::new(&module_error_stats, "error_stats_f32")?,
             _modules: vec![
-                module_conv1d,
+                module_convolution,
                 module_convert,
-                module_layer_norm,
-                module_rms_norm,
                 module_rotary,
                 module_elementwise,
                 module_matmul,
-                module_softmax_rows,
+                module_normalize,
                 module_embed,
                 module_error_stats,
             ],

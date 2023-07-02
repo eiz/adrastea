@@ -20,19 +20,17 @@ macro_rules! simt_kernels {
 simt_kernels! {
     [sm_80: "sm_80", sm_89: "sm_89", gfx1100: "gfx1100"],
     [
-        conv1d,
         convert,
+        convolution,
         elementwise,
         embed,
         embed_uint8,
         error_stats,
-        layer_norm,
         matmul,
         matmul_nt_fp16u8,
         microbench,
-        rms_norm,
+        normalize,
         rotary,
-        softmax_rows,
         square_fp32_16x16
     ]
 }

@@ -58,19 +58,17 @@ fn build_arch_hip(out_path: &Path, arch: &str, kernels: &[&str]) {
 
 fn main() {
     let kernels = &[
-        "conv1d",
         "convert",
+        "convolution",
         "elementwise",
         "embed",
         "embed_uint8",
         "error_stats",
-        "layer_norm",
         "matmul",
         "matmul_nt_fp16u8",
         "microbench",
-        "rms_norm",
+        "normalize",
         "rotary",
-        "softmax_rows",
         "square_fp32_16x16",
     ];
     let kernels_cuda = &[
