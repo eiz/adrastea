@@ -144,13 +144,24 @@ impl ClipTokenizer {
         Self { vocab, symbols: Vec::new(), work_queue: BinaryHeap::new() }
     }
 
-    pub fn encode(&mut self, text: &str) -> anyhow::Result<Vec<i32>> {
+    pub fn encode(&mut self, text: &str, bos: bool, eos: bool) -> anyhow::Result<Vec<i32>> {
         let mut result = vec![];
+        if bos {
+            result.push(
+                *self.vocab.token_lookup.get("<|startoftext|>".as_bytes().as_bstr()).unwrap()
+                    as i32,
+            );
+        }
         let word_regex = self.vocab.word_regex.clone();
         for rmatch in word_regex.find_iter(&text.to_lowercase()) {
             let err = self.tokenize_word(&mut result, &format!("{}</w>", rmatch.as_str()));
             self.symbols.clear();
             err?;
+        }
+        if eos {
+            result
+                .push(*self.vocab.token_lookup.get("<|endoftext|>".as_bytes().as_bstr()).unwrap()
+                    as i32);
         }
         Ok(result)
     }
@@ -532,7 +543,9 @@ impl ClipTextTransformer {
         })
     }
 
-    pub fn forward(&self, kernels: &dyn CommonKernels, tokens: &[i32]) -> anyhow::Result<()> {
+    pub fn forward(
+        &self, kernels: &dyn CommonKernels, last_logits: &mut TensorViewMut<f16>, tokens: &[i32],
+    ) -> anyhow::Result<()> {
         let mut hidden_state =
             Tensor::new_hip(&[tokens.len() as usize, self.params.hidden_size as usize])?;
         let tokens_gpu =
@@ -555,10 +568,9 @@ impl ClipTextTransformer {
                 self.params.num_attention_heads as isize,
             )?;
         }
-        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
         kernels.layer_norm(
-            &mut normed.as_view_mut(),
-            &hidden_state.as_view(),
+            last_logits,
+            &hidden_state.as_view().skip(&[(tokens.len() - 1) as isize, 0]),
             &self.final_layer_norm.weight.as_view(),
             &self.final_layer_norm.bias.as_view(),
             1.0e-5,
@@ -742,16 +754,25 @@ impl ClipVisionContext {
 
 struct ClipTextContext {
     model: Arc<ClipTextTransformer>,
+    tokenizer: ClipTokenizer,
     kernels: Arc<dyn CommonKernels>,
 }
 
 impl ClipTextContext {
-    pub fn new(model: Arc<ClipTextTransformer>, kernels: Arc<dyn CommonKernels>) -> Self {
-        Self { model, kernels }
+    pub fn new(
+        model: Arc<ClipTextTransformer>, vocab: Arc<ClipVocabulary>,
+        kernels: Arc<dyn CommonKernels>,
+    ) -> Self {
+        let tokenizer = ClipTokenizer::new(vocab);
+        Self { model, tokenizer, kernels }
     }
 
-    pub fn encode(&self, text: &str) -> anyhow::Result<Tensor<f16>> {
-        todo!()
+    pub fn encode(&mut self, text: &str) -> anyhow::Result<Tensor<f16>> {
+        let tokens = self.tokenizer.encode(text, true, true)?;
+        let mut logits = Tensor::new_hip(&[1, self.model.params.hidden_size as usize])?;
+        println!("{:?} => {:?}", text, tokens);
+        self.model.forward(&*self.kernels, &mut logits.as_view_mut(), &tokens)?;
+        Ok(logits)
     }
 }
 
@@ -767,14 +788,18 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let vt = ClipVisionTransformer::new(&builder, "vision_model")?;
     let vision_ctx = ClipVisionContext::new(Arc::new(vt), kernels.clone());
     let tt = ClipTextTransformer::new(&builder, "text_model")?;
-    let text_ctx = ClipTextContext::new(Arc::new(tt), kernels.clone());
+    let vocab = Arc::new(ClipVocabulary::new());
+    let mut text_ctx = ClipTextContext::new(Arc::new(tt), vocab.clone(), kernels.clone());
     let joint_embed = ClipJointEmbedding::new(&builder)?;
     println!("{:#?}", params);
-    let mut tokenizer = ClipTokenizer::new(Arc::new(ClipVocabulary::new()));
-    let tokens = tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx")?;
+    let mut tokenizer = ClipTokenizer::new(vocab);
+    let tokens =
+        tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx", false, false)?;
     println!("{:?}", tokens);
     println!("{:?}", tokenizer.decode(&tokens));
     vision_ctx.encode("/home/eiz/clip_gold.png")?;
+    let text_embedding = text_ctx.encode("a photo of a cat")?;
+    println!("text_embedding {:>7.4?}", text_embedding);
     todo!();
 }
 
