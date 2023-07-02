@@ -581,6 +581,7 @@ impl ClipTextTransformer {
 
 struct ClipJointEmbedding {
     logit_scale: f32,
+    projection_dim: usize,
     text_projection: Tensor<f16>,
     visual_projection: Tensor<f16>,
 }
@@ -589,6 +590,7 @@ impl ClipJointEmbedding {
     fn new(builder: &ClipModelLoader) -> anyhow::Result<Self> {
         Ok(Self {
             logit_scale: builder.load_scalar_f32("logit_scale")?,
+            projection_dim: builder.params.projection_dim as usize,
             text_projection: builder.load_tensor_f16("text_projection.weight")?,
             visual_projection: builder.load_tensor_f16("visual_projection.weight")?,
         })
@@ -596,31 +598,48 @@ impl ClipJointEmbedding {
 
     pub fn embed_text(
         &self, kernels: &dyn CommonKernels, embedding: &mut TensorViewMut<f16>,
-        text_features: Tensor<f16>,
+        text_features: &TensorView<f16>,
     ) -> anyhow::Result<()> {
         kernels.matmul_f16(
             embedding,
-            &text_features.as_view(),
-            &self.text_projection.as_view(),
+            &text_features,
+            &self.text_projection.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
-        todo!();
-        // kernels.l2_norm_inplace(embedding)?;
+        kernels.l2_norm_f16_inplace(embedding)?;
         Ok(())
     }
 
     pub fn embed_image(
         &self, kernels: &dyn CommonKernels, embedding: &mut TensorViewMut<f16>,
-        visual_features: Tensor<f16>,
+        visual_features: &TensorView<f16>,
     ) -> anyhow::Result<()> {
         kernels.matmul_f16(
             embedding,
-            &visual_features.as_view(),
-            &self.visual_projection.as_view(),
+            visual_features,
+            &self.visual_projection.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
-        todo!();
-        // kernels.l2_norm_inplace(embedding)?;
+        kernels.l2_norm_f16_inplace(embedding)?;
+        Ok(())
+    }
+
+    pub fn forward(
+        &self, kernels: &dyn CommonKernels, similarities: &mut TensorViewMut<f16>,
+        text_features: &TensorView<f16>, visual_features: &TensorView<f16>,
+    ) -> anyhow::Result<()> {
+        assert_eq!(text_features.size(-2), visual_features.size(-2));
+        let mut text_embedding = Tensor::new_hip(&[text_features.size(-2), self.projection_dim])?;
+        let mut visual_embedding =
+            Tensor::new_hip(&[visual_features.size(-2), self.projection_dim])?;
+        self.embed_text(kernels, &mut text_embedding.as_view_mut(), text_features)?;
+        self.embed_image(kernels, &mut visual_embedding.as_view_mut(), visual_features)?;
+        kernels.matmul_f16(
+            similarities,
+            &text_embedding.as_view(),
+            &visual_embedding.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::Scale(self.logit_scale.exp())),
+        )?;
         Ok(())
     }
 }
@@ -825,11 +844,16 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let mut tokenizer = ClipTokenizer::new(vocab);
     let tokens =
         tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx", false, false)?;
-    println!("{:?}", tokens);
-    println!("{:?}", tokenizer.decode(&tokens));
-    vision_ctx.encode("/home/eiz/clip_gold.png")?;
+    let vision_embedding = vision_ctx.encode("/home/eiz/clip_gold.png")?;
     let text_embedding = text_ctx.encode("a photo of a cat")?;
-    println!("text_embedding {:>7.4?}", text_embedding);
+    let mut similarities = Tensor::new_hip(&[1, 1])?;
+    joint_embed.forward(
+        &*kernels,
+        &mut similarities.as_view_mut(),
+        &text_embedding.as_view(),
+        &vision_embedding.as_view(),
+    )?;
+    println!("similarities {:?}", similarities);
     todo!();
 }
 

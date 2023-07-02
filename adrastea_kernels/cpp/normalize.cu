@@ -1,5 +1,7 @@
 #include "compat.h"
 
+// all normalizations are performed in f32 and converted to the desired output format
+
 // row-wise rms normalization
 // 1 block per row, x = row, 8 warps per block
 extern "C" __global__ void rms_norm(__half* output,
@@ -215,4 +217,60 @@ extern "C" __global__ void softmax_rows(__half* output,
     float val = __half2float(input[row_idx + i]) / temp;
     output[row_idx + i] = __float2half(expf(val - s_max_val) / s_sum_exp);
   }
+}
+
+// row-wise euclidean vector norm
+template <typename T>
+__device__ void l2_norm(TensorView<T> output, TensorView<T> input) {
+  using Frame = typename TensorView<T>::StackFrame;
+  output.iter_dims(1, [&output, &input](Frame* tos, Frame* bos) {
+    auto out_view = output.slice(tos, bos);
+    auto in_view = input.slice(tos, bos);
+    int row = BLOCK_IDX_X;
+    int tid = THREAD_IDX_X;
+    int warp_id = tid / 32;
+    bool warp_leader = (tid % 32) == 0;
+    __shared__ float s_norm;
+    __shared__ float s_warp_reduced[8];
+    float sum_val = 0.0f;
+    // sum_sq: thread reduction
+    for (int i = tid; i < out_view.width(); i += BLOCK_DIM_X) {
+      float val = float(in_view(row, i));
+      sum_val += val * val;
+    }
+    __syncthreads();
+    // sum_sq: warp reduction
+    for (int offset = 16; offset > 0; offset /= 2) {
+      float other_val = __shfl_xor_sync(~0, sum_val, offset);
+      sum_val += other_val;
+    }
+    if (warp_leader) {
+      s_warp_reduced[warp_id] = sum_val;
+    }
+    // sum_sq: block reduction
+    __syncthreads();
+    if (warp_id == 0) {
+      sum_val = (tid < 8) ? s_warp_reduced[tid] : 0.0f;
+      for (int offset = 4; offset > 0; offset /= 2) {
+        float other_val = __shfl_xor_sync(~0, sum_val, offset);
+        sum_val += other_val;
+      }
+      if (warp_leader) {
+        s_norm = rsqrt(sum_val + 1.0e-5);
+      }
+    }
+    __syncthreads();
+    float norm = s_norm;
+    for (int i = tid; i < out_view.width(); i += BLOCK_DIM_X) {
+      output(row, i) = T(float(in_view(row, i)) * norm);
+    }
+  });
+}
+
+extern "C" __global__ void l2_norm_f16(TensorViewF16 output, TensorViewF16 input) {
+  l2_norm(output, input);
+}
+
+extern "C" __global__ void l2_norm_f32(TensorViewF32 output, TensorViewF32 input) {
+  l2_norm(output, input);
 }

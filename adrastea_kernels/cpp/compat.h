@@ -44,6 +44,11 @@ struct TensorView {
   uint32_t shape[7];
   uint32_t strides[7];
 
+  struct StackFrame {
+    int dim_idx;
+    int idx;
+  };
+
   // traditional NCHW dimension names
   __device__ __forceinline__ uint32_t width() { return shape[0]; }
   __device__ __forceinline__ uint32_t height() { return shape[1]; }
@@ -60,24 +65,23 @@ struct TensorView {
   __device__ __forceinline__ T& operator()(uint32_t n, uint32_t c, uint32_t y, uint32_t x) {
     return ptr[n * strides[3] + c * strides[2] + y * strides[1] + x * strides[0]];
   }
-};
-using TensorViewF16 = TensorView<__half>;
-using TensorViewF32 = TensorView<float>;
 
-namespace iter {
-struct stack_frame {
-  int dim_idx;
-  int idx;
-};
-}  // namespace iter
+  __device__ __forceinline__ TensorView<T> slice(StackFrame* tos, StackFrame* bos) {
+    auto result = *this;
+    for (StackFrame* cur = tos + 1; cur < bos; cur++) {
+      result.ptr += cur->idx * result.strides[cur->dim_idx];
+      result.dims--;
+    }
+    return result;
+  }
 
-template <typename T, typename Fn>
-__device__ __forceinline__ void iter_dims(TensorView<T>& tv, Fn fn, int atom_dim = 0) {
-  iter::stack_frame dim_stack[7];
-  iter::stack_frame* bos = &dim_stack[7];
-  iter::stack_frame* tos = &dim_stack[6];
-  tos->dim_idx = tv.dims - 1;
-  tos->idx = 0;
+  template <typename Fn>
+  __device__ __forceinline__ void iter_dims(int atom_dim, Fn fn) {
+    StackFrame dim_stack[7];
+    StackFrame* bos = &dim_stack[7];
+    StackFrame* tos = &dim_stack[6];
+    tos->dim_idx = dims - 1;
+    tos->idx = 0;
 #define POP()        \
   do {               \
     tos++;           \
@@ -85,19 +89,22 @@ __device__ __forceinline__ void iter_dims(TensorView<T>& tv, Fn fn, int atom_dim
       tos->idx++;    \
     }                \
   } while (0)
-  while (tos < bos) {
-    if (tos->dim_idx <= atom_dim) {
-      fn(bos, tos);
-      POP();
-    } else {
-      if (tos->idx >= tv.shape[tos->dim_idx]) {
+    while (tos < bos) {
+      if (tos->dim_idx <= atom_dim) {
+        fn(tos, bos);
         POP();
-        continue;
+      } else {
+        if (tos->idx >= shape[tos->dim_idx]) {
+          POP();
+          continue;
+        }
+        tos--;
+        tos->dim_idx = tos[1].dim_idx - 1;
+        tos->idx = 0;
       }
-      tos--;
-      tos->dim_idx = tos[1].dim_idx - 1;
-      tos->idx = 0;
     }
-  }
 #undef POP
-}
+  }
+};
+using TensorViewF16 = TensorView<__half>;
+using TensorViewF32 = TensorView<float>;

@@ -185,6 +185,7 @@ pub trait CommonKernels {
         &self, output: &mut TensorViewMut<f16>, input: &TensorView<f16>, weight: &TensorView<f16>,
         eps: f32,
     ) -> anyhow::Result<()>;
+    fn l2_norm_f16_inplace(&self, inout: &mut TensorViewMut<f16>) -> anyhow::Result<()>;
     fn rotary_inplace(
         &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
     ) -> anyhow::Result<()>;
@@ -279,6 +280,9 @@ impl CommonKernels for MatmulTracer {
         eps: f32,
     ) -> anyhow::Result<()> {
         self.kernels.rms_norm(output, input, weight, eps)
+    }
+    fn l2_norm_f16_inplace(&self, inout: &mut TensorViewMut<f16>) -> anyhow::Result<()> {
+        self.kernels.l2_norm_f16_inplace(inout)
     }
     fn rotary_inplace(
         &self, inout: &mut TensorViewMut<f16>, n_heads: i32, pos_offset: i32, theta: f32,
@@ -376,6 +380,7 @@ pub struct GpuKernels {
     layer_norm:
         Kernel<(*mut f16, *const f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
     rms_norm: Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, f32)>,
+    l2_norm_f16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor)>,
     rotary: Kernel<(*mut f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, f32)>,
     matmul_f16_slow: Kernel<(
         *mut f16,
@@ -452,6 +457,7 @@ impl GpuKernels {
             conv2d_f32: Kernel::new(&module_convolution, "conv2d_f32")?,
             layer_norm: Kernel::new(&module_normalize, "layer_norm")?,
             rms_norm: Kernel::new(&module_normalize, "rms_norm")?,
+            l2_norm_f16: Kernel::new(&module_normalize, "l2_norm_f16")?,
             rotary: Kernel::new(&module_rotary, "rotary")?,
             matmul_f16_slow: Kernel::new(&module_matmul, "matmul_f16")?,
             matmul_f16: Kernel::new(&module_matmul, "matmul_f16_fast")?,
@@ -715,6 +721,19 @@ impl CommonKernels for GpuKernels {
                 input.stride(-2) as i32,
                 eps,
             ),
+        )?;
+        Ok(())
+    }
+
+    fn l2_norm_f16_inplace(&self, inout: &mut TensorViewMut<f16>) -> anyhow::Result<()> {
+        self.l2_norm_f16.launch(
+            LaunchParams {
+                blocks: (inout.size(-2) as u32, 1, 1),
+                threads: (256, 1, 1),
+                shared_mem: 0,
+                stream: None,
+            },
+            (inout.into(), inout.into()),
         )?;
         Ok(())
     }
