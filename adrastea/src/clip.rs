@@ -746,6 +746,15 @@ impl ClipVisionContext {
     }
 
     pub fn encode(&self, image: impl LazyClipImage) -> anyhow::Result<Tensor<f16>> {
+        let mut output_norm = Tensor::new_hip(&[1, 1024])?;
+        self.encode_into(&mut output_norm.as_view_mut(), image, None)?;
+        Ok(output_norm)
+    }
+
+    pub fn encode_into(
+        &self, output: &mut TensorViewMut<f16>, image: impl LazyClipImage,
+        early_output_layer: Option<usize>,
+    ) -> anyhow::Result<()> {
         let image = image.load(&*self.kernels)?;
         let mut embedding = Tensor::new_hip(&[257, 1024])?;
         let mut class_embed = embedding.as_view_mut();
@@ -781,23 +790,32 @@ impl ClipVisionContext {
             &self.model.pre_layernorm.bias.as_view(),
             1.0e-5,
         )?;
-        for layer in &self.model.layers {
-            layer.forward(
-                &*self.kernels,
-                &mut hidden_state.as_view_mut(),
-                MatmulMask::None,
-                self.model.params.num_attention_heads as isize,
-            )?;
+        for (i, layer) in self.model.layers.iter().enumerate() {
+            if Some(i) == early_output_layer {
+                layer.forward(
+                    &*self.kernels,
+                    output,
+                    MatmulMask::None,
+                    self.model.params.num_attention_heads as isize,
+                )?;
+                return Ok(());
+            } else {
+                layer.forward(
+                    &*self.kernels,
+                    &mut hidden_state.as_view_mut(),
+                    MatmulMask::None,
+                    self.model.params.num_attention_heads as isize,
+                )?;
+            }
         }
-        let mut output_norm = Tensor::new_hip(&[1, 1024])?;
         self.kernels.layer_norm(
-            &mut output_norm.as_view_mut(),
+            output,
             &hidden_state.as_view().take(&[1, 1024]),
             &self.model.post_layernorm.weight.as_view(),
             &self.model.post_layernorm.bias.as_view(),
             1.0e-5,
         )?;
-        Ok(output_norm)
+        Ok(())
     }
 }
 
@@ -816,10 +834,17 @@ impl ClipTextContext {
         Self { model, tokenizer, kernels }
     }
 
+    pub fn encode_into(
+        &mut self, output: &mut TensorViewMut<f16>, text: &str,
+    ) -> anyhow::Result<()> {
+        let tokens = self.tokenizer.encode(text, true, true)?;
+        self.model.forward(&*self.kernels, output, &tokens)?;
+        Ok(())
+    }
+
     pub fn encode(&mut self, text: &str) -> anyhow::Result<Tensor<f16>> {
         let tokens = self.tokenizer.encode(text, true, true)?;
         let mut logits = Tensor::new_hip(&[1, self.model.params.hidden_size as usize])?;
-        println!("{:?} => {:?}", text, tokens);
         self.model.forward(&*self.kernels, &mut logits.as_view_mut(), &tokens)?;
         Ok(logits)
     }
@@ -842,8 +867,6 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let joint_embed = ClipJointEmbedding::new(&builder)?;
     println!("{:#?}", params);
     let mut tokenizer = ClipTokenizer::new(vocab);
-    let tokens =
-        tokenizer.encode("hello world thumbwar x xx xxx xxxx xxxxx xxxxxx", false, false)?;
     let vision_embedding = vision_ctx.encode("/home/eiz/clip_gold.png")?;
     let text_embedding = text_ctx.encode("a photo of a cat")?;
     let mut similarities = Tensor::new_hip(&[1, 1])?;
