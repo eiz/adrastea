@@ -21,6 +21,7 @@ use std::{
     path::Path,
 };
 
+use alloc::collections::btree_map::Entry::{Occupied, Vacant};
 use anyhow::bail;
 use memmap2::Mmap;
 use serde::Deserialize;
@@ -250,6 +251,47 @@ impl PickledModel<()> {
         path: P, dict_path: Option<&str>,
     ) -> anyhow::Result<PickledModel<()>> {
         Self::load_typed::<RawModel, _>(path, dict_path)
+    }
+}
+
+#[derive(Deserialize)]
+struct HuggingFaceShardIndex {
+    weight_map: BTreeMap<String, String>,
+}
+
+pub struct ShardedModel {
+    shards: Vec<PickledModel<()>>,
+    index: BTreeMap<String, usize>,
+}
+
+impl ShardedModel {
+    pub fn load_huggingface<P: AsRef<Path>>(dir: P) -> anyhow::Result<Self> {
+        let dir = dir.as_ref();
+        // 🤗's (maybe I should name my company 🤣) sharded model format doesn't
+        // actually tell you how many files there are or use indices. our internal
+        // indices may not match the shard order in the file names because we're just
+        // assigning them as we see them in the weight map
+        let mut shard_index = BTreeMap::new();
+        let mut shards = vec![];
+        let mut index = BTreeMap::new();
+        let index_file: HuggingFaceShardIndex =
+            serde_json::from_reader(File::open(dir.join("pytorch_model.bin.index.json"))?)?;
+        for (tensor_name, shard_name) in index_file.weight_map {
+            let shard = shard_index.entry(shard_name.clone());
+            match shard {
+                Occupied(v) => {
+                    index.insert(tensor_name, *v.get());
+                }
+                Vacant(v) => {
+                    let shard = PickledModel::load_file(dir.join(&shard_name), None)?;
+                    let shard_index = shards.len();
+                    shards.push(shard);
+                    v.insert(shard_index);
+                    index.insert(tensor_name, shard_index);
+                }
+            }
+        }
+        Ok(ShardedModel { shards, index })
     }
 }
 

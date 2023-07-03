@@ -53,6 +53,7 @@ pub mod audio;
 pub mod clip;
 pub mod kernels;
 pub mod llama;
+pub mod llava;
 pub mod mel;
 pub mod pickle;
 pub mod rt_alloc;
