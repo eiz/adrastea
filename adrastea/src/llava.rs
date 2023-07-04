@@ -15,6 +15,8 @@
 
 use serde::Deserialize;
 
+use crate::pickle::ShardedModel;
+
 #[derive(Deserialize)]
 pub struct LlavaParams {
     hidden_size: i32,
@@ -23,4 +25,10 @@ pub struct LlavaParams {
     num_attention_heads: i32,
     num_hidden_layers: i32,
     vocab_size: i32,
+}
+
+pub fn llava_test() -> anyhow::Result<()> {
+    let model = ShardedModel::load_huggingface("/home/eiz/Downloads/llava-7b")?;
+    println!("{:#?}", model);
+    todo!()
 }

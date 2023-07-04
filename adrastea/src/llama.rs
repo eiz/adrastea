@@ -5,13 +5,225 @@ use serde::Deserialize;
 
 use crate::{
     kernels::{BinaryOp, CommonKernels, MatmulMask, MatmulOptions, MatmulStore},
-    pickle::{load_tensor, PickledModel},
+    pickle::{load_tensor, PickledModel, ShardedModel},
     tensor::{Tensor, TensorLayout, TensorViewMut},
     util::round_up,
 };
 
 // TODO: last logits, kv cache, bring over many optimizations =(
 // bring back multi-gpu and quantization =(
+
+pub enum LlamaAttentionAddress {
+    Query,
+    Key,
+    Value,
+    Out,
+}
+
+pub enum LlamaMLPAddress {
+    Expand,
+    Contract,
+    Gate,
+}
+
+pub enum LlamaTransformerBlockAddress {
+    AttentionNorm,
+    Attention(LlamaAttentionAddress),
+    MLPNorm,
+    MLP(LlamaMLPAddress),
+}
+
+pub enum LlamaModelAddress {
+    TokenEmbedding,
+    OutputNorm,
+    TokenProjection,
+    Layer(usize, LlamaTransformerBlockAddress),
+}
+
+pub trait ResolveTensorAddress<T> {
+    fn resolve_tensor_address(address: T) -> String;
+}
+
+pub trait LoadTensor<T> {
+    fn load_tensor(&self, address: T) -> anyhow::Result<Tensor<f16>>;
+}
+
+pub struct HuggingFaceTensorNames;
+
+impl ResolveTensorAddress<LlamaModelAddress> for HuggingFaceTensorNames {
+    fn resolve_tensor_address(address: LlamaModelAddress) -> String {
+        match address {
+            LlamaModelAddress::TokenEmbedding => "model.embed_tokens.weight".into(),
+            LlamaModelAddress::OutputNorm => "model.norm.weight".into(),
+            LlamaModelAddress::TokenProjection => "lm_head.weight".into(),
+            LlamaModelAddress::Layer(n, address) => {
+                format!("model.layers.{n}.{}", Self::resolve_tensor_address(address))
+            }
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaTransformerBlockAddress> for HuggingFaceTensorNames {
+    fn resolve_tensor_address(address: LlamaTransformerBlockAddress) -> String {
+        match address {
+            LlamaTransformerBlockAddress::Attention(address) => {
+                format!("self_attn.{}", Self::resolve_tensor_address(address))
+            }
+            LlamaTransformerBlockAddress::MLP(address) => {
+                format!("mlp.{}", Self::resolve_tensor_address(address))
+            }
+            LlamaTransformerBlockAddress::AttentionNorm => "input_layernorm.weight".into(),
+            LlamaTransformerBlockAddress::MLPNorm => "post_attention_layernorm.weight".into(),
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaAttentionAddress> for HuggingFaceTensorNames {
+    fn resolve_tensor_address(address: LlamaAttentionAddress) -> String {
+        match address {
+            LlamaAttentionAddress::Query => "q_proj.weight".into(),
+            LlamaAttentionAddress::Key => "k_proj.weight".into(),
+            LlamaAttentionAddress::Value => "v_proj.weight".into(),
+            LlamaAttentionAddress::Out => "o_proj.weight".into(),
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaMLPAddress> for HuggingFaceTensorNames {
+    fn resolve_tensor_address(address: LlamaMLPAddress) -> String {
+        match address {
+            LlamaMLPAddress::Expand => "up_proj.weight".into(),
+            LlamaMLPAddress::Contract => "down_proj.weight".into(),
+            LlamaMLPAddress::Gate => "gate_proj.weight".into(),
+        }
+    }
+}
+
+pub struct MetaTensorNames;
+
+impl ResolveTensorAddress<LlamaModelAddress> for MetaTensorNames {
+    fn resolve_tensor_address(address: LlamaModelAddress) -> String {
+        match address {
+            LlamaModelAddress::TokenEmbedding => "tok_embeddings.weight".into(),
+            LlamaModelAddress::OutputNorm => "norm.weight".into(),
+            LlamaModelAddress::TokenProjection => "output.weight".into(),
+            LlamaModelAddress::Layer(n, address) => {
+                format!("layers.{n}.{}", Self::resolve_tensor_address(address))
+            }
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaTransformerBlockAddress> for MetaTensorNames {
+    fn resolve_tensor_address(address: LlamaTransformerBlockAddress) -> String {
+        match address {
+            LlamaTransformerBlockAddress::Attention(address) => {
+                format!("attention.{}", Self::resolve_tensor_address(address))
+            }
+            LlamaTransformerBlockAddress::MLP(address) => {
+                format!("feed_forward.{}", Self::resolve_tensor_address(address))
+            }
+            LlamaTransformerBlockAddress::AttentionNorm => "attention_norm.weight".into(),
+            LlamaTransformerBlockAddress::MLPNorm => "ffn_norm.weight".into(),
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaAttentionAddress> for MetaTensorNames {
+    fn resolve_tensor_address(address: LlamaAttentionAddress) -> String {
+        match address {
+            LlamaAttentionAddress::Query => "wq.weight".into(),
+            LlamaAttentionAddress::Key => "wk.weight".into(),
+            LlamaAttentionAddress::Value => "wv.weight".into(),
+            LlamaAttentionAddress::Out => "wo.weight".into(),
+        }
+    }
+}
+
+impl ResolveTensorAddress<LlamaMLPAddress> for MetaTensorNames {
+    fn resolve_tensor_address(address: LlamaMLPAddress) -> String {
+        match address {
+            LlamaMLPAddress::Expand => "w1.weight".into(),
+            LlamaMLPAddress::Contract => "w2.weight".into(),
+            LlamaMLPAddress::Gate => "w3.weight".into(),
+        }
+    }
+}
+
+pub struct MetaLlamaModelLoader {
+    model: PickledModel<()>,
+}
+
+impl MetaLlamaModelLoader {
+    pub fn new(model: PickledModel<()>) -> Self {
+        Self { model }
+    }
+}
+
+impl LoadTensor<LlamaModelAddress> for MetaLlamaModelLoader {
+    fn load_tensor(&self, address: LlamaModelAddress) -> anyhow::Result<Tensor<f16>> {
+        let name = MetaTensorNames::resolve_tensor_address(address);
+        load_tensor(&self.model, &name)
+    }
+}
+
+pub struct HuggingFaceLlamaModelLoader {
+    model: ShardedModel,
+}
+
+impl HuggingFaceLlamaModelLoader {
+    pub fn new(model: ShardedModel) -> Self {
+        Self { model }
+    }
+}
+
+impl LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader {
+    fn load_tensor(&self, address: LlamaModelAddress) -> anyhow::Result<Tensor<f16>> {
+        let name = HuggingFaceTensorNames::resolve_tensor_address(address);
+        self.model.load_tensor(&name)
+    }
+}
+
+struct LlamaTransformerBlockLoader<'a, T: LoadTensor<LlamaModelAddress>> {
+    inner: &'a T,
+    layer: usize,
+}
+
+impl<'a, T: LoadTensor<LlamaModelAddress>> LlamaTransformerBlockLoader<'a, T> {
+    fn new(inner: &'a T, layer: usize) -> Self {
+        Self { inner, layer }
+    }
+}
+
+impl<'a, T: LoadTensor<LlamaModelAddress>> LoadTensor<LlamaTransformerBlockAddress>
+    for LlamaTransformerBlockLoader<'a, T>
+{
+    fn load_tensor(&self, address: LlamaTransformerBlockAddress) -> anyhow::Result<Tensor<f16>> {
+        self.inner.load_tensor(LlamaModelAddress::Layer(self.layer, address))
+    }
+}
+
+impl<'a, T: LoadTensor<LlamaModelAddress>> LoadTensor<LlamaAttentionAddress>
+    for LlamaTransformerBlockLoader<'a, T>
+{
+    fn load_tensor(&self, address: LlamaAttentionAddress) -> anyhow::Result<Tensor<f16>> {
+        self.inner.load_tensor(LlamaModelAddress::Layer(
+            self.layer,
+            LlamaTransformerBlockAddress::Attention(address),
+        ))
+    }
+}
+
+impl<'a, T: LoadTensor<LlamaModelAddress>> LoadTensor<LlamaMLPAddress>
+    for LlamaTransformerBlockLoader<'a, T>
+{
+    fn load_tensor(&self, address: LlamaMLPAddress) -> anyhow::Result<Tensor<f16>> {
+        self.inner.load_tensor(LlamaModelAddress::Layer(
+            self.layer,
+            LlamaTransformerBlockAddress::MLP(address),
+        ))
+    }
+}
 
 pub struct LlamaAttention {
     query: Tensor<f16>,
@@ -21,12 +233,12 @@ pub struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    pub fn new(pickle: &PickledModel<()>, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new<T: LoadTensor<LlamaAttentionAddress>>(loader: &T) -> anyhow::Result<Self> {
         Ok(Self {
-            query: load_tensor(pickle, &format!("{}.wq.weight", prefix))?,
-            key: load_tensor(pickle, &format!("{}.wk.weight", prefix))?,
-            value: load_tensor(pickle, &format!("{}.wv.weight", prefix))?,
-            out: load_tensor(pickle, &format!("{}.wo.weight", prefix))?,
+            query: loader.load_tensor(LlamaAttentionAddress::Query)?,
+            key: loader.load_tensor(LlamaAttentionAddress::Key)?,
+            value: loader.load_tensor(LlamaAttentionAddress::Value)?,
+            out: loader.load_tensor(LlamaAttentionAddress::Out)?,
         })
     }
 }
@@ -38,11 +250,11 @@ pub struct LlamaFeedForward {
 }
 
 impl LlamaFeedForward {
-    pub fn new(pickle: &PickledModel<()>, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new<T: LoadTensor<LlamaMLPAddress>>(loader: &T) -> anyhow::Result<Self> {
         Ok(Self {
-            w1: load_tensor(pickle, &format!("{}.w1.weight", prefix))?,
-            w2: load_tensor(pickle, &format!("{}.w2.weight", prefix))?,
-            w3: load_tensor(pickle, &format!("{}.w3.weight", prefix))?,
+            w1: loader.load_tensor(LlamaMLPAddress::Expand)?,
+            w2: loader.load_tensor(LlamaMLPAddress::Contract)?,
+            w3: loader.load_tensor(LlamaMLPAddress::Gate)?,
         })
     }
 }
@@ -55,12 +267,18 @@ pub struct LlamaTransformerBlock {
 }
 
 impl LlamaTransformerBlock {
-    pub fn new(pickle: &PickledModel<()>, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new<
+        T: LoadTensor<LlamaAttentionAddress>
+            + LoadTensor<LlamaMLPAddress>
+            + LoadTensor<LlamaTransformerBlockAddress>,
+    >(
+        loader: &T,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            attn_norm: load_tensor(pickle, &format!("{}.attention_norm.weight", prefix))?,
-            attn: LlamaAttention::new(pickle, &format!("{}.attention", prefix))?,
-            ffn_norm: load_tensor(pickle, &format!("{}.ffn_norm.weight", prefix))?,
-            ffn: LlamaFeedForward::new(pickle, &format!("{}.feed_forward", prefix))?,
+            attn_norm: loader.load_tensor(LlamaTransformerBlockAddress::AttentionNorm)?,
+            ffn_norm: loader.load_tensor(LlamaTransformerBlockAddress::MLPNorm)?,
+            attn: LlamaAttention::new(loader)?,
+            ffn: LlamaFeedForward::new(loader)?,
         })
     }
 }
@@ -91,19 +309,23 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
-    pub fn new(
-        pickle: &PickledModel<()>, mut params: LlamaParams, tokenizer: SentencePieceProcessor,
+    pub fn new<T: LoadTensor<LlamaModelAddress>>(
+        loader: &T, mut params: LlamaParams, tokenizer: SentencePieceProcessor,
     ) -> anyhow::Result<Self> {
         params.vocab_size = tokenizer.len() as isize;
         Ok(Self {
             layers: (0..params.n_layers)
-                .map(|i| LlamaTransformerBlock::new(pickle, &format!("layers.{}", i)))
+                .map(|i| {
+                    LlamaTransformerBlock::new(&LlamaTransformerBlockLoader::new(
+                        loader, i as usize,
+                    ))
+                })
                 .collect::<anyhow::Result<_>>()?,
             params,
             tokenizer,
-            output: load_tensor(pickle, "output.weight")?,
-            norm: load_tensor(pickle, "norm.weight")?,
-            tok_embeddings: load_tensor(pickle, "tok_embeddings.weight")?,
+            output: loader.load_tensor(LlamaModelAddress::TokenProjection)?,
+            norm: loader.load_tensor(LlamaModelAddress::OutputNorm)?,
+            tok_embeddings: loader.load_tensor(LlamaModelAddress::TokenEmbedding)?,
         })
     }
 

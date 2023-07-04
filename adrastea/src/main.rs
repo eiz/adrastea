@@ -23,6 +23,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use llama::MetaLlamaModelLoader;
 use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
 
 use anyhow::bail;
@@ -954,8 +955,10 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
     let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
     let end_of_text = 1;
-    let mut context =
-        LlamaContext::new(Arc::new(LlamaModel::new(&model, params, tokenizer)?), kernels);
+    let mut context = LlamaContext::new(
+        Arc::new(LlamaModel::new(&MetaLlamaModelLoader::new(model), params, tokenizer)?),
+        kernels,
+    );
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
     for _i in 0..200 {
         let logits = context.decode(&token_buffer)?.into_cpu()?;
@@ -1017,6 +1020,8 @@ fn main() -> anyhow::Result<()> {
         llama_test(&args[2])?
     } else if args.len() >= 3 && args[1] == "clip" {
         clip::clip_test(&args[2])?
+    } else if args.len() >= 2 && args[1] == "llava" {
+        llava::llava_test()?
     } else {
         println!("test commands: cuda, load, wav, vulkan, microbenchmark, audio, wayland, skia, combined, llama, clip");
     }

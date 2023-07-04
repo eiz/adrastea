@@ -13,7 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use core::ops::Range;
+use core::{fmt::Debug, ops::Range};
 use std::{
     collections::{BTreeMap, HashMap},
     fs::File,
@@ -214,6 +214,12 @@ impl<'a, 'de> Deserialize<'de> for RawModel<'a> {
     }
 }
 
+impl<T> Debug for PickledModel<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PickledModel").field("tensors", &self.tensors).finish()
+    }
+}
+
 impl PickledModel<()> {
     pub fn load_typed<'de, T: ModelState<'de>, P: AsRef<Path>>(
         path: P, params: T::LoadParams,
@@ -259,6 +265,7 @@ struct HuggingFaceShardIndex {
     weight_map: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
 pub struct ShardedModel {
     shards: Vec<PickledModel<()>>,
     index: BTreeMap<String, usize>,
@@ -292,6 +299,25 @@ impl ShardedModel {
             }
         }
         Ok(ShardedModel { shards, index })
+    }
+
+    pub fn load_tensor<N: Copy + Default>(&self, name: &str) -> anyhow::Result<Tensor<N>> {
+        let shard_idx =
+            self.index.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
+        let shard = &self.shards[*shard_idx];
+        let pickled_tensor =
+            shard.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
+        let mut tensor = Tensor::new_hip_layout(TensorLayout::new(
+            &pickled_tensor.shape,
+            &pickled_tensor.stride,
+        ))?;
+        match tensor.storage_mut() {
+            TensorStorage::Hip(ref mut b) => {
+                b.copy_from_slice(&shard.mapping.data()[pickled_tensor.range.clone()])?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(tensor)
     }
 }
 
