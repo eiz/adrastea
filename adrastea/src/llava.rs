@@ -47,7 +47,7 @@ pub fn llava_test() -> anyhow::Result<()> {
     // use a better way
     // lmao I'm still copypasta'ing this todo everywhere
     let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
-    let path = Path::new("/home/eiz/Downloads/llama-7b-hf");
+    let path = Path::new("/home/eiz/Downloads/llava-7b");
     let model = ShardedModel::load_huggingface(&path)?;
     println!("{:#?}", model);
     // TODO: copied the meta params.json into llava dir
@@ -59,11 +59,15 @@ pub fn llava_test() -> anyhow::Result<()> {
             &HuggingFaceLlamaModelLoader::new(&model, &params, &*kernels),
             params.clone(),
             tokenizer,
-            0,
+            4,
         )?),
         kernels,
     );
+    let text = context.model().tokenizer().encode("What is a man?")?;
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
+    for i in text {
+        token_buffer.push(i.id as i32);
+    }
     for _i in 0..200 {
         let logits = context.decode(&token_buffer)?.into_cpu()?;
         let logits_vec = logits.storage().as_cpu();

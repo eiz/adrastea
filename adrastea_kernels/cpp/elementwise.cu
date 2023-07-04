@@ -36,22 +36,38 @@ template <typename T, typename Operator>
 void __device__ __forceinline__ elementwise_unary_1d(TensorView<T> output,
                                                      TensorView<T> input,
                                                      int const i) {
-  Operator op;
-  output(i) = op(input(i));
+  using Frame = typename TensorView<T>::StackFrame;
+  output.iter_dims(0, [&output, &input, i](Frame* tos, Frame* bos) {
+    Operator op;
+    auto output_slice = output.slice(tos, bos);
+    auto input_slice = input.slice(tos, bos);
+    output_slice(i) = op(input_slice(i));
+  });
 }
 
 template <typename T, typename Operator>
 void __device__ __forceinline__
 elementwise_unary_2d(TensorView<T> output, TensorView<T> input, int const i, int const j) {
-  Operator op;
-  output(j, i) = op(input(j, i));
+  using Frame = typename TensorView<T>::StackFrame;
+  output.iter_dims(1, [&output, &input, i, j](Frame* tos, Frame* bos) {
+    Operator op;
+    auto output_slice = output.slice(tos, bos);
+    auto input_slice = input.slice(tos, bos);
+    output_slice(j, i) = op(input_slice(j, i));
+  });
 }
 
 template <typename T, typename Operator>
 void __device__ __forceinline__
 elementwise_binary_1d(TensorView<T> output, TensorView<T> left, TensorView<T> right, int const i) {
-  Operator op;
-  output(i) = op(left(i), right(i));
+  using Frame = typename TensorView<T>::StackFrame;
+  output.iter_dims(0, [&output, &left, &right, i](Frame* tos, Frame* bos) {
+    Operator op;
+    auto output_slice = output.slice(tos, bos);
+    auto left_slice = left.slice(tos, bos);
+    auto right_slice = right.slice(tos, bos);
+    output_slice(i) = op(left_slice(i), right_slice(i));
+  });
 }
 
 template <typename T, typename Operator>
@@ -60,8 +76,14 @@ void __device__ __forceinline__ elementwise_binary_2d(TensorView<T> output,
                                                       TensorView<T> right,
                                                       int const i,
                                                       int const j) {
-  Operator op;
-  output(j, i) = op(left(j, i), right(j, i));
+  using Frame = typename TensorView<T>::StackFrame;
+  output.iter_dims(1, [&output, &left, &right, i, j](Frame* tos, Frame* bos) {
+    Operator op;
+    auto output_slice = output.slice(tos, bos);
+    auto left_slice = left.slice(tos, bos);
+    auto right_slice = right.slice(tos, bos);
+    output_slice(j, i) = op(left_slice(j, i), right_slice(j, i));
+  });
 }
 
 template <typename T>

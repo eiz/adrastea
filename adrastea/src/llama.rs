@@ -200,6 +200,7 @@ impl<'a> LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader<'a> {
                 // I don't know what the attempt at cleverness was, but we have
                 // to undo the permutation done to the QK matrices by the
                 // Hugging Face conversion code
+                // TODO: this code would be a lot simpler with an actual reshape operator!
                 let mut unswizzled_result =
                     Tensor::new_hip(&[self.params.dim as usize, self.params.dim as usize])?;
                 self.kernels.elementwise_unary_2d_f16(
@@ -220,7 +221,6 @@ impl<'a> LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader<'a> {
                         .permute(&[0, 2, 1, 3]),
                     UnaryOp::Identity,
                 )?;
-                println!("{name} {unswizzled_result:>7.4?}");
                 Ok(unswizzled_result)
             }
             _ => Ok(result),
