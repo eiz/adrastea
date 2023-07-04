@@ -47,14 +47,20 @@ pub fn llava_test() -> anyhow::Result<()> {
     // use a better way
     // lmao I'm still copypasta'ing this todo everywhere
     let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
-    let path = Path::new("/home/eiz/Downloads/llava-7b");
+    let path = Path::new("/home/eiz/Downloads/llama-7b-hf");
     let model = ShardedModel::load_huggingface(&path)?;
+    println!("{:#?}", model);
     // TODO: copied the meta params.json into llava dir
     let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
     let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
     let end_of_text = 1;
     let mut context = LlamaContext::new(
-        Arc::new(LlamaModel::new(&HuggingFaceLlamaModelLoader::new(model), params, tokenizer, 4)?),
+        Arc::new(LlamaModel::new(
+            &HuggingFaceLlamaModelLoader::new(&model, &params, &*kernels),
+            params.clone(),
+            tokenizer,
+            0,
+        )?),
         kernels,
     );
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
@@ -69,9 +75,11 @@ pub fn llava_test() -> anyhow::Result<()> {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap()
             .0;
+        println!("argmax {}", argmax);
         if argmax as usize == end_of_text {
             break;
         }
+        token_buffer.push(argmax as i32);
         println!(
             "text {:?}",
             context
@@ -79,7 +87,6 @@ pub fn llava_test() -> anyhow::Result<()> {
                 .tokenizer()
                 .decode_piece_ids(&token_buffer.iter().map(|x| *x as u32).collect::<Vec<_>>())
         );
-        token_buffer.push(argmax as i32);
     }
     todo!()
 }

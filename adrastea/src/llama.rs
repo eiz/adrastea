@@ -4,7 +4,7 @@ use sentencepiece::SentencePieceProcessor;
 use serde::Deserialize;
 
 use crate::{
-    kernels::{BinaryOp, CommonKernels, MatmulMask, MatmulOptions, MatmulStore},
+    kernels::{BinaryOp, CommonKernels, MatmulMask, MatmulOptions, MatmulStore, UnaryOp},
     pickle::{load_tensor, PickledModel, ShardedModel},
     tensor::{Tensor, TensorLayout, TensorViewMut},
     util::round_up,
@@ -13,6 +13,7 @@ use crate::{
 // TODO: last logits, kv cache, bring over many optimizations =(
 // bring back multi-gpu and quantization =(
 
+#[derive(Copy, Clone, Debug)]
 pub enum LlamaAttentionAddress {
     Query,
     Key,
@@ -20,12 +21,14 @@ pub enum LlamaAttentionAddress {
     Out,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub enum LlamaMLPAddress {
     Expand,
     Contract,
     Gate,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub enum LlamaTransformerBlockAddress {
     AttentionNorm,
     Attention(LlamaAttentionAddress),
@@ -33,6 +36,7 @@ pub enum LlamaTransformerBlockAddress {
     MLP(LlamaMLPAddress),
 }
 
+#[derive(Copy, Clone, Debug)]
 pub enum LlamaModelAddress {
     TokenEmbedding,
     OutputNorm,
@@ -143,9 +147,9 @@ impl ResolveTensorAddress<LlamaAttentionAddress> for MetaTensorNames {
 impl ResolveTensorAddress<LlamaMLPAddress> for MetaTensorNames {
     fn resolve_tensor_address(address: LlamaMLPAddress) -> String {
         match address {
-            LlamaMLPAddress::Expand => "w1.weight".into(),
+            LlamaMLPAddress::Expand => "w3.weight".into(),
             LlamaMLPAddress::Contract => "w2.weight".into(),
-            LlamaMLPAddress::Gate => "w3.weight".into(),
+            LlamaMLPAddress::Gate => "w1.weight".into(),
         }
     }
 }
@@ -163,24 +167,64 @@ impl MetaLlamaModelLoader {
 impl LoadTensor<LlamaModelAddress> for MetaLlamaModelLoader {
     fn load_tensor(&self, address: LlamaModelAddress) -> anyhow::Result<Tensor<f16>> {
         let name = MetaTensorNames::resolve_tensor_address(address);
-        load_tensor(&self.model, &name)
+        let result = load_tensor(&self.model, &name)?;
+        Ok(result)
     }
 }
 
-pub struct HuggingFaceLlamaModelLoader {
-    model: ShardedModel,
+pub struct HuggingFaceLlamaModelLoader<'a> {
+    model: &'a ShardedModel,
+    params: &'a LlamaParams,
+    kernels: &'a dyn CommonKernels,
 }
 
-impl HuggingFaceLlamaModelLoader {
-    pub fn new(model: ShardedModel) -> Self {
-        Self { model }
+impl<'a> HuggingFaceLlamaModelLoader<'a> {
+    pub fn new(
+        model: &'a ShardedModel, params: &'a LlamaParams, kernels: &'a dyn CommonKernels,
+    ) -> Self {
+        Self { model, params, kernels }
     }
 }
 
-impl LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader {
+impl<'a> LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader<'a> {
     fn load_tensor(&self, address: LlamaModelAddress) -> anyhow::Result<Tensor<f16>> {
         let name = HuggingFaceTensorNames::resolve_tensor_address(address);
-        self.model.load_tensor(&name)
+        let result = self.model.load_tensor(&name)?;
+        match address {
+            LlamaModelAddress::Layer(
+                _,
+                LlamaTransformerBlockAddress::Attention(
+                    LlamaAttentionAddress::Key | LlamaAttentionAddress::Query,
+                ),
+            ) => {
+                // I don't know what the attempt at cleverness was, but we have
+                // to undo the permutation done to the QK matrices by the
+                // Hugging Face conversion code
+                let mut unswizzled_result =
+                    Tensor::new_hip(&[self.params.dim as usize, self.params.dim as usize])?;
+                self.kernels.elementwise_unary_2d_f16(
+                    &mut unswizzled_result.as_view_mut().shape_cast(&[
+                        self.params.n_heads as isize,
+                        (self.params.dim / self.params.n_heads / 2) as isize,
+                        2,
+                        self.params.dim as isize,
+                    ]),
+                    &result
+                        .as_view()
+                        .shape_cast(&[
+                            self.params.n_heads as isize,
+                            2,
+                            (self.params.dim / self.params.n_heads / 2) as isize,
+                            self.params.dim as isize,
+                        ])
+                        .permute(&[0, 2, 1, 3]),
+                    UnaryOp::Identity,
+                )?;
+                println!("{name} {unswizzled_result:>7.4?}");
+                Ok(unswizzled_result)
+            }
+            _ => Ok(result),
+        }
     }
 }
 
@@ -244,17 +288,17 @@ impl LlamaAttention {
 }
 
 pub struct LlamaFeedForward {
-    w1: Tensor<f16>,
-    w2: Tensor<f16>,
-    w3: Tensor<f16>,
+    gate: Tensor<f16>,
+    contract: Tensor<f16>,
+    expand: Tensor<f16>,
 }
 
 impl LlamaFeedForward {
     pub fn new<T: LoadTensor<LlamaMLPAddress>>(loader: &T) -> anyhow::Result<Self> {
         Ok(Self {
-            w1: loader.load_tensor(LlamaMLPAddress::Expand)?,
-            w2: loader.load_tensor(LlamaMLPAddress::Contract)?,
-            w3: loader.load_tensor(LlamaMLPAddress::Gate)?,
+            gate: loader.load_tensor(LlamaMLPAddress::Gate)?,
+            contract: loader.load_tensor(LlamaMLPAddress::Contract)?,
+            expand: loader.load_tensor(LlamaMLPAddress::Expand)?,
         })
     }
 }
@@ -283,7 +327,7 @@ impl LlamaTransformerBlock {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct LlamaParams {
     pub dim: u32,
     pub multiple_of: u32,
@@ -394,9 +438,9 @@ impl LlamaContext {
         let mut key = Tensor::new_hip(&hidden_state.layout().dims)?;
         let mut value = Tensor::new_hip(&hidden_state.layout().dims)?;
         let mut qkv = Tensor::new_hip(&hidden_state.layout().dims)?;
-        let mut ffn_w1 =
+        let mut gate_in =
             Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
-        let mut ffn_w3 =
+        let mut expand =
             Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
         self.kernels.rms_norm(
             &mut normed_state.as_view_mut(),
@@ -469,26 +513,26 @@ impl LlamaContext {
             self.model.params.norm_eps,
         )?;
         self.kernels.matmul_f16(
-            &mut ffn_w1.as_view_mut(),
+            &mut gate_in.as_view_mut(),
             &normed_state.as_view(),
-            &layer.ffn.w1.as_view().permute(&[1, 0]),
+            &layer.ffn.gate.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.matmul_f16(
-            &mut ffn_w3.as_view_mut(),
+            &mut expand.as_view_mut(),
             &normed_state.as_view(),
-            &layer.ffn.w3.as_view().permute(&[1, 0]),
+            &layer.ffn.expand.as_view().permute(&[1, 0]),
             MatmulOptions::new(),
         )?;
         self.kernels.elementwise_binary_2d_f16_inplace(
-            &mut ffn_w1.as_view_mut(),
-            &ffn_w3.as_view(),
+            &mut gate_in.as_view_mut(),
+            &expand.as_view(),
             BinaryOp::SiluMul,
         )?;
         self.kernels.matmul_f16(
             hidden_state,
-            &ffn_w1.as_view(),
-            &layer.ffn.w2.as_view().permute(&[1, 0]),
+            &gate_in.as_view(),
+            &layer.ffn.contract.as_view().permute(&[1, 0]),
             MatmulOptions::new().store(MatmulStore::Add),
         )?;
         Ok(())
