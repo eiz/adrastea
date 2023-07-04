@@ -2,22 +2,6 @@
 
 #include <cassert>
 
-// TODO this is probably stupid and doesn't work, check the asm
-// TODO ensure contiguous memory access between adjacent threads in strided cases
-#define STRIDE_1(stride, ...) \
-  if (stride == 1) {          \
-    __VA_ARGS__;              \
-  } else {                    \
-    __VA_ARGS__;              \
-  }
-
-#define STRIDE_1_BINARY_1D(stride_1, stride_2, stride_3, ...) \
-  STRIDE_1(stride_1, STRIDE_1(stride_2, STRIDE_1(stride_3, __VA_ARGS__)))
-
-#define STRIDE_1_BINARY_2D(stride_1x, stride_1y, stride_2x, stride_2y, stride_3x, stride_3y, ...) \
-  STRIDE_1_BINARY_1D(stride_1x, stride_2x, stride_3x,                                             \
-                     STRIDE_1_BINARY_1D(stride_1y, stride_2y, stride_3y, __VA_ARGS__))
-
 enum UnaryOp {
   IDENTITY = 1,
 };
@@ -49,72 +33,48 @@ struct SiluMul {
 };
 
 template <typename T, typename Operator>
-void __device__ __forceinline__ elementwise_unary_1d(T* const output,
-                                                     T const* const input,
-                                                     int const stride_o,
-                                                     int const stride_i,
+void __device__ __forceinline__ elementwise_unary_1d(TensorView<T> output,
+                                                     TensorView<T> input,
                                                      int const i) {
   Operator op;
-  output[i * stride_o] = op(input[i * stride_i]);
+  output(i) = op(input(i));
 }
 
 template <typename T, typename Operator>
-void __device__ __forceinline__ elementwise_unary_2d(T* const output,
-                                                     T const* const input,
-                                                     int const stride_ox,
-                                                     int const stride_oy,
-                                                     int const stride_ix,
-                                                     int const stride_iy,
-                                                     int const i,
-                                                     int const j) {
+void __device__ __forceinline__
+elementwise_unary_2d(TensorView<T> output, TensorView<T> input, int const i, int const j) {
   Operator op;
-  output[i * stride_ox + j * stride_oy] = op(input[i * stride_ix + j * stride_iy]);
+  output(j, i) = op(input(j, i));
 }
 
 template <typename T, typename Operator>
-void __device__ __forceinline__ elementwise_binary_1d(T* const output,
-                                                      T const* const left,
-                                                      T const* const right,
-                                                      int const stride_o,
-                                                      int const stride_l,
-                                                      int const stride_r,
-                                                      int const i) {
+void __device__ __forceinline__
+elementwise_binary_1d(TensorView<T> output, TensorView<T> left, TensorView<T> right, int const i) {
   Operator op;
-  output[i * stride_o] = op(left[i * stride_l], right[i * stride_r]);
+  output(i) = op(left(i), right(i));
 }
 
 template <typename T, typename Operator>
-void __device__ __forceinline__ elementwise_binary_2d(T* const output,
-                                                      T const* const left,
-                                                      T const* const right,
-                                                      int const stride_ox,
-                                                      int const stride_oy,
-                                                      int const stride_lx,
-                                                      int const stride_ly,
-                                                      int const stride_rx,
-                                                      int const stride_ry,
+void __device__ __forceinline__ elementwise_binary_2d(TensorView<T> output,
+                                                      TensorView<T> left,
+                                                      TensorView<T> right,
                                                       int const i,
                                                       int const j) {
   Operator op;
-  output[i * stride_ox + j * stride_oy] =
-      op(left[i * stride_lx + j * stride_ly], right[i * stride_rx + j * stride_ry]);
+  output(j, i) = op(left(j, i), right(j, i));
 }
 
 template <typename T>
-void __device__ __forceinline__ elementwise_unary_1d_generic(T* const output,
-                                                             T const* const input,
-                                                             int length,
-                                                             int const stride_o,
-                                                             int const stride_i,
+void __device__ __forceinline__ elementwise_unary_1d_generic(TensorView<T> output,
+                                                             TensorView<T> input,
                                                              UnaryOp op) {
   int n = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
-  if (n >= length)
+  if (n >= output.width())
     return;
 
   switch (op) {
     case IDENTITY:
-      STRIDE_1_BINARY_1D(stride_o, stride_i, stride_i,
-                         elementwise_unary_1d<T, Identity>(output, input, stride_o, stride_i, n));
+      elementwise_unary_1d<T, Identity>(output, input, n);
       break;
     default:
       assert(false);
@@ -122,25 +82,17 @@ void __device__ __forceinline__ elementwise_unary_1d_generic(T* const output,
 }
 
 template <typename T>
-void __device__ __forceinline__ elementwise_unary_2d_generic(T* const output,
-                                                             T const* const input,
-                                                             int length_x,
-                                                             int length_y,
-                                                             int const stride_ox,
-                                                             int const stride_oy,
-                                                             int const stride_ix,
-                                                             int const stride_iy,
+void __device__ __forceinline__ elementwise_unary_2d_generic(TensorView<T> output,
+                                                             TensorView<T> input,
                                                              UnaryOp op) {
   int x = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
   int y = BLOCK_DIM_Y * BLOCK_IDX_Y + THREAD_IDX_Y;
-  if (x >= length_x || y >= length_y)
+  if (x >= output.width() || y >= output.height())
     return;
 
   switch (op) {
     case IDENTITY:
-      STRIDE_1_BINARY_2D(stride_ox, stride_oy, stride_ix, stride_iy, stride_ix, stride_iy,
-                         elementwise_unary_2d<T, Identity>(output, input, stride_ox, stride_oy,
-                                                           stride_ix, stride_iy, x, y));
+      elementwise_unary_2d<T, Identity>(output, input, x, y);
       break;
     default:
       assert(false);
@@ -148,28 +100,20 @@ void __device__ __forceinline__ elementwise_unary_2d_generic(T* const output,
 }
 
 template <typename T>
-void __device__ __forceinline__ elementwise_binary_1d_generic(T* const output,
-                                                              T const* const left,
-                                                              T const* const right,
-                                                              int length,
-                                                              int const stride_o,
-                                                              int const stride_l,
-                                                              int const stride_r,
+void __device__ __forceinline__ elementwise_binary_1d_generic(TensorView<T> output,
+                                                              TensorView<T> left,
+                                                              TensorView<T> right,
                                                               BinaryOp op) {
   int n = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
-  if (n >= length)
+  if (n >= output.width())
     return;
 
   switch (op) {
     case ADD:
-      STRIDE_1_BINARY_1D(
-          stride_o, stride_l, stride_r,
-          elementwise_binary_1d<T, Add>(output, left, right, stride_o, stride_l, stride_r, n));
+      elementwise_binary_1d<T, Add>(output, left, right, n);
       break;
     case SILU_MUL:
-      STRIDE_1_BINARY_1D(
-          stride_o, stride_l, stride_r,
-          elementwise_binary_1d<T, SiluMul>(output, left, right, stride_o, stride_l, stride_r, n));
+      elementwise_binary_1d<T, SiluMul>(output, left, right, n);
       break;
     default:
       assert(false);
@@ -177,35 +121,21 @@ void __device__ __forceinline__ elementwise_binary_1d_generic(T* const output,
 }
 
 template <typename T>
-void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
-                                                              T const* const left,
-                                                              T const* const right,
-                                                              int length_x,
-                                                              int length_y,
-                                                              int const stride_ox,
-                                                              int const stride_oy,
-                                                              int const stride_lx,
-                                                              int const stride_ly,
-                                                              int const stride_rx,
-                                                              int const stride_ry,
+void __device__ __forceinline__ elementwise_binary_2d_generic(TensorView<T> output,
+                                                              TensorView<T> left,
+                                                              TensorView<T> right,
                                                               BinaryOp op) {
   int x = BLOCK_DIM_X * BLOCK_IDX_X + THREAD_IDX_X;
   int y = BLOCK_DIM_Y * BLOCK_IDX_Y + THREAD_IDX_Y;
-  if (x >= length_x || y >= length_y)
+  if (x >= output.width() || y >= output.height())
     return;
 
   switch (op) {
     case ADD:
-      STRIDE_1_BINARY_2D(
-          stride_ox, stride_oy, stride_lx, stride_ly, stride_rx, stride_ry,
-          elementwise_binary_2d<T, Add>(output, left, right, stride_ox, stride_oy, stride_lx,
-                                        stride_ly, stride_rx, stride_ry, x, y));
+      elementwise_binary_2d<T, Add>(output, left, right, x, y);
       break;
     case SILU_MUL:
-      STRIDE_1_BINARY_2D(
-          stride_ox, stride_oy, stride_lx, stride_ly, stride_rx, stride_ry,
-          elementwise_binary_2d<T, SiluMul>(output, left, right, stride_ox, stride_oy, stride_lx,
-                                            stride_ly, stride_rx, stride_ry, x, y));
+      elementwise_binary_2d<T, SiluMul>(output, left, right, x, y);
       break;
     default:
       assert(false);
@@ -213,94 +143,43 @@ void __device__ __forceinline__ elementwise_binary_2d_generic(T* const output,
 }
 
 extern "C" {
-void __global__ elementwise_unary_1d_f16(half* const output,
-                                         half const* const input,
-                                         int length,
-                                         int const stride_o,
-                                         int const stride_i,
-                                         UnaryOp op) {
-  elementwise_unary_1d_generic<half>(output, input, length, stride_o, stride_i, op);
+void __global__ elementwise_unary_1d_f16(TensorViewF16 output, TensorViewF16 input, UnaryOp op) {
+  elementwise_unary_1d_generic<half>(output, input, op);
 }
 
-void __global__ elementwise_unary_2d_f16(half* const output,
-                                         half const* const input,
-                                         int length_x,
-                                         int length_y,
-                                         int const stride_ox,
-                                         int const stride_oy,
-                                         int const stride_ix,
-                                         int const stride_iy,
-                                         UnaryOp op) {
-  elementwise_unary_2d_generic<half>(output, input, length_x, length_y, stride_ox, stride_oy,
-                                     stride_ix, stride_iy, op);
+void __global__ elementwise_unary_2d_f16(TensorViewF16 output, TensorViewF16 input, UnaryOp op) {
+  elementwise_unary_2d_generic<half>(output, input, op);
 }
 
-void __global__ elementwise_unary_2d_f32(float* const output,
-                                         float const* const input,
-                                         int length_x,
-                                         int length_y,
-                                         int const stride_ox,
-                                         int const stride_oy,
-                                         int const stride_ix,
-                                         int const stride_iy,
-                                         UnaryOp op) {
-  elementwise_unary_2d_generic<float>(output, input, length_x, length_y, stride_ox, stride_oy,
-                                      stride_ix, stride_iy, op);
+void __global__ elementwise_unary_2d_f32(TensorViewF32 output, TensorViewF32 input, UnaryOp op) {
+  elementwise_unary_2d_generic<float>(output, input, op);
 }
 
-void __global__ elementwise_binary_1d_f16(half* const output,
-                                          half const* const left,
-                                          half const* const right,
-                                          int length,
-                                          int const stride_o,
-                                          int const stride_l,
-                                          int const stride_r,
+void __global__ elementwise_binary_1d_f16(TensorViewF16 output,
+                                          TensorViewF16 left,
+                                          TensorViewF16 right,
                                           BinaryOp op) {
-  elementwise_binary_1d_generic<half>(output, left, right, length, stride_o, stride_l, stride_r,
-                                      op);
+  elementwise_binary_1d_generic<half>(output, left, right, op);
 }
 
-void __global__ elementwise_binary_1d_f32(float* const output,
-                                          float const* const left,
-                                          float const* const right,
-                                          int length,
-                                          int const stride_o,
-                                          int const stride_l,
-                                          int const stride_r,
+void __global__ elementwise_binary_1d_f32(TensorViewF32 output,
+                                          TensorViewF32 left,
+                                          TensorViewF32 right,
                                           BinaryOp op) {
-  elementwise_binary_1d_generic<float>(output, left, right, length, stride_o, stride_l, stride_r,
-                                       op);
+  elementwise_binary_1d_generic<float>(output, left, right, op);
 }
 
-void __global__ elementwise_binary_2d_f16(half* const output,
-                                          half const* const left,
-                                          half const* const right,
-                                          int length_x,
-                                          int length_y,
-                                          int const stride_ox,
-                                          int const stride_oy,
-                                          int const stride_lx,
-                                          int const stride_ly,
-                                          int const stride_rx,
-                                          int const stride_ry,
+void __global__ elementwise_binary_2d_f16(TensorViewF16 output,
+                                          TensorViewF16 left,
+                                          TensorViewF16 right,
                                           BinaryOp op) {
-  elementwise_binary_2d_generic<half>(output, left, right, length_x, length_y, stride_ox, stride_oy,
-                                      stride_lx, stride_ly, stride_rx, stride_ry, op);
+  elementwise_binary_2d_generic<half>(output, left, right, op);
 }
 
-void __global__ elementwise_binary_2d_f32(float* const output,
-                                          float const* const left,
-                                          float const* const right,
-                                          int length_x,
-                                          int length_y,
-                                          int const stride_ox,
-                                          int const stride_oy,
-                                          int const stride_lx,
-                                          int const stride_ly,
-                                          int const stride_rx,
-                                          int const stride_ry,
+void __global__ elementwise_binary_2d_f32(TensorViewF32 output,
+                                          TensorViewF32 left,
+                                          TensorViewF32 right,
                                           BinaryOp op) {
-  elementwise_binary_2d_generic<float>(output, left, right, length_x, length_y, stride_ox,
-                                       stride_oy, stride_lx, stride_ly, stride_rx, stride_ry, op);
+  elementwise_binary_2d_generic<float>(output, left, right, op);
 }
 }  // extern "C"

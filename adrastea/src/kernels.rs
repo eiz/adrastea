@@ -446,9 +446,9 @@ pub struct GpuKernels {
         u32,
     )>,
     elementwise_binary_2d_f16:
-        Kernel<(*mut f16, *const f16, *const f16, i32, i32, i32, i32, i32, i32, i32, i32, u32)>,
-    elementwise_unary_2d_f16: Kernel<(*mut f16, *const f16, i32, i32, i32, i32, i32, i32, u32)>,
-    elementwise_unary_2d_f32: Kernel<(*mut f32, *const f32, i32, i32, i32, i32, i32, i32, u32)>,
+        Kernel<(TensorGpuDescriptor, TensorGpuDescriptor, TensorGpuDescriptor, u32)>,
+    elementwise_unary_2d_f16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor, u32)>,
+    elementwise_unary_2d_f32: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor, u32)>,
     softmax_rows: Kernel<(*mut f16, *const f16, i32, i32, f32)>,
     embed: Kernel<(*mut f16, *const i32, i32, i32, *const f16)>,
     fp32_to_fp16: Kernel<(TensorGpuDescriptor, TensorGpuDescriptor)>,
@@ -607,17 +607,7 @@ impl CommonKernels for GpuKernels {
                 shared_mem: 0,
                 stream: None,
             },
-            (
-                output.as_mut_gpu_ptr(),
-                input.as_gpu_ptr(),
-                output.size(-1) as i32,
-                output.size(-2) as i32,
-                output.stride(-1) as i32,
-                output.stride(-2) as i32,
-                input.stride(-1) as i32,
-                input.stride(-2) as i32,
-                op as u32,
-            ),
+            (output.into(), input.into(), op as u32),
         )?;
         Ok(())
     }
@@ -636,17 +626,7 @@ impl CommonKernels for GpuKernels {
                 shared_mem: 0,
                 stream: None,
             },
-            (
-                output.as_mut_gpu_ptr(),
-                input.as_gpu_ptr(),
-                output.size(-1) as i32,
-                output.size(-2) as i32,
-                output.stride(-1) as i32,
-                output.stride(-2) as i32,
-                input.stride(-1) as i32,
-                input.stride(-2) as i32,
-                op as u32,
-            ),
+            (output.into(), input.into(), op as u32),
         )?;
         Ok(())
     }
@@ -665,20 +645,7 @@ impl CommonKernels for GpuKernels {
                 shared_mem: 0,
                 stream: None,
             },
-            (
-                inout_left.as_mut_gpu_ptr(),
-                inout_left.as_gpu_ptr(),
-                right.as_gpu_ptr(),
-                inout_left.size(-1) as i32,
-                inout_left.size(-2) as i32,
-                inout_left.stride(-1) as i32,
-                inout_left.stride(-2) as i32,
-                inout_left.stride(-1) as i32,
-                inout_left.stride(-2) as i32,
-                right.stride(-1) as i32,
-                right.stride(-2) as i32,
-                op as u32,
-            ),
+            (inout_left.into(), inout_left.into(), right.into(), op as u32),
         )?;
         Ok(())
     }
