@@ -310,9 +310,9 @@ pub struct LlamaModel {
 
 impl LlamaModel {
     pub fn new<T: LoadTensor<LlamaModelAddress>>(
-        loader: &T, mut params: LlamaParams, tokenizer: SentencePieceProcessor,
+        loader: &T, mut params: LlamaParams, tokenizer: SentencePieceProcessor, added_tokens: usize,
     ) -> anyhow::Result<Self> {
-        params.vocab_size = tokenizer.len() as isize;
+        params.vocab_size = (tokenizer.len() + added_tokens) as isize;
         Ok(Self {
             layers: (0..params.n_layers)
                 .map(|i| {

@@ -956,7 +956,7 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
     let end_of_text = 1;
     let mut context = LlamaContext::new(
-        Arc::new(LlamaModel::new(&MetaLlamaModelLoader::new(model), params, tokenizer)?),
+        Arc::new(LlamaModel::new(&MetaLlamaModelLoader::new(model), params, tokenizer, 0)?),
         kernels,
     );
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
