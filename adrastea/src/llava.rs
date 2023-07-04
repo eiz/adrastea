@@ -13,10 +13,7 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-use std::{
-    fs::File,
-    path::{Path, PathBuf},
-};
+use std::{fs::File, path::Path};
 
 use alloc::sync::Arc;
 use sentencepiece::SentencePieceProcessor;
@@ -29,7 +26,7 @@ use crate::{
     pickle::ShardedModel,
 };
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct LlavaParams {
     hidden_size: i32,
     mm_vision_select_layer: i32,
@@ -37,6 +34,20 @@ pub struct LlavaParams {
     num_attention_heads: i32,
     num_hidden_layers: i32,
     vocab_size: i32,
+    rms_norm_eps: f32,
+}
+
+impl LlavaParams {
+    fn to_llama(&self) -> LlamaParams {
+        LlamaParams {
+            dim: self.hidden_size as u32,
+            multiple_of: 256,
+            n_heads: self.num_attention_heads as u32,
+            n_layers: self.num_hidden_layers as u32,
+            norm_eps: self.rms_norm_eps,
+            vocab_size: self.vocab_size as isize,
+        }
+    }
 }
 
 pub fn llava_test() -> anyhow::Result<()> {
@@ -49,15 +60,13 @@ pub fn llava_test() -> anyhow::Result<()> {
     let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
     let path = Path::new("/home/eiz/Downloads/llava-7b");
     let model = ShardedModel::load_huggingface(&path)?;
-    println!("{:#?}", model);
-    // TODO: copied the meta params.json into llava dir
-    let params: LlamaParams = serde_json::from_reader(File::open(path.join("params.json"))?)?;
+    let params: LlavaParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
     let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
     let end_of_text = 1;
     let mut context = LlamaContext::new(
         Arc::new(LlamaModel::new(
-            &HuggingFaceLlamaModelLoader::new(&model, &params, &*kernels),
-            params.clone(),
+            &HuggingFaceLlamaModelLoader::new(&model, &params.to_llama(), &*kernels),
+            params.to_llama(),
             tokenizer,
             4,
         )?),
@@ -79,7 +88,6 @@ pub fn llava_test() -> anyhow::Result<()> {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap()
             .0;
-        println!("argmax {}", argmax);
         if argmax as usize == end_of_text {
             break;
         }

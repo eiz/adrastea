@@ -971,7 +971,6 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap()
             .0;
-        println!("argmax {}", argmax);
         if argmax as usize == end_of_text {
             break;
         }
