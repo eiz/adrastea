@@ -24,9 +24,16 @@ use core::{
     time::Duration,
 };
 use llama::MetaLlamaModelLoader;
-use std::{collections::HashMap, fs::File, io::Write, path::Path, time::Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use anyhow::bail;
+use clap::{Parser, Subcommand};
 use half::f16;
 use sentencepiece::SentencePieceProcessor;
 use serde::{Deserialize, Serialize};
@@ -986,7 +993,88 @@ fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Parser)]
+struct Opt {
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    Cuda,
+    Load {
+        #[arg(value_name = "FILE")]
+        path: PathBuf,
+        #[arg(long)]
+        dict_path: Option<String>,
+    },
+    LoadWhisper {
+        #[arg(value_name = "FILE")]
+        path: PathBuf,
+    },
+    Wav {
+        #[arg(value_name = "WAV")]
+        wav_path: PathBuf,
+        #[arg(value_name = "MODEL")]
+        model_path: PathBuf,
+    },
+    Vulkan,
+    Microbenchmark,
+    Audio,
+    Wayland,
+    Skia,
+    Combined,
+    Llama {
+        #[arg(value_name = "MODEL")]
+        path: PathBuf,
+    },
+    Clip {
+        #[arg(value_name = "MODEL")]
+        path: PathBuf,
+    },
+    Llava {
+        #[arg(value_name = "MODEL")]
+        path: PathBuf,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
+    let opt = Opt::parse();
+    match opt.command {
+        CliCommand::Cuda => unsafe { cuda_square()? },
+        CliCommand::Load { path, dict_path } => {
+            let model = PickledModel::load_file(&path, dict_path.as_ref().map(|s| s.as_str()))?;
+            println!("{:#?}", model.tensors);
+        }
+        CliCommand::LoadWhisper { path } => {
+            let model = PickledModel::load_typed::<WhisperModelState, _>(&path, ())?;
+            println!("{:#?}", model.tensors);
+            println!("{:#?}", model.metadata);
+        }
+        CliCommand::Wav { wav_path, model_path } => {
+            wav_test(wav_path, model_path)?;
+        }
+        CliCommand::Vulkan => unsafe { vulkan::vulkan_square()? },
+        CliCommand::Microbenchmark => unsafe { microbenchmark()? },
+        CliCommand::Audio => streaming_test(None)?,
+        CliCommand::Wayland => {
+            let (_audio_state, surface_state) = gui_test_state();
+            wayland_test(surface_state)?
+        }
+        CliCommand::Skia => skia_test()?,
+        CliCommand::Combined => {
+            let (audio_state, surface_state) = gui_test_state();
+            std::thread::spawn(move || streaming_test(Some(audio_state)));
+            wayland_test(surface_state)?;
+        }
+        CliCommand::Llama { path } => llama_test(&path)?,
+        CliCommand::Clip { path } => clip::clip_test(&path)?,
+        CliCommand::Llava { path } => llava::llava_test()?,
+    }
+    Ok(())
+}
+
+fn old_main() -> anyhow::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
     println!("The endless sea.");
     if args.len() >= 2 && args[1] == "cuda" {
