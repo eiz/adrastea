@@ -22,10 +22,15 @@ use serde::Deserialize;
 use simt_hip::{HipDevice, HipPhysicalDevice};
 
 use crate::{
+    clip::{ClipModelLoader, ClipParams, ClipVisionContext, ClipVisionTransformer},
     kernels::{GpuKernels, MatmulTracer},
     llama::{HuggingFaceLlamaModelLoader, LlamaContext, LlamaModel, LlamaParams},
-    pickle::ShardedModel,
+    pickle::{PickledModel, ShardedModel},
 };
+
+const IM_END: u32 = 32003;
+const IM_PATCH: u32 = 32001;
+const IM_START: u32 = 32002;
 
 #[derive(Clone, Deserialize)]
 pub struct LlavaParams {
@@ -51,10 +56,11 @@ impl LlavaParams {
     }
 }
 
-pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>>(
-    path: P, images: &[Q], prompt: &str,
+pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
+    llava_path: P, clip_path: Q, images: &[R], prompt: &str,
 ) -> anyhow::Result<()> {
-    let path = path.as_ref();
+    let llava_path = llava_path.as_ref();
+    let clip_path = clip_path.as_ref();
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
@@ -62,15 +68,22 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>>(
     // use a better way
     // lmao I'm still copypasta'ing this todo everywhere
     let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
-    let model = ShardedModel::load_huggingface(path)?;
-    let params: LlavaParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
-    let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
+    let clip_model = PickledModel::load_file(clip_path.join("pytorch_model.bin"), None)?;
+    let clip_params: ClipParams =
+        serde_json::from_reader(File::open(clip_path.join("config.json"))?)?;
+    let clip_builder = ClipModelLoader::new(&clip_model, &*kernels, &clip_params);
+    let clip_vision = ClipVisionTransformer::new(&clip_builder, "vision_model")?;
+    let clip_vision = ClipVisionContext::new(Arc::new(clip_vision), kernels.clone());
+    let llava_model = ShardedModel::load_huggingface(llava_path)?;
+    let llava_params: LlavaParams =
+        serde_json::from_reader(File::open(llava_path.join("config.json"))?)?;
+    let llava_tokenizer = SentencePieceProcessor::open(llava_path.join("tokenizer.model"))?;
     let end_of_text = 1;
     let mut context = LlamaContext::new(
         Arc::new(LlamaModel::new(
-            &HuggingFaceLlamaModelLoader::new(&model, &params.to_llama(), &*kernels),
-            params.to_llama(),
-            tokenizer,
+            &HuggingFaceLlamaModelLoader::new(&llava_model, &llava_params.to_llama(), &*kernels),
+            llava_params.to_llama(),
+            llava_tokenizer,
             4,
         )?),
         kernels,
@@ -94,12 +107,27 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>>(
     if text_start < prompt.len() {
         segments.push(PromptSeg::Text(prompt[text_start..].to_string()));
     }
-    println!("segments {:?}", segments);
-    let text = context.model().tokenizer().encode(prompt)?;
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
-    for i in text {
-        token_buffer.push(i.id as i32);
+    let mut patch_offsets = vec![];
+    for seg in segments.iter() {
+        match seg {
+            PromptSeg::Text(text) => {
+                let text = context.model().tokenizer().encode(text)?;
+                for i in text {
+                    token_buffer.push(i.id as i32);
+                }
+            }
+            PromptSeg::Image(idx) => {
+                token_buffer.push(IM_START as i32);
+                patch_offsets.push((idx, token_buffer.len()));
+                for _i in 0..clip_params.vision_config.image_size {
+                    token_buffer.push(IM_PATCH as i32);
+                }
+                token_buffer.push(IM_END as i32);
+            }
+        }
     }
+    println!("segments {:?}", segments);
     for _i in 0..200 {
         let logits = context.decode(&token_buffer)?.into_cpu()?;
         let logits_vec = logits.storage().as_cpu();
@@ -112,15 +140,19 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>>(
             .unwrap()
             .0;
         if argmax as usize == end_of_text {
+            println!("end of text");
             break;
         }
         token_buffer.push(argmax as i32);
         println!(
             "text {:?}",
-            context
-                .model()
-                .tokenizer()
-                .decode_piece_ids(&token_buffer.iter().map(|x| *x as u32).collect::<Vec<_>>())
+            context.model().tokenizer().decode_piece_ids(
+                &token_buffer
+                    .iter()
+                    .filter(|&&x| x < context.model().tokenizer().len() as i32)
+                    .map(|x| *x as u32)
+                    .collect::<Vec<_>>()
+            )
         );
     }
     todo!()

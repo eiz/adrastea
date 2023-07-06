@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::{
     kernels::{BinaryOp, CommonKernels, MatmulMask, MatmulOptions, MatmulStore, UnaryOp},
     pickle::{load_tensor, PickledModel, ShardedModel},
-    tensor::{Tensor, TensorLayout, TensorViewMut},
+    tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
     util::round_up,
 };
 
@@ -400,18 +400,50 @@ impl LlamaContext {
         &self.kernels
     }
 
+    pub fn embed(
+        &mut self, embedded: &mut TensorViewMut<f16>, tokens: &[i32],
+    ) -> anyhow::Result<()> {
+        let tokens_gpu =
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+        self.kernels.embed(embedded, tokens_gpu.as_view(), self.model.tok_embeddings.as_view())
+    }
+
+    // TODO: this function should not exist in its current form but we are
+    // deferring implementing kv cache for a little while longer
+    pub fn decode_embedded(&mut self, embedded: &TensorView<f16>) -> anyhow::Result<Tensor<f16>> {
+        let mut hidden_state = Tensor::new_hip(&embedded.layout().dims)?;
+        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut logits =
+            Tensor::new_hip(&[embedded.size(-2) as usize, self.model.params.vocab_size as usize])?;
+        for layer in &self.model.layers {
+            self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
+        }
+        self.kernels.rms_norm(
+            &mut normed_state.as_view_mut(),
+            &hidden_state.as_view(),
+            &self.model.norm.as_view(),
+            self.model.params.norm_eps,
+        )?;
+        self.kernels.matmul_f16(
+            &mut logits.as_view_mut(),
+            &normed_state.as_view(),
+            &self.model.output.as_view().permute(&[1, 0]),
+            MatmulOptions::new(),
+        )?;
+        Ok(logits)
+    }
+
     pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state = Tensor::new_hip(&[tokens.len(), self.model.params.dim as usize])?;
         let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
-        let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
         self.kernels.embed(
             &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),
             self.model.tok_embeddings.as_view(),
         )?;
-
+        let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
         for layer in &self.model.layers {
             self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
         }

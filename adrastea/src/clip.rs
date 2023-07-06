@@ -100,7 +100,7 @@ impl PartialOrd for Bigram {
     }
 }
 
-struct ClipVocabulary {
+pub struct ClipVocabulary {
     token_lookup: BTreeMap<BString, usize>,
     tokens: Vec<String>,
     word_regex: Arc<Regex>,
@@ -133,7 +133,7 @@ impl ClipVocabulary {
 // This is adapted from the tokenizer code I wrote for llama.cpp. Which itself
 // is very similar to the original SentencePiece BPE tokenization algorithm. It
 // should produce similar'ish output to the original clip code
-struct ClipTokenizer {
+pub struct ClipTokenizer {
     vocab: Arc<ClipVocabulary>,
     symbols: Vec<Symbol>,
     work_queue: BinaryHeap<Bigram>,
@@ -257,7 +257,7 @@ fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Te
     Ok(output)
 }
 
-struct ClipModelLoader<'a> {
+pub struct ClipModelLoader<'a> {
     pickle: &'a PickledModel<()>,
     kernels: &'a dyn CommonKernels,
     params: &'a ClipParams,
@@ -285,30 +285,30 @@ impl<'a> ClipModelLoader<'a> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ClipVisionParams {
-    image_size: i32,
-    patch_size: i32,
-    num_attention_heads: i32,
-    num_hidden_layers: i32,
+pub struct ClipVisionParams {
+    pub image_size: i32,
+    pub patch_size: i32,
+    pub num_attention_heads: i32,
+    pub num_hidden_layers: i32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ClipTextParams {
-    num_attention_heads: i32,
-    num_hidden_layers: i32,
-    vocab_size: i32,
-    hidden_size: i32,
+pub struct ClipTextParams {
+    pub num_attention_heads: i32,
+    pub num_hidden_layers: i32,
+    pub vocab_size: i32,
+    pub hidden_size: i32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ClipParams {
-    projection_dim: i32,
-    vision_config: ClipVisionParams,
-    text_config: ClipTextParams,
+pub struct ClipParams {
+    pub projection_dim: i32,
+    pub vision_config: ClipVisionParams,
+    pub text_config: ClipTextParams,
 }
 
 #[derive(Debug)]
-struct ClipLayerNorm {
+pub struct ClipLayerNorm {
     weight: Tensor<f16>,
     bias: Tensor<f16>,
 }
@@ -322,7 +322,7 @@ impl ClipLayerNorm {
     }
 }
 
-struct ClipAttention {
+pub struct ClipAttention {
     query: ClipLinear,
     key: ClipLinear,
     value: ClipLinear,
@@ -396,7 +396,7 @@ impl ClipAttention {
     }
 }
 
-struct ClipLinear {
+pub struct ClipLinear {
     weight: Tensor<f16>,
     bias: Tensor<f16>,
 }
@@ -410,7 +410,7 @@ impl ClipLinear {
     }
 }
 
-struct ClipMLP {
+pub struct ClipMLP {
     fc1: ClipLinear,
     fc2: ClipLinear,
 }
@@ -444,7 +444,7 @@ impl ClipMLP {
     }
 }
 
-struct ClipTransformerBlock {
+pub struct ClipTransformerBlock {
     layer_norm1: ClipLayerNorm,
     attn: ClipAttention,
     layer_norm2: ClipLayerNorm,
@@ -486,7 +486,7 @@ impl ClipTransformerBlock {
     }
 }
 
-struct ClipVisionTransformer {
+pub struct ClipVisionTransformer {
     params: ClipVisionParams,
     class_embedding: Tensor<f16>,
     patch_embedding: Tensor<f16>,
@@ -497,7 +497,7 @@ struct ClipVisionTransformer {
 }
 
 impl ClipVisionTransformer {
-    fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
+    pub fn new(builder: &ClipModelLoader, prefix: &str) -> anyhow::Result<Self> {
         Ok(Self {
             class_embedding: builder
                 .load_tensor_f16(&format!("{}.embeddings.class_embedding", prefix))?,
@@ -518,7 +518,7 @@ impl ClipVisionTransformer {
     }
 }
 
-struct ClipTextTransformer {
+pub struct ClipTextTransformer {
     params: ClipTextParams,
     position_embedding: Tensor<f16>,
     token_embedding: Tensor<f16>,
@@ -579,7 +579,7 @@ impl ClipTextTransformer {
     }
 }
 
-struct ClipJointEmbedding {
+pub struct ClipJointEmbedding {
     logit_scale: f32,
     projection_dim: usize,
     text_projection: Tensor<f16>,
@@ -682,9 +682,9 @@ fn pixmap_as_planes(pixmap: Pixmap, channel_mean: &[f32], channel_stddev: &[f32]
     Tensor::from_vec(planes, TensorLayout::row_major(&[3, h, w]))
 }
 
-struct ClipImage(Tensor<f16>);
+pub struct ClipImage(Tensor<f16>);
 
-trait LazyClipImage {
+pub trait LazyClipImage {
     fn load(&self, kernels: &dyn CommonKernels) -> anyhow::Result<ClipImage>;
 }
 
@@ -735,7 +735,7 @@ impl<P: AsRef<Path>> LazyClipImage for P {
     }
 }
 
-struct ClipVisionContext {
+pub struct ClipVisionContext {
     model: Arc<ClipVisionTransformer>,
     kernels: Arc<dyn CommonKernels>,
 }

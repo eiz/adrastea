@@ -1033,8 +1033,10 @@ enum CliCommand {
         path: PathBuf,
     },
     Llava {
-        #[arg(value_name = "MODEL")]
-        path: PathBuf,
+        #[arg(value_name = "LLAVA")]
+        llava_path: PathBuf,
+        #[arg(value_name = "CLIP")]
+        clip_path: PathBuf,
         #[arg(value_name = "IMAGES")]
         images: Vec<PathBuf>,
         #[arg(
@@ -1078,7 +1080,9 @@ fn main() -> anyhow::Result<()> {
         }
         CliCommand::Llama { path } => llama_test(&path)?,
         CliCommand::Clip { path } => clip::clip_test(&path)?,
-        CliCommand::Llava { path, images, prompt } => llava::llava_test(path, &images, &prompt)?,
+        CliCommand::Llava { llava_path, clip_path, images, prompt } => {
+            llava::llava_test(llava_path, clip_path, &images, &prompt)?
+        }
     }
     Ok(())
 }
