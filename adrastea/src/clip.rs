@@ -791,21 +791,19 @@ impl ClipVisionContext {
             1.0e-5,
         )?;
         for (i, layer) in self.model.layers.iter().enumerate() {
+            layer.forward(
+                &*self.kernels,
+                &mut hidden_state.as_view_mut(),
+                MatmulMask::None,
+                self.model.params.num_attention_heads as isize,
+            )?;
             if Some(i) == early_output_layer {
-                layer.forward(
-                    &*self.kernels,
+                self.kernels.elementwise_unary_2d_f16(
                     output,
-                    MatmulMask::None,
-                    self.model.params.num_attention_heads as isize,
+                    &hidden_state.as_view(),
+                    UnaryOp::Identity,
                 )?;
                 return Ok(());
-            } else {
-                layer.forward(
-                    &*self.kernels,
-                    &mut hidden_state.as_view_mut(),
-                    MatmulMask::None,
-                    self.model.params.num_attention_heads as isize,
-                )?;
             }
         }
         self.kernels.layer_norm(

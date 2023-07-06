@@ -415,6 +415,11 @@ impl LlamaContext {
         let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
         let mut logits =
             Tensor::new_hip(&[embedded.size(-2) as usize, self.model.params.vocab_size as usize])?;
+        self.kernels.elementwise_unary_2d_f16(
+            &mut hidden_state.as_view_mut(),
+            embedded,
+            UnaryOp::Identity,
+        )?;
         for layer in &self.model.layers {
             self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
         }

@@ -23,9 +23,10 @@ use simt_hip::{HipDevice, HipPhysicalDevice};
 
 use crate::{
     clip::{ClipModelLoader, ClipParams, ClipVisionContext, ClipVisionTransformer},
-    kernels::{GpuKernels, MatmulTracer},
+    kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulStore, MatmulTracer, UnaryOp},
     llama::{HuggingFaceLlamaModelLoader, LlamaContext, LlamaModel, LlamaParams},
     pickle::{PickledModel, ShardedModel},
+    tensor::Tensor,
 };
 
 const IM_END: u32 = 32003;
@@ -86,12 +87,11 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             llava_tokenizer,
             4,
         )?),
-        kernels,
+        kernels.clone(),
     );
     let image_subst_re = Regex::new(r#"\$\d"#).unwrap();
     let mut text_start = 0;
     let mut segments = vec![];
-
     #[derive(Debug)]
     enum PromptSeg {
         Text(String),
@@ -109,6 +109,7 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     }
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
     let mut patch_offsets = vec![];
+    let mut image_embeddings = vec![];
     for seg in segments.iter() {
         match seg {
             PromptSeg::Text(text) => {
@@ -119,17 +120,58 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
             }
             PromptSeg::Image(idx) => {
                 token_buffer.push(IM_START as i32);
-                patch_offsets.push((idx, token_buffer.len()));
-                for _i in 0..clip_params.vision_config.image_size {
+                patch_offsets.push((*idx, token_buffer.len()));
+                // TODO: correct dim here
+                for _i in 0..256 {
                     token_buffer.push(IM_PATCH as i32);
                 }
                 token_buffer.push(IM_END as i32);
             }
         }
     }
-    println!("segments {:?}", segments);
+    let mm_projector_weight = llava_model.load_tensor("model.mm_projector.weight")?;
+    let mm_projector_bias = llava_model.load_tensor("model.mm_projector.bias")?;
+    for image in images {
+        let image = image.as_ref();
+        let mut clip_embed = Tensor::new_hip(&[257, 1024])?;
+        clip_vision.encode_into(
+            &mut clip_embed.as_view_mut(),
+            image,
+            Some(
+                (clip_params.vision_config.num_hidden_layers + llava_params.mm_vision_select_layer)
+                    as usize,
+            ),
+        )?;
+        let mut llava_embed = Tensor::new_hip(&[
+            clip_embed.size(-2) as usize - 1,
+            llava_params.hidden_size as usize,
+        ])?;
+        kernels.matmul_f16(
+            &mut llava_embed.as_view_mut(),
+            &clip_embed.as_view().skip(&[1, 0]),
+            &mm_projector_weight.as_view().permute(&[1, 0]),
+            MatmulOptions::new().store(MatmulStore::BetaBias(0.0, &mm_projector_bias.as_view())),
+        )?;
+        image_embeddings.push(llava_embed);
+    }
     for _i in 0..200 {
-        let logits = context.decode(&token_buffer)?.into_cpu()?;
+        let mut embedding =
+            Tensor::new_hip(&[token_buffer.len(), context.model().params().dim as usize])?;
+        context.embed(
+            &mut embedding.as_view_mut().take(&[token_buffer.len() as isize, -1]),
+            &token_buffer,
+        )?;
+        for &(i, position) in &patch_offsets {
+            kernels.elementwise_unary_2d_f16(
+                &mut embedding
+                    .as_view_mut()
+                    .skip(&[position as isize, 0])
+                    .take(&[256, llava_params.hidden_size as isize]),
+                &image_embeddings[i].as_view(),
+                UnaryOp::Identity,
+            )?;
+        }
+        let logits = context.decode_embedded(&embedding.as_view())?.into_cpu()?;
         let logits_vec = logits.storage().as_cpu();
         let last_logits =
             &logits_vec[logits_vec.len() - context.model().params().vocab_size as usize..];
