@@ -16,6 +16,7 @@
 use std::{fs::File, path::Path};
 
 use alloc::sync::Arc;
+use regex::Regex;
 use sentencepiece::SentencePieceProcessor;
 use serde::Deserialize;
 use simt_hip::{HipDevice, HipPhysicalDevice};
@@ -50,7 +51,10 @@ impl LlavaParams {
     }
 }
 
-pub fn llava_test() -> anyhow::Result<()> {
+pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>>(
+    path: P, images: &[Q], prompt: &str,
+) -> anyhow::Result<()> {
+    let path = path.as_ref();
     let phys = HipPhysicalDevice::get(0)?;
     let device = Arc::new(HipDevice::new(phys)?);
     let _scope = device.lock()?;
@@ -58,8 +62,7 @@ pub fn llava_test() -> anyhow::Result<()> {
     // use a better way
     // lmao I'm still copypasta'ing this todo everywhere
     let kernels = Arc::new(MatmulTracer::new(GpuKernels::new(phys.capability()?)?));
-    let path = Path::new("/home/eiz/Downloads/llava-7b");
-    let model = ShardedModel::load_huggingface(&path)?;
+    let model = ShardedModel::load_huggingface(path)?;
     let params: LlavaParams = serde_json::from_reader(File::open(path.join("config.json"))?)?;
     let tokenizer = SentencePieceProcessor::open(path.join("tokenizer.model"))?;
     let end_of_text = 1;
@@ -72,7 +75,27 @@ pub fn llava_test() -> anyhow::Result<()> {
         )?),
         kernels,
     );
-    let text = context.model().tokenizer().encode("What is a man?")?;
+    let image_subst_re = Regex::new(r#"\$\d"#).unwrap();
+    let mut text_start = 0;
+    let mut segments = vec![];
+
+    #[derive(Debug)]
+    enum PromptSeg {
+        Text(String),
+        Image(usize),
+    }
+    for rmatch in image_subst_re.find_iter(prompt) {
+        if rmatch.start() > text_start {
+            segments.push(PromptSeg::Text(prompt[text_start..rmatch.start()].to_string()));
+        }
+        segments.push(PromptSeg::Image(rmatch.as_str()[1..].parse()?));
+        text_start = rmatch.end();
+    }
+    if text_start < prompt.len() {
+        segments.push(PromptSeg::Text(prompt[text_start..].to_string()));
+    }
+    println!("segments {:?}", segments);
+    let text = context.model().tokenizer().encode(prompt)?;
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
     for i in text {
         token_buffer.push(i.id as i32);

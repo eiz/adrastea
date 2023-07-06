@@ -1035,6 +1035,15 @@ enum CliCommand {
     Llava {
         #[arg(value_name = "MODEL")]
         path: PathBuf,
+        #[arg(value_name = "IMAGES")]
+        images: Vec<PathBuf>,
+        #[arg(
+            long,
+            short,
+            help = "The text prompt. $0, $1, $2, ... $9 are replaced with images.",
+            default_value = "Describe the image.$1"
+        )]
+        prompt: String,
     },
 }
 
@@ -1069,49 +1078,7 @@ fn main() -> anyhow::Result<()> {
         }
         CliCommand::Llama { path } => llama_test(&path)?,
         CliCommand::Clip { path } => clip::clip_test(&path)?,
-        CliCommand::Llava { path } => llava::llava_test()?,
-    }
-    Ok(())
-}
-
-fn old_main() -> anyhow::Result<()> {
-    let args = std::env::args().collect::<Vec<_>>();
-    println!("The endless sea.");
-    if args.len() >= 2 && args[1] == "cuda" {
-        unsafe { cuda_square()? }
-    } else if args.len() >= 3 && args[1] == "load" {
-        let dict_path = if args.len() >= 4 { Some(args[3].as_str()) } else { None };
-        let model = PickledModel::load_file(&args[2], dict_path)?;
-        println!("{:#?}", model.tensors);
-    } else if args.len() >= 3 && args[1] == "load_whisper" {
-        let model = PickledModel::load_typed::<WhisperModelState, _>(&args[2], ())?;
-        println!("{:#?}", model.tensors);
-        println!("{:#?}", model.metadata);
-    } else if args.len() >= 4 && args[1] == "wav" {
-        wav_test(&args[2], &args[3])?;
-    } else if args.len() >= 2 && args[1] == "vulkan" {
-        unsafe { vulkan::vulkan_square()? }
-    } else if args.len() >= 2 && args[1] == "microbenchmark" {
-        unsafe { microbenchmark()? }
-    } else if args.len() >= 2 && args[1] == "audio" {
-        streaming_test(None)?
-    } else if args.len() >= 2 && args[1] == "wayland" {
-        let (_audio_state, surface_state) = gui_test_state();
-        wayland_test(surface_state)?
-    } else if args.len() >= 2 && args[1] == "skia" {
-        skia_test()?
-    } else if args.len() >= 2 && args[1] == "combined" {
-        let (audio_state, surface_state) = gui_test_state();
-        std::thread::spawn(move || streaming_test(Some(audio_state)));
-        wayland_test(surface_state)?;
-    } else if args.len() >= 3 && args[1] == "llama" {
-        llama_test(&args[2])?
-    } else if args.len() >= 3 && args[1] == "clip" {
-        clip::clip_test(&args[2])?
-    } else if args.len() >= 2 && args[1] == "llava" {
-        llava::llava_test()?
-    } else {
-        println!("test commands: cuda, load, wav, vulkan, microbenchmark, audio, wayland, skia, combined, llama, clip");
+        CliCommand::Llava { path, images, prompt } => llava::llava_test(path, &images, &prompt)?,
     }
     Ok(())
 }
