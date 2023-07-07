@@ -802,9 +802,9 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
         Ok(1)
     })?;
 
-    let left = Tensor::new_hip(&[2048, 4096])?;
-    let right = Tensor::new_hip(&[4096, 4096])?;
-    let mut out = Tensor::new_hip(&[2048, 4096])?;
+    let left = Tensor::new_gpu(&[2048, 4096])?;
+    let right = Tensor::new_gpu(&[4096, 4096])?;
+    let mut out = Tensor::new_gpu(&[2048, 4096])?;
     if let Ok(wmma_loop) = wmma_loop_f16_f16 {
         bench("wmma_loop_f16_f16", || {
             wmma_loop.launch(

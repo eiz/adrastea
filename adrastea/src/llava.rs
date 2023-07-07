@@ -93,32 +93,32 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     let mut text_start = 0;
     let mut segments = vec![];
     #[derive(Debug)]
-    enum PromptSeg {
+    enum PromptSegment {
         Text(String),
         Image(usize),
     }
     for rmatch in image_subst_re.find_iter(prompt) {
         if rmatch.start() > text_start {
-            segments.push(PromptSeg::Text(prompt[text_start..rmatch.start()].to_string()));
+            segments.push(PromptSegment::Text(prompt[text_start..rmatch.start()].to_string()));
         }
-        segments.push(PromptSeg::Image(rmatch.as_str()[1..].parse()?));
+        segments.push(PromptSegment::Image(rmatch.as_str()[1..].parse()?));
         text_start = rmatch.end();
     }
     if text_start < prompt.len() {
-        segments.push(PromptSeg::Text(prompt[text_start..].to_string()));
+        segments.push(PromptSegment::Text(prompt[text_start..].to_string()));
     }
     let mut token_buffer = vec![context.model().tokenizer().bos_id().unwrap() as i32];
     let mut patch_offsets = vec![];
     let mut image_embeddings = vec![];
     for seg in segments.iter() {
         match seg {
-            PromptSeg::Text(text) => {
+            PromptSegment::Text(text) => {
                 let text = context.model().tokenizer().encode(text)?;
                 for i in text {
                     token_buffer.push(i.id as i32);
                 }
             }
-            PromptSeg::Image(idx) => {
+            PromptSegment::Image(idx) => {
                 token_buffer.push(IM_START as i32);
                 patch_offsets.push((*idx, token_buffer.len()));
                 // TODO: correct dim here
@@ -133,7 +133,7 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     let mm_projector_bias = llava_model.load_tensor("model.mm_projector.bias")?;
     for image in images {
         let image = image.as_ref();
-        let mut clip_embed = Tensor::new_hip(&[257, 1024])?;
+        let mut clip_embed = Tensor::new_gpu(&[257, 1024])?;
         clip_vision.encode_into(
             &mut clip_embed.as_view_mut(),
             image,
@@ -142,7 +142,7 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
                     as usize,
             ),
         )?;
-        let mut llava_embed = Tensor::new_hip(&[
+        let mut llava_embed = Tensor::new_gpu(&[
             clip_embed.size(-2) as usize - 1,
             llava_params.hidden_size as usize,
         ])?;
@@ -156,7 +156,7 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
     }
     for _i in 0..200 {
         let mut embedding =
-            Tensor::new_hip(&[token_buffer.len(), context.model().params().dim as usize])?;
+            Tensor::new_gpu(&[token_buffer.len(), context.model().params().dim as usize])?;
         context.embed(
             &mut embedding.as_view_mut().take(&[token_buffer.len() as isize, -1]),
             &token_buffer,

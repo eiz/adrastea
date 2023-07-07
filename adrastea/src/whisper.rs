@@ -303,11 +303,11 @@ impl WhisperContext {
             kv_cache: (0..model.dims.n_text_layer)
                 .map(|_| {
                     Ok(WhisperContextCacheLayer {
-                        key: Tensor::new_hip(&[
+                        key: Tensor::new_gpu(&[
                             model.dims.n_text_ctx as usize,
                             model.dims.n_text_state as usize,
                         ])?,
-                        value: Tensor::new_hip(&[
+                        value: Tensor::new_gpu(&[
                             model.dims.n_text_ctx as usize,
                             model.dims.n_text_state as usize,
                         ])?,
@@ -326,9 +326,9 @@ impl WhisperContext {
         &self, layer: &WhisperTransformerBlock, hidden_state: &mut TensorViewMut<f16>,
         features: Option<&TensorView<f16>>, mask: MatmulMask,
     ) -> anyhow::Result<()> {
-        let mut ln_out = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut ln_out = Tensor::new_gpu(&hidden_state.layout().dims)?;
         let mut mlp_hidden =
-            Tensor::new_hip(&[ln_out.size(-2) as usize, ln_out.size(-1) as usize * 4])?;
+            Tensor::new_gpu(&[ln_out.size(-2) as usize, ln_out.size(-1) as usize * 4])?;
         self.kernels.layer_norm(
             &mut ln_out.as_view_mut(),
             &hidden_state.as_view(),
@@ -388,10 +388,10 @@ impl WhisperContext {
     ) -> Result<(), anyhow::Error> {
         // TODO this incidentally works but should reference the right hparam
         let heads = self.model.dims.n_audio_head as isize;
-        let mut query = Tensor::new_hip(&ln_out.layout().dims)?;
-        let mut key = Tensor::new_hip(&kv_input.layout().dims)?;
-        let mut value = Tensor::new_hip(&kv_input.layout().dims)?;
-        let mut qkv = Tensor::new_hip(&ln_out.layout().dims)?;
+        let mut query = Tensor::new_gpu(&ln_out.layout().dims)?;
+        let mut key = Tensor::new_gpu(&kv_input.layout().dims)?;
+        let mut value = Tensor::new_gpu(&kv_input.layout().dims)?;
+        let mut qkv = Tensor::new_gpu(&ln_out.layout().dims)?;
         self.kernels.matmul_f16(
             &mut query.as_view_mut(),
             ln_out,
@@ -416,7 +416,7 @@ impl WhisperContext {
             key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
         let v_view =
             value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        let mut qk = Tensor::new_gpu(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
         self.kernels.matmul_f16(
             &mut qk.as_view_mut(),
             &q_view,
@@ -459,9 +459,9 @@ impl WhisperContext {
         )
         .into_hip()?;
         let mut conv_out =
-            Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1)])?;
+            Tensor::new_gpu(&[self.model.dims.n_audio_state as usize, mels_half.size(-1)])?;
         let mut hidden_state =
-            Tensor::new_hip(&[self.model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
+            Tensor::new_gpu(&[self.model.dims.n_audio_state as usize, mels_half.size(-1) / 2])?;
         self.kernels.conv1d(
             &mut conv_out.as_view_mut(),
             &mels_half.as_view(),
@@ -490,7 +490,7 @@ impl WhisperContext {
         for layer in &self.model.encoder.layers {
             self.process_layer(layer, &mut hidden_state, None, MatmulMask::None)?;
         }
-        let mut features = Tensor::new_hip(&[
+        let mut features = Tensor::new_gpu(&[
             self.model.dims.n_audio_ctx as usize,
             self.model.dims.n_audio_state as usize,
         ])?;
@@ -508,11 +508,11 @@ impl WhisperContext {
         &mut self, features: TensorView<f16>, tokens: &[i32],
     ) -> anyhow::Result<Tensor<f16>> {
         let mut hidden_state =
-            Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
-        let mut ln_out = Tensor::new_hip(&[tokens.len(), self.model.dims.n_text_state as usize])?;
+            Tensor::new_gpu(&[tokens.len(), self.model.dims.n_text_state as usize])?;
+        let mut ln_out = Tensor::new_gpu(&[tokens.len(), self.model.dims.n_text_state as usize])?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
-        let mut logits = Tensor::new_hip(&[tokens.len(), self.model.dims.n_vocab as usize])?;
+        let mut logits = Tensor::new_gpu(&[tokens.len(), self.model.dims.n_vocab as usize])?;
         self.kernels.embed(
             &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),

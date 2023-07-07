@@ -252,7 +252,7 @@ impl ClipTokenizer {
 }
 
 fn to_f16(kernels: &dyn CommonKernels, tensor: Tensor<f32>) -> anyhow::Result<Tensor<f16>> {
-    let mut output = Tensor::new_hip_layout(tensor.layout().clone())?;
+    let mut output = Tensor::new_gpu_layout(tensor.layout().clone())?;
     kernels.fp32_to_fp16(&mut output.as_view_mut(), &tensor.as_view())?;
     Ok(output)
 }
@@ -343,10 +343,10 @@ impl ClipAttention {
         &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
         normed: &TensorView<f16>, mask: MatmulMask, heads: isize,
     ) -> anyhow::Result<()> {
-        let mut query = Tensor::new_hip(&normed.layout().dims)?;
-        let mut key = Tensor::new_hip(&normed.layout().dims)?;
-        let mut value = Tensor::new_hip(&normed.layout().dims)?;
-        let mut qkv = Tensor::new_hip(&normed.layout().dims)?;
+        let mut query = Tensor::new_gpu(&normed.layout().dims)?;
+        let mut key = Tensor::new_gpu(&normed.layout().dims)?;
+        let mut value = Tensor::new_gpu(&normed.layout().dims)?;
+        let mut qkv = Tensor::new_gpu(&normed.layout().dims)?;
         kernels.matmul_f16(
             &mut query.as_view_mut(),
             normed,
@@ -371,7 +371,7 @@ impl ClipAttention {
             key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
         let v_view =
             value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        let mut qk = Tensor::new_gpu(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
         kernels.matmul_f16(
             &mut qk.as_view_mut(),
             &q_view,
@@ -427,7 +427,7 @@ impl ClipMLP {
         &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
         normed: &TensorView<f16>,
     ) -> anyhow::Result<()> {
-        let mut mlp_hidden = Tensor::new_hip(&[hidden_state.size(-2), self.fc1.weight.size(-2)])?;
+        let mut mlp_hidden = Tensor::new_gpu(&[hidden_state.size(-2), self.fc1.weight.size(-2)])?;
         kernels.matmul_f16(
             &mut mlp_hidden.as_view_mut(),
             normed,
@@ -465,7 +465,7 @@ impl ClipTransformerBlock {
         &self, kernels: &dyn CommonKernels, hidden_state: &mut TensorViewMut<f16>,
         mask: MatmulMask, heads: isize,
     ) -> anyhow::Result<()> {
-        let mut normed = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut normed = Tensor::new_gpu(&hidden_state.layout().dims)?;
         kernels.layer_norm(
             &mut normed.as_view_mut(),
             &hidden_state.as_view(),
@@ -547,7 +547,7 @@ impl ClipTextTransformer {
         &self, kernels: &dyn CommonKernels, last_logits: &mut TensorViewMut<f16>, tokens: &[i32],
     ) -> anyhow::Result<()> {
         let mut hidden_state =
-            Tensor::new_hip(&[tokens.len() as usize, self.params.hidden_size as usize])?;
+            Tensor::new_gpu(&[tokens.len() as usize, self.params.hidden_size as usize])?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
         kernels.embed(
@@ -629,9 +629,9 @@ impl ClipJointEmbedding {
         text_features: &TensorView<f16>, visual_features: &TensorView<f16>,
     ) -> anyhow::Result<()> {
         assert_eq!(text_features.size(-2), visual_features.size(-2));
-        let mut text_embedding = Tensor::new_hip(&[text_features.size(-2), self.projection_dim])?;
+        let mut text_embedding = Tensor::new_gpu(&[text_features.size(-2), self.projection_dim])?;
         let mut visual_embedding =
-            Tensor::new_hip(&[visual_features.size(-2), self.projection_dim])?;
+            Tensor::new_gpu(&[visual_features.size(-2), self.projection_dim])?;
         self.embed_text(kernels, &mut text_embedding.as_view_mut(), text_features)?;
         self.embed_image(kernels, &mut visual_embedding.as_view_mut(), visual_features)?;
         kernels.matmul_f16(
@@ -746,7 +746,7 @@ impl ClipVisionContext {
     }
 
     pub fn encode(&self, image: impl LazyClipImage) -> anyhow::Result<Tensor<f16>> {
-        let mut output_norm = Tensor::new_hip(&[1, 1024])?;
+        let mut output_norm = Tensor::new_gpu(&[1, 1024])?;
         self.encode_into(&mut output_norm.as_view_mut(), image, None)?;
         Ok(output_norm)
     }
@@ -756,7 +756,7 @@ impl ClipVisionContext {
         early_output_layer: Option<usize>,
     ) -> anyhow::Result<()> {
         let image = image.load(&*self.kernels)?;
-        let mut embedding = Tensor::new_hip(&[257, 1024])?;
+        let mut embedding = Tensor::new_gpu(&[257, 1024])?;
         let mut class_embed = embedding.as_view_mut();
         let mut class_embed = class_embed.take(&[1, 1024]);
         self.kernels.elementwise_unary_2d_f16(
@@ -767,7 +767,7 @@ impl ClipVisionContext {
         let mut patch_embeds = embedding.as_view_mut();
         let mut patch_embeds =
             patch_embeds.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
-        let zero_bias = Tensor::new_hip(&[1024])?;
+        let zero_bias = Tensor::new_gpu(&[1024])?;
         self.kernels.conv2d_f16(
             &mut patch_embeds,
             &image.0.as_view(),
@@ -782,7 +782,7 @@ impl ClipVisionContext {
             &self.model.position_embedding.as_view(),
             BinaryOp::Add,
         )?;
-        let mut hidden_state = Tensor::new_hip(&[257, 1024])?;
+        let mut hidden_state = Tensor::new_gpu(&[257, 1024])?;
         self.kernels.layer_norm(
             &mut hidden_state.as_view_mut(),
             &embedding.as_view(),
@@ -842,7 +842,7 @@ impl ClipTextContext {
 
     pub fn encode(&mut self, text: &str) -> anyhow::Result<Tensor<f16>> {
         let tokens = self.tokenizer.encode(text, true, true)?;
-        let mut logits = Tensor::new_hip(&[1, self.model.params.hidden_size as usize])?;
+        let mut logits = Tensor::new_gpu(&[1, self.model.params.hidden_size as usize])?;
         self.model.forward(&*self.kernels, &mut logits.as_view_mut(), &tokens)?;
         Ok(logits)
     }
@@ -867,7 +867,7 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let mut tokenizer = ClipTokenizer::new(vocab);
     let vision_embedding = vision_ctx.encode("/home/eiz/clip_gold.png")?;
     let text_embedding = text_ctx.encode("a photo of a cat")?;
-    let mut similarities = Tensor::new_hip(&[1, 1])?;
+    let mut similarities = Tensor::new_gpu(&[1, 1])?;
     joint_embed.forward(
         &*kernels,
         &mut similarities.as_view_mut(),
@@ -907,7 +907,7 @@ mod tests {
         let class_embed: Tensor<f32> = load_tensor(&model, "clip.class_embed")?;
         let expected_class_patch_embed: Tensor<f32> =
             load_tensor(&model, "clip.class_patch_embed")?;
-        let mut embedding = Tensor::new_hip(&[257, 1024])?;
+        let mut embedding = Tensor::new_gpu(&[257, 1024])?;
         let mut class_embed_dest = embedding.as_view_mut();
         let mut class_embed_dest = class_embed_dest.take(&[1, 1024]);
         kernels.elementwise_unary_2d_f32(
@@ -918,8 +918,8 @@ mod tests {
         let mut actual_result = embedding.as_view_mut();
         let mut actual_result =
             actual_result.skip(&[1, 0]).shape_cast(&[16, 16, 1024]).permute(&[2, 0, 1]);
-        let mut err_stats_gpu = Tensor::new_hip(&[3])?;
-        let bias = Tensor::new_hip(&[1024])?;
+        let mut err_stats_gpu = Tensor::new_gpu(&[3])?;
+        let bias = Tensor::new_gpu(&[1024])?;
         kernels.conv2d_f32(
             &mut actual_result,
             &pixel_values.as_view(),

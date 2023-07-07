@@ -202,7 +202,7 @@ impl<'a> LoadTensor<LlamaModelAddress> for HuggingFaceLlamaModelLoader<'a> {
                 // Hugging Face conversion code
                 // TODO: this code would be a lot simpler with an actual reshape operator!
                 let mut unswizzled_result =
-                    Tensor::new_hip(&[self.params.dim as usize, self.params.dim as usize])?;
+                    Tensor::new_gpu(&[self.params.dim as usize, self.params.dim as usize])?;
                 self.kernels.elementwise_unary_2d_f16(
                     &mut unswizzled_result.as_view_mut().shape_cast(&[
                         self.params.n_heads as isize,
@@ -411,10 +411,10 @@ impl LlamaContext {
     // TODO: this function should not exist in its current form but we are
     // deferring implementing kv cache for a little while longer
     pub fn decode_embedded(&mut self, embedded: &TensorView<f16>) -> anyhow::Result<Tensor<f16>> {
-        let mut hidden_state = Tensor::new_hip(&embedded.layout().dims)?;
-        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut hidden_state = Tensor::new_gpu(&embedded.layout().dims)?;
+        let mut normed_state = Tensor::new_gpu(&hidden_state.layout().dims)?;
         let mut logits =
-            Tensor::new_hip(&[embedded.size(-2) as usize, self.model.params.vocab_size as usize])?;
+            Tensor::new_gpu(&[embedded.size(-2) as usize, self.model.params.vocab_size as usize])?;
         self.kernels.elementwise_unary_2d_f16(
             &mut hidden_state.as_view_mut(),
             embedded,
@@ -439,8 +439,8 @@ impl LlamaContext {
     }
 
     pub fn decode(&mut self, tokens: &[i32]) -> anyhow::Result<Tensor<f16>> {
-        let mut hidden_state = Tensor::new_hip(&[tokens.len(), self.model.params.dim as usize])?;
-        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut hidden_state = Tensor::new_gpu(&[tokens.len(), self.model.params.dim as usize])?;
+        let mut normed_state = Tensor::new_gpu(&hidden_state.layout().dims)?;
         let tokens_gpu =
             Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
         self.kernels.embed(
@@ -448,7 +448,7 @@ impl LlamaContext {
             tokens_gpu.as_view(),
             self.model.tok_embeddings.as_view(),
         )?;
-        let mut logits = Tensor::new_hip(&[tokens.len(), self.model.params.vocab_size as usize])?;
+        let mut logits = Tensor::new_gpu(&[tokens.len(), self.model.params.vocab_size as usize])?;
         for layer in &self.model.layers {
             self.process_layer(&mut hidden_state.as_view_mut(), layer)?;
         }
@@ -470,15 +470,15 @@ impl LlamaContext {
     fn process_layer(
         &self, hidden_state: &mut TensorViewMut<f16>, layer: &LlamaTransformerBlock,
     ) -> anyhow::Result<()> {
-        let mut normed_state = Tensor::new_hip(&hidden_state.layout().dims)?;
-        let mut query = Tensor::new_hip(&hidden_state.layout().dims)?;
-        let mut key = Tensor::new_hip(&hidden_state.layout().dims)?;
-        let mut value = Tensor::new_hip(&hidden_state.layout().dims)?;
-        let mut qkv = Tensor::new_hip(&hidden_state.layout().dims)?;
+        let mut normed_state = Tensor::new_gpu(&hidden_state.layout().dims)?;
+        let mut query = Tensor::new_gpu(&hidden_state.layout().dims)?;
+        let mut key = Tensor::new_gpu(&hidden_state.layout().dims)?;
+        let mut value = Tensor::new_gpu(&hidden_state.layout().dims)?;
+        let mut qkv = Tensor::new_gpu(&hidden_state.layout().dims)?;
         let mut gate_in =
-            Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
+            Tensor::new_gpu(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
         let mut expand =
-            Tensor::new_hip(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
+            Tensor::new_gpu(&[hidden_state.size(-2), self.model.params.ffn_dim() as usize])?;
         self.kernels.rms_norm(
             &mut normed_state.as_view_mut(),
             &hidden_state.as_view(),
@@ -522,7 +522,7 @@ impl LlamaContext {
             key.as_view().shape_cast(&[key.size(-2) as isize, heads, -1]).permute(&[1, 2, 0]);
         let v_view =
             value.as_view().shape_cast(&[value.size(-2) as isize, heads, -1]).permute(&[1, 0, 2]);
-        let mut qk = Tensor::new_hip(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
+        let mut qk = Tensor::new_gpu(&[heads as usize, q_view.size(-2), k_view.size(-1)])?;
         self.kernels.matmul_f16(
             &mut qk.as_view_mut(),
             &q_view,

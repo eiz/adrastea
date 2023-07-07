@@ -266,11 +266,11 @@ impl<T: Copy + Default> Tensor<T> {
         Tensor { storage, layout, _dead: PhantomData }
     }
 
-    pub fn new_hip(dims: &[usize]) -> anyhow::Result<Self> {
-        Self::new_hip_layout(TensorLayout::row_major(dims))
+    pub fn new_gpu(dims: &[usize]) -> anyhow::Result<Self> {
+        Self::new_gpu_layout(TensorLayout::row_major(dims))
     }
 
-    pub fn new_hip_layout(layout: TensorLayout) -> anyhow::Result<Self> {
+    pub fn new_gpu_layout(layout: TensorLayout) -> anyhow::Result<Self> {
         let buf = HipBuffer::new((layout.largest_address() + 1) * std::mem::size_of::<T>())?;
         unsafe {
             simt_hip::hip_call(|| {

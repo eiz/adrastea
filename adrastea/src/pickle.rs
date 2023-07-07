@@ -307,7 +307,7 @@ impl ShardedModel {
         let shard = &self.shards[*shard_idx];
         let pickled_tensor =
             shard.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
-        let mut tensor = Tensor::new_hip_layout(TensorLayout::new(
+        let mut tensor = Tensor::new_gpu_layout(TensorLayout::new(
             &pickled_tensor.shape,
             &pickled_tensor.stride,
         ))?;
@@ -327,7 +327,7 @@ pub fn load_tensor<T, N: Copy + Default>(
     let pickled_tensor =
         pickled.tensors.get(name).ok_or_else(|| anyhow::anyhow!("tensor {} not found", name))?;
     let mut tensor =
-        Tensor::new_hip_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
+        Tensor::new_gpu_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
     match tensor.storage_mut() {
         TensorStorage::Hip(ref mut b) => {
             b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
