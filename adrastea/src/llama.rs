@@ -404,7 +404,7 @@ impl LlamaContext {
         &mut self, embedded: &mut TensorViewMut<f16>, tokens: &[i32],
     ) -> anyhow::Result<()> {
         let tokens_gpu =
-            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_gpu()?;
         self.kernels.embed(embedded, tokens_gpu.as_view(), self.model.tok_embeddings.as_view())
     }
 
@@ -442,7 +442,7 @@ impl LlamaContext {
         let mut hidden_state = Tensor::new_gpu(&[tokens.len(), self.model.params.dim as usize])?;
         let mut normed_state = Tensor::new_gpu(&hidden_state.layout().dims)?;
         let tokens_gpu =
-            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_gpu()?;
         self.kernels.embed(
             &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),

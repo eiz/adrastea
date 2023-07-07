@@ -549,7 +549,7 @@ impl ClipTextTransformer {
         let mut hidden_state =
             Tensor::new_gpu(&[tokens.len() as usize, self.params.hidden_size as usize])?;
         let tokens_gpu =
-            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_gpu()?;
         kernels.embed(
             &mut hidden_state.as_view_mut(),
             tokens_gpu.as_view(),
@@ -723,7 +723,7 @@ impl<P: AsRef<Path>> LazyClipImage for P {
                 &[0.48145466, 0.4578275, 0.40821073],
                 &[0.26862954, 0.26130258, 0.27577711],
             )
-            .into_hip()?,
+            .into_gpu()?,
         )?;
         println!("{:>7.4?}", values);
         let snap = surface.image_snapshot();

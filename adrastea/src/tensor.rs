@@ -285,7 +285,7 @@ impl<T: Copy + Default> Tensor<T> {
         Tensor { storage: TensorStorage::Cpu(vec), layout, _dead: PhantomData }
     }
 
-    pub fn into_hip(self) -> anyhow::Result<Self> {
+    pub fn into_gpu(self) -> anyhow::Result<Self> {
         match self.storage {
             TensorStorage::Cpu(v) => {
                 let mut buf = HipBuffer::new(v.len() * std::mem::size_of::<T>())?;

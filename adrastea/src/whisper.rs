@@ -183,7 +183,7 @@ impl WhisperAudioEncoder {
         Ok(Self {
             conv1: WhisperConv1d::new(pickle, &format!("{}.conv1", prefix))?,
             conv2: WhisperConv1d::new(pickle, &format!("{}.conv2", prefix))?,
-            position_embedding: sinusoid_position_embedding(&pickle.metadata).into_hip()?,
+            position_embedding: sinusoid_position_embedding(&pickle.metadata).into_gpu()?,
             layers: (0..pickle.metadata.n_audio_layer)
                 .map(|i| {
                     WhisperTransformerBlock::new(pickle, &format!("{}.blocks.{}", prefix, i), false)
@@ -457,7 +457,7 @@ impl WhisperContext {
             mels_half,
             TensorLayout::row_major(&[WHISPER_N_MELS, self.mel_transform.num_cols(wave.len())]),
         )
-        .into_hip()?;
+        .into_gpu()?;
         let mut conv_out =
             Tensor::new_gpu(&[self.model.dims.n_audio_state as usize, mels_half.size(-1)])?;
         let mut hidden_state =
@@ -511,7 +511,7 @@ impl WhisperContext {
             Tensor::new_gpu(&[tokens.len(), self.model.dims.n_text_state as usize])?;
         let mut ln_out = Tensor::new_gpu(&[tokens.len(), self.model.dims.n_text_state as usize])?;
         let tokens_gpu =
-            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_hip()?;
+            Tensor::from_vec(tokens.into(), TensorLayout::row_major(&[tokens.len()])).into_gpu()?;
         let mut logits = Tensor::new_gpu(&[tokens.len(), self.model.dims.n_vocab as usize])?;
         self.kernels.embed(
             &mut hidden_state.as_view_mut(),
