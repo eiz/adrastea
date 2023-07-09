@@ -18,7 +18,7 @@ use core::{
     marker::PhantomData,
 };
 
-use simt::GpuBuffer;
+use simt::{ComputeApi, GpuBuffer, ScopedGpu};
 use smallvec::SmallVec;
 
 use crate::util::ElidingRangeIterator;
@@ -422,16 +422,32 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
             TensorStoragePtr::Gpu(b) => {
                 let storage_size = self.layout.largest_address() + 1;
                 let mut cpu_data = vec![T::default(); storage_size];
+                // TODO backend specific stuff like this needs to get pushed down into simt
                 unsafe {
-                    simt_hip::hip_call(|| {
-                        simt_hip_sys::library().hipMemcpy(
-                            cpu_data.as_mut_ptr() as *mut std::ffi::c_void,
-                            b as *const std::ffi::c_void,
-                            storage_size * std::mem::size_of::<T>(),
-                            simt_hip_sys::hipMemcpyKind::hipMemcpyDeviceToHost,
-                        )
-                    })
-                    .map_err(|_| std::fmt::Error)?;
+                    match ScopedGpu::current_api() {
+                        Some(ComputeApi::Cuda) => {
+                            simt_cuda::cuda_call(|| {
+                                simt_cuda_sys::library().cuMemcpyDtoH_v2(
+                                    cpu_data.as_mut_ptr() as *mut std::ffi::c_void,
+                                    b as simt_cuda_sys::CUdeviceptr_v2,
+                                    storage_size * std::mem::size_of::<T>(),
+                                )
+                            })
+                            .map_err(|_| std::fmt::Error)?;
+                        }
+                        Some(ComputeApi::Hip) => {
+                            simt_hip::hip_call(|| {
+                                simt_hip_sys::library().hipMemcpy(
+                                    cpu_data.as_mut_ptr() as *mut std::ffi::c_void,
+                                    b as *const std::ffi::c_void,
+                                    storage_size * std::mem::size_of::<T>(),
+                                    simt_hip_sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                                )
+                            })
+                            .map_err(|_| std::fmt::Error)?;
+                        }
+                        None => todo!(),
+                    }
                 }
                 format_slice_with_layout(f, &cpu_data, 0, &self.layout)?;
             }
