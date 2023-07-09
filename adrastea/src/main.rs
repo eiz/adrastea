@@ -24,7 +24,7 @@ use core::{
     time::Duration,
 };
 use llama::MetaLlamaModelLoader;
-use simt::{ComputeApi, Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
+use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use std::{
     collections::HashMap,
     fs::File,
@@ -37,7 +37,6 @@ use clap::{Parser, Subcommand};
 use half::f16;
 use sentencepiece::SentencePieceProcessor;
 use serde::{Deserialize, Serialize};
-use simt_hip::{HipDevice, HipPhysicalDevice};
 use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
 use wayland::{ISkiaPaint, SurfaceClient};
 
@@ -368,8 +367,8 @@ fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
 }
 
 fn wav_test<P: AsRef<Path>, Q: AsRef<Path>>(path: P, model_path: Q) -> anyhow::Result<()> {
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
@@ -568,8 +567,8 @@ pub fn wayland_test(test_state: MainWindow) -> anyhow::Result<()> {
 }
 
 pub fn streaming_test(mut test_state: Option<GuiTestAudioThreadState>) -> anyhow::Result<()> {
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
     let start = Instant::now();

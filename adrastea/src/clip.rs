@@ -49,7 +49,7 @@ use half::f16;
 use memmap2::Mmap;
 use regex::Regex;
 use serde::Deserialize;
-use simt_hip::{HipDevice, HipPhysicalDevice};
+use simt::{Gpu, PhysicalGpu};
 use skia_safe::{
     AlphaType, ColorSpace, ColorType, CubicResampler, Data, EncodedImageFormat, Image, ImageInfo,
     Pixmap, Surface,
@@ -850,8 +850,8 @@ impl ClipTextContext {
 
 pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
     let model = PickledModel::load_file(path.join("pytorch_model.bin"), None)?;
@@ -881,7 +881,7 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
-    use simt_hip::{HipDevice, HipPhysicalDevice};
+    use simt::{Gpu, PhysicalGpu};
 
     use crate::{
         kernels::{CommonKernels, GpuKernels, UnaryOp},
@@ -897,8 +897,8 @@ mod tests {
 
     #[test]
     fn conv2d_matches_pytorch() -> anyhow::Result<()> {
-        let phys = HipPhysicalDevice::get(0)?;
-        let device = Arc::new(HipDevice::new(phys)?);
+        let phys = PhysicalGpu::any().expect("no gpu found");
+        let device = Arc::new(Gpu::new(phys)?);
         let _scope = device.lock()?;
         let kernels = Arc::new(GpuKernels::new(phys.capability()?)?);
         let model = PickledModel::load_file("/tmp/clip_tests.pt", None)?;

@@ -19,7 +19,7 @@ use alloc::sync::Arc;
 use regex::Regex;
 use sentencepiece::SentencePieceProcessor;
 use serde::Deserialize;
-use simt_hip::{HipDevice, HipPhysicalDevice};
+use simt::{Gpu, PhysicalGpu};
 
 use crate::{
     clip::{ClipModelLoader, ClipParams, ClipVisionContext, ClipVisionTransformer},
@@ -62,8 +62,8 @@ pub fn llava_test<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
 ) -> anyhow::Result<()> {
     let llava_path = llava_path.as_ref();
     let clip_path = clip_path.as_ref();
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
