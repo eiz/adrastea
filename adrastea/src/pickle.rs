@@ -312,7 +312,7 @@ impl ShardedModel {
             &pickled_tensor.stride,
         ))?;
         match tensor.storage_mut() {
-            TensorStorage::Hip(ref mut b) => {
+            TensorStorage::Gpu(ref mut b) => {
                 b.copy_from_slice(&shard.mapping.data()[pickled_tensor.range.clone()])?;
             }
             _ => unreachable!(),
@@ -329,7 +329,7 @@ pub fn load_tensor<T, N: Copy + Default>(
     let mut tensor =
         Tensor::new_gpu_layout(TensorLayout::new(&pickled_tensor.shape, &pickled_tensor.stride))?;
     match tensor.storage_mut() {
-        TensorStorage::Hip(ref mut b) => {
+        TensorStorage::Gpu(ref mut b) => {
             b.copy_from_slice(&pickled.mapping.data()[pickled_tensor.range.clone()])?;
         }
         _ => unreachable!(),

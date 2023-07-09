@@ -18,7 +18,7 @@ use core::{
     marker::PhantomData,
 };
 
-use simt_hip::HipBuffer;
+use simt::GpuBuffer;
 use smallvec::SmallVec;
 
 use crate::util::ElidingRangeIterator;
@@ -153,14 +153,14 @@ impl TensorLayout {
 #[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtr<T> {
     Cpu(*const T),
-    Hip(*const T),
+    Gpu(*const T),
 }
 
 impl<T> TensorStoragePtr<T> {
     pub fn offset(&self, offset: usize) -> Self {
         match self {
             TensorStoragePtr::Cpu(ptr) => TensorStoragePtr::Cpu(unsafe { ptr.add(offset) }),
-            TensorStoragePtr::Hip(ptr) => TensorStoragePtr::Hip(unsafe { ptr.add(offset) }),
+            TensorStoragePtr::Gpu(ptr) => TensorStoragePtr::Gpu(unsafe { ptr.add(offset) }),
         }
     }
 }
@@ -175,14 +175,14 @@ impl<T> Clone for TensorStoragePtr<T> {
 #[derive(PartialEq, Eq, Debug)]
 pub enum TensorStoragePtrMut<T> {
     Cpu(*mut T),
-    Hip(*mut T),
+    Gpu(*mut T),
 }
 
 impl<T> TensorStoragePtrMut<T> {
     pub fn offset(&self, offset: usize) -> Self {
         match self {
             TensorStoragePtrMut::Cpu(ptr) => TensorStoragePtrMut::Cpu(unsafe { ptr.add(offset) }),
-            TensorStoragePtrMut::Hip(ptr) => TensorStoragePtrMut::Hip(unsafe { ptr.add(offset) }),
+            TensorStoragePtrMut::Gpu(ptr) => TensorStoragePtrMut::Gpu(unsafe { ptr.add(offset) }),
         }
     }
 }
@@ -196,7 +196,7 @@ impl<T> Clone for TensorStoragePtrMut<T> {
 
 pub enum TensorStorage<T> {
     Cpu(Vec<T>),
-    Hip(HipBuffer),
+    Gpu(GpuBuffer),
 }
 
 impl<T> TensorStorage<T> {
@@ -214,16 +214,16 @@ impl<T> TensorStorage<T> {
         }
     }
 
-    pub fn as_hip(&self) -> &HipBuffer {
+    pub fn as_gpu(&self) -> &GpuBuffer {
         match self {
-            TensorStorage::Hip(b) => b,
+            TensorStorage::Gpu(b) => b,
             _ => panic!("tensor storage not resident on gpu"),
         }
     }
 
-    pub fn as_mut_hip(&mut self) -> &mut HipBuffer {
+    pub fn as_mut_gpu(&mut self) -> &mut GpuBuffer {
         match self {
-            TensorStorage::Hip(b) => b,
+            TensorStorage::Gpu(b) => b,
             _ => panic!("tensor storage not resident on gpu"),
         }
     }
@@ -240,7 +240,8 @@ impl<T> Tensor<T> {
         TensorView {
             ptr: match &self.storage {
                 TensorStorage::Cpu(v) => TensorStoragePtr::Cpu(v.as_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtr::Hip(b.ptr as *const T),
+                TensorStorage::Gpu(GpuBuffer::Cuda(b)) => TensorStoragePtr::Gpu(b.ptr as *const T),
+                TensorStorage::Gpu(GpuBuffer::Hip(b)) => TensorStoragePtr::Gpu(b.ptr as *const T),
             },
             layout: self.layout.clone(),
             _dead: PhantomData,
@@ -251,7 +252,8 @@ impl<T> Tensor<T> {
         TensorViewMut {
             ptr: match &mut self.storage {
                 TensorStorage::Cpu(v) => TensorStoragePtrMut::Cpu(v.as_mut_ptr()),
-                TensorStorage::Hip(b) => TensorStoragePtrMut::Hip(b.ptr as *mut T),
+                TensorStorage::Gpu(GpuBuffer::Cuda(b)) => TensorStoragePtrMut::Gpu(b.ptr as *mut T),
+                TensorStorage::Gpu(GpuBuffer::Hip(b)) => TensorStoragePtrMut::Gpu(b.ptr as *mut T),
             },
             layout: self.layout.clone(),
             _dead: PhantomData,
@@ -271,13 +273,20 @@ impl<T: Copy + Default> Tensor<T> {
     }
 
     pub fn new_gpu_layout(layout: TensorLayout) -> anyhow::Result<Self> {
-        let buf = HipBuffer::new((layout.largest_address() + 1) * std::mem::size_of::<T>())?;
+        let buf = GpuBuffer::new((layout.largest_address() + 1) * std::mem::size_of::<T>())?;
         unsafe {
-            simt_hip::hip_call(|| {
-                simt_hip_sys::library().hipMemset(buf.ptr as *mut _, 0, buf.size)
-            })?;
+            match &buf {
+                GpuBuffer::Cuda(b) => simt_cuda::cuda_call(|| {
+                    simt_cuda_sys::library().cuMemsetD8_v2(b.ptr, 0, b.size)
+                })?,
+                GpuBuffer::Hip(b) => {
+                    simt_hip::hip_call(|| {
+                        simt_hip_sys::library().hipMemset(b.ptr as *mut _, 0, b.size)
+                    })?;
+                }
+            }
         }
-        Ok(Tensor { storage: TensorStorage::Hip(buf), layout, _dead: PhantomData })
+        Ok(Tensor { storage: TensorStorage::Gpu(buf), layout, _dead: PhantomData })
     }
 
     pub fn from_vec(vec: Vec<T>, layout: TensorLayout) -> Self {
@@ -288,23 +297,27 @@ impl<T: Copy + Default> Tensor<T> {
     pub fn into_gpu(self) -> anyhow::Result<Self> {
         match self.storage {
             TensorStorage::Cpu(v) => {
-                let mut buf = HipBuffer::new(v.len() * std::mem::size_of::<T>())?;
+                let mut buf = GpuBuffer::new(v.len() * std::mem::size_of::<T>())?;
                 buf.copy_from_slice(&v)?;
                 Ok(Tensor {
-                    storage: TensorStorage::Hip(buf),
+                    storage: TensorStorage::Gpu(buf),
                     layout: self.layout,
                     _dead: PhantomData,
                 })
             }
-            TensorStorage::Hip(_) => Ok(self),
+            TensorStorage::Gpu(_) => Ok(self),
         }
     }
 
     pub fn into_cpu(self) -> anyhow::Result<Self> {
         match self.storage {
             TensorStorage::Cpu(_) => Ok(self),
-            TensorStorage::Hip(b) => {
-                let mut v = vec![T::default(); b.size / std::mem::size_of::<T>()];
+            TensorStorage::Gpu(b) => {
+                let size = match &b {
+                    GpuBuffer::Cuda(b) => b.size,
+                    GpuBuffer::Hip(b) => b.size,
+                };
+                let mut v = vec![T::default(); size / std::mem::size_of::<T>()];
                 b.copy_to_slice(&mut v)?;
                 Ok(Tensor {
                     storage: TensorStorage::Cpu(v),
@@ -318,14 +331,16 @@ impl<T: Copy + Default> Tensor<T> {
     pub fn as_gpu_ptr(&self) -> *const T {
         match &self.storage {
             TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
-            TensorStorage::Hip(b) => b.ptr as *const T,
+            TensorStorage::Gpu(GpuBuffer::Cuda(b)) => b.ptr as *const T,
+            TensorStorage::Gpu(GpuBuffer::Hip(b)) => b.ptr as *const T,
         }
     }
 
     pub fn as_mut_gpu_ptr(&mut self) -> *mut T {
         match &self.storage {
             TensorStorage::Cpu(_) => panic!("not a gpu tensor"),
-            TensorStorage::Hip(b) => b.ptr as *mut T,
+            TensorStorage::Gpu(GpuBuffer::Cuda(b)) => b.ptr as *mut T,
+            TensorStorage::Gpu(GpuBuffer::Hip(b)) => b.ptr as *mut T,
         }
     }
 
@@ -404,7 +419,7 @@ impl<'a, T: Default + Debug + Copy> Debug for TensorView<'a, T> {
                     unsafe { std::slice::from_raw_parts(p, self.layout.largest_address() + 1) };
                 format_slice_with_layout(f, slice, 0, &self.layout)?;
             }
-            TensorStoragePtr::Hip(b) => {
+            TensorStoragePtr::Gpu(b) => {
                 let storage_size = self.layout.largest_address() + 1;
                 let mut cpu_data = vec![T::default(); storage_size];
                 unsafe {
@@ -429,13 +444,13 @@ impl<'a, T> TensorView<'a, T> {
     pub fn as_gpu_ptr(&self) -> *const T {
         match self.ptr {
             TensorStoragePtr::Cpu(_) => panic!("not a gpu tensor"),
-            TensorStoragePtr::Hip(b) => b as *const T,
+            TensorStoragePtr::Gpu(b) => b as *const T,
         }
     }
 
     pub fn as_cpu_slice(&self) -> &[T] {
         match self.ptr {
-            TensorStoragePtr::Hip(_) => panic!("not a cpu tensor"),
+            TensorStoragePtr::Gpu(_) => panic!("not a cpu tensor"),
             TensorStoragePtr::Cpu(p) => unsafe {
                 std::slice::from_raw_parts(p, self.layout.largest_address() + 1)
             },
@@ -484,7 +499,7 @@ impl<'a, T> TensorViewMut<'a, T> {
         TensorView {
             ptr: match &self.ptr {
                 TensorStoragePtrMut::Cpu(p) => TensorStoragePtr::Cpu(*p),
-                TensorStoragePtrMut::Hip(p) => TensorStoragePtr::Hip(*p),
+                TensorStoragePtrMut::Gpu(p) => TensorStoragePtr::Gpu(*p),
             },
             layout: self.layout.clone(),
             _dead: PhantomData,
@@ -494,20 +509,20 @@ impl<'a, T> TensorViewMut<'a, T> {
     pub fn as_gpu_ptr(&self) -> *const T {
         match self.ptr {
             TensorStoragePtrMut::Cpu(_) => panic!("not a gpu tensor"),
-            TensorStoragePtrMut::Hip(b) => b as *const T,
+            TensorStoragePtrMut::Gpu(b) => b as *const T,
         }
     }
 
     pub fn as_mut_gpu_ptr(&mut self) -> *mut T {
         match self.ptr {
             TensorStoragePtrMut::Cpu(_) => panic!("not a gpu tensor"),
-            TensorStoragePtrMut::Hip(b) => b as *mut T,
+            TensorStoragePtrMut::Gpu(b) => b as *mut T,
         }
     }
 
     pub fn as_cpu_slice(&self) -> &[T] {
         match self.ptr {
-            TensorStoragePtrMut::Hip(_) => panic!("not a cpu tensor"),
+            TensorStoragePtrMut::Gpu(_) => panic!("not a cpu tensor"),
             TensorStoragePtrMut::Cpu(p) => unsafe {
                 std::slice::from_raw_parts(p, self.layout.largest_address() + 1)
             },

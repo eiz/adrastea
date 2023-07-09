@@ -24,10 +24,10 @@ use core::{
     time::Duration,
 };
 use llama::MetaLlamaModelLoader;
+use simt::{ComputeApi, Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use std::{
     collections::HashMap,
     fs::File,
-    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -37,10 +37,8 @@ use clap::{Parser, Subcommand};
 use half::f16;
 use sentencepiece::SentencePieceProcessor;
 use serde::{Deserialize, Serialize};
-use simt_hip::{HipDevice, HipModule, HipPhysicalDevice, Kernel, LaunchParams};
-use skia_safe::{
-    paint::Style, Canvas, Color, EncodedImageFormat, Font, FontStyle, Paint, Surface, Typeface,
-};
+use simt_hip::{HipDevice, HipPhysicalDevice};
+use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
 use wayland::{ISkiaPaint, SurfaceClient};
 
 use crate::{
@@ -771,15 +769,15 @@ pub unsafe fn rocblas_result_call<T, F: FnOnce(*mut T) -> simt_rocblas_sys::rocb
 }
 
 unsafe fn microbenchmark() -> anyhow::Result<()> {
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     let kernels = GpuKernels::new(phys.capability()?)?;
-    let module_microbench = HipModule::find(phys.capability()?, adrastea_kernels::microbench)?;
+    let module_microbench = GpuModule::find(phys.capability()?, adrastea_kernels::microbench)?;
     let empty_kernel: Kernel<(i32,)> = Kernel::new(&module_microbench, "empty_kernel")?;
-    let wmma_loop_f16_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
+    let wmma_loop_f16_f16: Result<Kernel<(i32,)>, simt::Error> =
         Kernel::new(&module_microbench, "wmma_loop_f16_f16");
-    let wmma_loop_f32_f16: Result<Kernel<(i32,)>, simt_hip::Error> =
+    let wmma_loop_f32_f16: Result<Kernel<(i32,)>, simt::Error> =
         Kernel::new(&module_microbench, "wmma_loop_f32_f16");
     let wgp_count = unsafe {
         simt_hip::hip_result_call(|x| {
@@ -934,24 +932,10 @@ unsafe fn microbenchmark() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn skia_test() -> anyhow::Result<()> {
-    let mut surface = Surface::new_raster_n32_premul((256, 256)).unwrap();
-    let canvas = surface.canvas();
-    let mut paint = Paint::default();
-
-    paint.set_style(Style::Stroke).set_stroke_width(4.0).set_color(Color::RED);
-    canvas.draw_line((0, 0), (256, 256), &paint);
-    let image = surface.image_snapshot();
-    let data = image.encode(surface.direct_context(), EncodedImageFormat::PNG, None).unwrap();
-    let mut f = File::create("test.png")?;
-    f.write_all(data.as_bytes())?;
-    Ok(())
-}
-
 fn llama_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let path = path.as_ref();
-    let phys = HipPhysicalDevice::get(0)?;
-    let device = Arc::new(HipDevice::new(phys)?);
+    let phys = PhysicalGpu::any().expect("no gpu found");
+    let device = Arc::new(Gpu::new(phys)?);
     let _scope = device.lock()?;
     // BIG TODO: loading each kernel as a separate module like this is super not ergonomic
     // use a better way
@@ -1022,7 +1006,6 @@ enum CliCommand {
     Microbenchmark,
     Audio,
     Wayland,
-    Skia,
     Combined,
     Llama {
         #[arg(value_name = "MODEL")]
@@ -1072,7 +1055,6 @@ fn main() -> anyhow::Result<()> {
             let (_audio_state, surface_state) = gui_test_state();
             wayland_test(surface_state)?
         }
-        CliCommand::Skia => skia_test()?,
         CliCommand::Combined => {
             let (audio_state, surface_state) = gui_test_state();
             std::thread::spawn(move || streaming_test(Some(audio_state)));

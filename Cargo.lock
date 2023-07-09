@@ -35,6 +35,9 @@ dependencies = [
  "serde",
  "serde-pickle",
  "serde_json",
+ "simt",
+ "simt_core",
+ "simt_cuda",
  "simt_cuda_sys",
  "simt_hip",
  "simt_hip_sys",
@@ -1180,39 +1183,75 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43b2853a4d09f215c24cc5489c992ce46052d359b5109343cbafbf26bc62f8a3"
 
 [[package]]
-name = "simt_cuda_sys"
-version = "0.1.1"
+name = "simt"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6731d567ba4412ad9c4448c81877f852de2c1efdc4bdf2eb68422b66637d5f4e"
+checksum = "c60895119ff189ff0ebcb52112bd8b1127e53b2cdd3bb7ecb5d0494be7e05f4b"
+dependencies = [
+ "simt_core",
+ "simt_cuda",
+ "simt_cuda_sys",
+ "simt_hip",
+ "simt_hip_sys",
+ "thiserror",
+]
+
+[[package]]
+name = "simt_core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca282474d9b1b343a76b0d082912ecbbdfdbc12b52141fa0fa07ae7b0b679f80"
+dependencies = [
+ "half",
+]
+
+[[package]]
+name = "simt_cuda"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e45c047d78173737a5abe5cfb447baf573bc6670f3426a8dc86aa1d82bef915c"
+dependencies = [
+ "half",
+ "simt_core",
+ "simt_cuda_sys",
+ "thiserror",
+]
+
+[[package]]
+name = "simt_cuda_sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7d3d9fcac9fd6d145b5134311685285cef54d9f549b9cabbb4a3a30cd3faed6"
 dependencies = [
  "libloading 0.8.0",
 ]
 
 [[package]]
 name = "simt_hip"
-version = "0.1.6"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4939ef76da99d12ec462d90bfabf7f6bb465f26cfa9fe551375b9ff1634ec77"
+checksum = "c8f82e87e0a62cd1faea361b3e34aeee3642e5f92666f1bd07bcdd7cca6e10a1"
 dependencies = [
  "half",
+ "simt_core",
  "simt_hip_sys",
  "thiserror",
 ]
 
 [[package]]
 name = "simt_hip_sys"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a18509a2a8908506620d4c50a2879c89fd32bed2739c571cbcf90d1443dbc375"
+checksum = "c4a0365b1e5a2a5c8df604382c906bf9e016ffbaa150384d773ff6336871b156"
 dependencies = [
  "libloading 0.8.0",
 ]
 
 [[package]]
 name = "simt_rocblas_sys"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "666b9e72e6861ef86a39ccf603f5200dfb35806368720b282b8b9b8259da002b"
+checksum = "fa341a7a5663b6cb293a2b5f56f46f8b20f0630c8c80d8f91eb5624b6184ed12"
 dependencies = [
  "libloading 0.8.0",
 ]

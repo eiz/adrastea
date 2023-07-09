@@ -17,7 +17,8 @@ use std::{collections::HashSet, os::raw::c_void};
 
 use half::f16;
 use parking_lot::Mutex;
-use simt_hip::{HipModule, Kernel, KernelParam, LaunchParams};
+use simt::{GpuModule, Kernel, LaunchParams};
+use simt_core::KernelParam;
 
 use crate::{
     tensor::{TensorLayout, TensorView, TensorViewMut},
@@ -360,7 +361,7 @@ impl CommonKernels for MatmulTracer {
 }
 
 pub struct GpuKernels {
-    _modules: Vec<HipModule>,
+    _modules: Vec<GpuModule>,
     conv1d: Kernel<(
         TensorGpuDescriptor,
         TensorGpuDescriptor,
@@ -458,14 +459,14 @@ pub struct GpuKernels {
 
 impl GpuKernels {
     pub fn new(capability: i32) -> anyhow::Result<Self> {
-        let module_convolution = HipModule::find(capability, adrastea_kernels::convolution)?;
-        let module_convert = HipModule::find(capability, adrastea_kernels::convert)?;
-        let module_rotary = HipModule::find(capability, adrastea_kernels::rotary)?;
-        let module_elementwise = HipModule::find(capability, adrastea_kernels::elementwise)?;
-        let module_matmul = HipModule::find(capability, adrastea_kernels::matmul)?;
-        let module_normalize = HipModule::find(capability, adrastea_kernels::normalize)?;
-        let module_embed = HipModule::find(capability, adrastea_kernels::embed)?;
-        let module_error_stats = HipModule::find(capability, adrastea_kernels::error_stats)?;
+        let module_convolution = GpuModule::find(capability, adrastea_kernels::convolution)?;
+        let module_convert = GpuModule::find(capability, adrastea_kernels::convert)?;
+        let module_rotary = GpuModule::find(capability, adrastea_kernels::rotary)?;
+        let module_elementwise = GpuModule::find(capability, adrastea_kernels::elementwise)?;
+        let module_matmul = GpuModule::find(capability, adrastea_kernels::matmul)?;
+        let module_normalize = GpuModule::find(capability, adrastea_kernels::normalize)?;
+        let module_embed = GpuModule::find(capability, adrastea_kernels::embed)?;
+        let module_error_stats = GpuModule::find(capability, adrastea_kernels::error_stats)?;
         let kernels = GpuKernels {
             conv1d: Kernel::new(&module_convolution, "conv1d")?,
             conv2d_f16: Kernel::new(&module_convolution, "conv2d_f16")?,
