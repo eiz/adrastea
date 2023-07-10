@@ -24,22 +24,11 @@ simt_kernels! {
         convolution,
         elementwise,
         embed,
-        embed_uint8,
         error_stats,
         matmul,
-        matmul_nt_fp16u8,
         microbench,
         normalize,
-        rotary,
-        square_fp32_16x16
-    ]
-}
-
-simt_kernels! {
-    [sm_80: "sm_80", sm_89: "sm_89"],
-    [
-        matmul_nt_wmma_16x128x256_fp16u8,
-        matmul_nt_wmma_16x128x256,
-        matmul_nt_wmma_128x64x64
+        quantize,
+        rotary
     ]
 }

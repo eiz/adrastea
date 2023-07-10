@@ -18,7 +18,6 @@ use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     any::Provider,
     cell::RefCell,
-    ffi::{c_void, CStr},
     fmt::{Debug, Display, Formatter},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -26,7 +25,6 @@ use core::{
 use llama::MetaLlamaModelLoader;
 use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use std::{
-    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     time::Instant,
@@ -36,7 +34,6 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 use half::f16;
 use sentencepiece::SentencePieceProcessor;
-use serde::{Deserialize, Serialize};
 use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
 use wayland::{ISkiaPaint, SurfaceClient};
 
@@ -68,293 +65,6 @@ pub mod util;
 pub mod vulkan;
 pub mod wayland;
 pub mod whisper;
-
-#[inline(always)]
-unsafe fn cuda_call<F: FnOnce() -> simt_cuda_sys::CUresult>(
-    cb: F,
-) -> Result<(), simt_cuda_sys::CUresult> {
-    let res = cb();
-    if res == simt_cuda_sys::CUresult::CUDA_SUCCESS {
-        Ok(())
-    } else {
-        Err(res)
-    }
-}
-
-#[inline(always)]
-unsafe fn cuda_result_call<T, F: FnOnce(*mut T) -> simt_cuda_sys::CUresult>(
-    cb: F,
-) -> Result<T, simt_cuda_sys::CUresult> {
-    let mut out = std::mem::MaybeUninit::uninit();
-    let res = cb(out.as_mut_ptr());
-    if res == simt_cuda_sys::CUresult::CUDA_SUCCESS {
-        Ok(out.assume_init())
-    } else {
-        Err(res)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TritonKernelMetadata {
-    num_warps: u32,
-    num_stages: u32,
-    constants: HashMap<String, u32>,
-    debug: bool,
-    shared: u32,
-    name: String,
-}
-
-struct CudaContext {
-    cuda: Arc<simt_cuda_sys::cuda>,
-    device: simt_cuda_sys::CUdevice,
-    context: simt_cuda_sys::CUcontext,
-}
-
-impl CudaContext {
-    pub unsafe fn new(cuda: Arc<simt_cuda_sys::cuda>, device_index: i32) -> anyhow::Result<Self> {
-        let device = cuda_result_call(|x| cuda.cuDeviceGet(x, device_index))?;
-        let context = cuda_result_call(|x| cuda.cuCtxCreate_v2(x, 0, device))?;
-        cuda_result_call(|x| cuda.cuCtxPopCurrent_v2(x)).expect("cuCtxPopCurrent_v2 failed");
-        Ok(Self { cuda, device, context })
-    }
-}
-
-impl Drop for CudaContext {
-    fn drop(&mut self) {
-        unsafe {
-            cuda_call(|| self.cuda.cuCtxDestroy_v2(self.context)).expect("cuCtxDestroy_v2 failed");
-        }
-    }
-}
-
-// exercise for the reader: make get() not have to return a clone
-thread_local! {
-    static THREAD_CUDA_CONTEXT: RefCell<Option<Arc<CudaContext>>> = RefCell::new(None);
-}
-
-struct ScopedCudaContext {
-    old_value: Option<Arc<CudaContext>>,
-}
-
-impl ScopedCudaContext {
-    unsafe fn new(value: Arc<CudaContext>) -> Result<Self, simt_cuda_sys::CUresult> {
-        let old_value = THREAD_CUDA_CONTEXT.with(|v| {
-            let mut v = v.borrow_mut();
-            let old_value = v.clone();
-            cuda_call(|| value.cuda.cuCtxPushCurrent_v2(value.context))?;
-            *v = Some(value);
-            Ok(old_value)
-        })?;
-        Ok(ScopedCudaContext { old_value })
-    }
-
-    fn get() -> Result<Arc<CudaContext>, simt_cuda_sys::CUresult> {
-        THREAD_CUDA_CONTEXT
-            .with(|v| v.borrow().clone())
-            .ok_or(simt_cuda_sys::CUresult::CUDA_ERROR_INVALID_CONTEXT)
-    }
-
-    pub fn capability() -> Result<i32, simt_cuda_sys::CUresult> {
-        unsafe {
-            let ctx = ScopedCudaContext::get()?;
-            let major = cuda_result_call(|x| {
-                ctx.cuda.cuDeviceGetAttribute(
-                    x,
-                    simt_cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                    ctx.device,
-                )
-            })?;
-            let minor = cuda_result_call(|x| {
-                ctx.cuda.cuDeviceGetAttribute(
-                    x,
-                    simt_cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                    ctx.device,
-                )
-            })?;
-            Ok(major * 10 + minor)
-        }
-    }
-}
-
-impl Drop for ScopedCudaContext {
-    fn drop(&mut self) {
-        THREAD_CUDA_CONTEXT.with(|v| {
-            let mut v = v.borrow_mut();
-            unsafe {
-                cuda_result_call(|x| v.as_ref().unwrap().cuda.cuCtxPopCurrent_v2(x))
-                    .expect("cuCtxPopCurrent_v2 failed");
-            }
-            *v = self.old_value.clone()
-        });
-    }
-}
-
-struct CudaBuffer {
-    ptr: simt_cuda_sys::CUdeviceptr,
-    size: usize,
-}
-
-impl CudaBuffer {
-    pub unsafe fn new(size: usize) -> anyhow::Result<Self> {
-        let ctx = ScopedCudaContext::get()?;
-        let ptr = cuda_result_call(|x| ctx.cuda.cuMemAlloc_v2(x, size))?;
-        Ok(Self { ptr, size })
-    }
-
-    pub unsafe fn copy_from(
-        &mut self, src: *const std::ffi::c_void, size: usize,
-    ) -> anyhow::Result<()> {
-        let ctx = ScopedCudaContext::get()?;
-        cuda_call(|| ctx.cuda.cuMemcpyHtoD_v2(self.ptr, src, size))?;
-        Ok(())
-    }
-
-    pub unsafe fn copy_to(&self, dst: *mut std::ffi::c_void, size: usize) -> anyhow::Result<()> {
-        let ctx = ScopedCudaContext::get()?;
-        cuda_call(|| ctx.cuda.cuMemcpyDtoH_v2(dst, self.ptr, size))?;
-        Ok(())
-    }
-
-    pub fn copy_from_slice<T: Copy>(&mut self, src: &[T]) -> anyhow::Result<()> {
-        assert_eq!(src.len() * std::mem::size_of::<T>(), self.size);
-        unsafe { self.copy_from(src.as_ptr() as *const std::ffi::c_void, self.size) }
-    }
-
-    pub fn copy_to_slice<T: Copy>(&self, dst: &mut [T]) -> anyhow::Result<()> {
-        assert_eq!(dst.len() * std::mem::size_of::<T>(), self.size);
-        unsafe { self.copy_to(dst.as_mut_ptr() as *mut std::ffi::c_void, self.size) }
-    }
-}
-
-impl Drop for CudaBuffer {
-    fn drop(&mut self) {
-        unsafe {
-            let ctx = ScopedCudaContext::get()
-                .expect("invariant: CudaBuffer must be dropped in a context scope");
-            cuda_call(|| ctx.cuda.cuMemFree_v2(self.ptr)).expect("cuMemFree_v2 failed");
-        }
-    }
-}
-
-pub struct CudaModule {
-    inner: simt_cuda_sys::CUmodule,
-}
-
-impl CudaModule {
-    pub unsafe fn new(data: &[u8]) -> anyhow::Result<Self> {
-        let ctx = ScopedCudaContext::get()?;
-        let inner = cuda_result_call(|x| ctx.cuda.cuModuleLoadData(x, data.as_ptr() as *const _))?;
-        Ok(Self { inner })
-    }
-
-    pub unsafe fn find(capability: i32, kernels: &[(&str, &[u8])]) -> anyhow::Result<Self> {
-        let ctx = ScopedCudaContext::get()?;
-        let mut compatible_kernels = vec![];
-        for (arch, bin) in kernels {
-            if !arch.starts_with("sm_") {
-                continue;
-            }
-            let arch = arch[3..].parse::<i32>()?;
-            if arch <= capability {
-                compatible_kernels.push((arch, bin));
-            }
-        }
-        compatible_kernels.sort_by_key(|(arch, _)| *arch);
-        let (_, bin) = compatible_kernels
-            .iter()
-            .rev()
-            .filter(|(arch, _)| *arch <= capability)
-            .last()
-            .ok_or_else(|| anyhow::anyhow!("no compatible kernel found"))?;
-        let inner = cuda_result_call(|x| ctx.cuda.cuModuleLoadData(x, bin.as_ptr() as *const _))?;
-        Ok(Self { inner })
-    }
-}
-
-impl Drop for CudaModule {
-    fn drop(&mut self) {
-        unsafe {
-            let ctx = ScopedCudaContext::get()
-                .expect("invariant: CudaModule must be dropped in a context scope");
-            cuda_call(|| ctx.cuda.cuModuleUnload(self.inner)).expect("cuModuleUnload failed");
-        }
-    }
-}
-
-const ROWS: u64 = 8;
-const COLS: u64 = 8;
-
-unsafe fn cuda_square() -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    const LIB: &str = "libcuda.so";
-    #[cfg(windows)]
-    const LIB: &str = "nvcuda.dll";
-    let cuda = Arc::new(simt_cuda_sys::cuda::new(LIB)?);
-    cuda_call(|| cuda.cuInit(0))?;
-    let device_count = cuda_result_call(|x| cuda.cuDeviceGetCount(x))?;
-    println!("{} device(s)", device_count);
-    for i in 0..device_count {
-        let mut name = [0u8; 256];
-        cuda_call(|| cuda.cuDeviceGetName(name.as_mut_ptr() as *mut _, 256, i))?;
-        let c_name = CStr::from_ptr(name.as_ptr() as *const _);
-        println!("Device {}: {}", i, c_name.to_str()?);
-    }
-    if device_count == 0 {
-        bail!("can't continue, no devices");
-    }
-    let context = Arc::new(CudaContext::new(cuda.clone(), 0)?);
-    let _scoped_ctx = ScopedCudaContext::new(context.clone());
-    let capability = ScopedCudaContext::capability()?;
-    let module = CudaModule::find(capability, adrastea_kernels::square_fp32_16x16)?;
-    let kernel = cuda_result_call(|x| {
-        cuda.cuModuleGetFunction(x, module.inner, b"square_fp32_16x16\0".as_ptr() as *const i8)
-    })?;
-    dbg!(kernel);
-    let stream = cuda_result_call(|x| cuda.cuStreamCreate(x, 0))?;
-    dbg!(stream);
-    let mut stage_buf = vec![0.0f32; (COLS * ROWS) as usize];
-    let buf_sz = (COLS * ROWS * std::mem::size_of::<f32>() as u64) as usize;
-    for y in 0..ROWS {
-        for x in 0..COLS {
-            stage_buf[(y * COLS + x) as usize] = (y + x) as f32;
-        }
-    }
-    let mut buf = CudaBuffer::new(buf_sz)?;
-    buf.copy_from_slice(&stage_buf)?;
-    let grid_x = util::ceil_div(COLS, 16);
-    let grid_y = util::ceil_div(ROWS, 16);
-    let width = COLS as u32;
-    let height = ROWS as u32;
-    cuda_call(|| {
-        cuda.cuLaunchKernel(
-            kernel,
-            grid_x as u32,
-            grid_y as u32,
-            1,
-            16,
-            16,
-            1,
-            0,
-            stream,
-            &[
-                &buf.ptr as *const _ as *mut c_void,
-                &buf.ptr as *const _ as *mut c_void,
-                &width as *const _ as *mut c_void,
-                &height as *const _ as *mut c_void,
-            ] as *const _ as *mut _,
-            std::ptr::null_mut(),
-        )
-    })?;
-    cuda_call(|| cuda.cuStreamSynchronize(stream))?;
-    buf.copy_to_slice(&mut stage_buf)?;
-    for y in 0..ROWS {
-        for x in 0..COLS {
-            print!("{:4} ", stage_buf[(y * COLS + x) as usize]);
-        }
-        println!("");
-    }
-    Ok(())
-}
 
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     match data {
@@ -984,7 +694,6 @@ struct Opt {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    Cuda,
     Load {
         #[arg(value_name = "FILE")]
         path: PathBuf,
@@ -1034,7 +743,6 @@ enum CliCommand {
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
     match opt.command {
-        CliCommand::Cuda => unsafe { cuda_square()? },
         CliCommand::Load { path, dict_path } => {
             let model = PickledModel::load_file(&path, dict_path.as_ref().map(|s| s.as_str()))?;
             println!("{:#?}", model.tensors);

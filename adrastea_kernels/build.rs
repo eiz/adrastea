@@ -62,14 +62,12 @@ fn main() {
         "convolution",
         "elementwise",
         "embed",
-        "embed_uint8",
         "error_stats",
         "matmul",
-        "matmul_nt_fp16u8",
         "microbench",
         "normalize",
+        "quantize",
         "rotary",
-        "square_fp32_16x16",
     ];
     let kernels_cuda = &[
         "matmul_nt_wmma_16x128x256_fp16u8",
