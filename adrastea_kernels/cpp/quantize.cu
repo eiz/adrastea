@@ -1,11 +1,8 @@
 #include "compat.h"
 
-__global__ void quantize_absmax_uint8(uint8_t* output,
-                                      half* scales,
-                                      half const* __restrict__ input,
-                                      int M,
-                                      int N,
-                                      int K) {
+__global__ void quantize_absmax_uint8(TensorViewU8 output,
+                                      TensorViewF16 scales,
+                                      TensorViewF16 input) {
   __shared__ float s_warp_reduced[32];
   __shared__ half s_absmax;
   float absmax_val = 0;
@@ -14,9 +11,9 @@ __global__ void quantize_absmax_uint8(uint8_t* output,
   int lane_id = tid % 32;
   int warp_id = tid / 32;
   bool warp_leader = lane_id == 0;
-  int block_count = N / K;
-  for (int i = blockIdx.x * K + tid; i < (blockIdx.x + 1) * K; i += blockDim.x) {
-    float val = __float2half(input[row * N + i]);
+  int block_size = output.width() / scales.width();
+  for (int i = blockIdx.x * block_size + tid; i < (blockIdx.x + 1) * block_size; i += blockDim.x) {
+    float val = __float2half(input(row, i));
     absmax_val = fmax(absmax_val, fabs(val));
   }
   __syncthreads();
@@ -38,25 +35,22 @@ __global__ void quantize_absmax_uint8(uint8_t* output,
   }
   __syncthreads();
   if (tid == 0) {
-    scales[row * block_count + blockIdx.x] = s_absmax;
+    scales(row, blockIdx.x) = s_absmax;
   }
-  for (int i = blockIdx.x * K + tid; i < (blockIdx.x + 1) * K; i += blockDim.x) {
-    output[row * N + i] = static_cast<uint8_t>(
-        round(127.5f + __half2float(input[row * N + i]) / __half2float(s_absmax)));
+  for (int i = blockIdx.x * block_size + tid; i < (blockIdx.x + 1) * block_size; i += blockDim.x) {
+    output(row, i) =
+        static_cast<uint8_t>(round(127.5f + __half2float(input(row, i)) / __half2float(s_absmax)));
   }
 }
 
-__global__ void dequantize_absmax_uint8(half* output,
-                                        half const* __restrict__ scales,
-                                        uint8_t const* __restrict__ input,
-                                        int M,
-                                        int N,
-                                        int K) {
+__global__ void dequantize_absmax_uint8(TensorViewF16 output,
+                                        TensorViewF16 scales,
+                                        TensorViewU8 input) {
   int row = blockIdx.y;
   int tid = threadIdx.x;
-  int block_count = N / K;
-  for (int i = blockIdx.x * K + tid; i < (blockIdx.x + 1) * K; i += blockDim.x) {
-    output[row * N + i] = __float2half((float(input[row * N + i]) - 127.5f) *
-                                       __half2float(scales[row * block_count + blockIdx.x]));
+  int block_size = output.width() / scales.width();
+  for (int i = blockIdx.x * block_size + tid; i < (blockIdx.x + 1) * block_size; i += blockDim.x) {
+    output(row, i) =
+        __float2half((float(input(row, i)) - 127.5f) * __half2float(scales(row, blockIdx.x)));
   }
 }

@@ -106,5 +106,7 @@ struct TensorView {
 #undef POP
   }
 };
+
+using TensorViewU8 = TensorView<uint8_t>;
 using TensorViewF16 = TensorView<__half>;
 using TensorViewF32 = TensorView<float>;

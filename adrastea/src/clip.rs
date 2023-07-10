@@ -863,8 +863,6 @@ pub fn clip_test<P: AsRef<Path>>(path: P) -> anyhow::Result<()> {
     let vocab = Arc::new(ClipVocabulary::new());
     let mut text_ctx = ClipTextContext::new(Arc::new(tt), vocab.clone(), kernels.clone());
     let joint_embed = ClipJointEmbedding::new(&builder)?;
-    println!("{:#?}", params);
-    let mut tokenizer = ClipTokenizer::new(vocab);
     let vision_embedding = vision_ctx.encode("/home/eiz/clip_gold.png")?;
     let text_embedding = text_ctx.encode("a photo of a cat")?;
     let mut similarities = Tensor::new_gpu(&[1, 1])?;
