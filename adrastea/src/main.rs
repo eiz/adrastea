@@ -22,8 +22,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use llama::MetaLlamaModelLoader;
-use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -31,10 +29,14 @@ use std::{
 };
 
 use anyhow::bail;
+use atspi::{connection::AccessibilityConnection, proxy::accessible::AccessibleProxy};
 use clap::{Parser, Subcommand};
 use half::f16;
+use llama::MetaLlamaModelLoader;
 use sentencepiece::SentencePieceProcessor;
+use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
+use tokio_stream::StreamExt;
 use wayland::{ISkiaPaint, SurfaceClient};
 
 use crate::{
@@ -738,6 +740,41 @@ enum CliCommand {
         )]
         prompt: String,
     },
+    Atk,
+}
+
+#[tokio::main]
+async fn atk_test() -> anyhow::Result<()> {
+    atspi::connection::set_session_accessibility(true).await?;
+    let ax = AccessibilityConnection::open().await?;
+    ax.register_event::<atspi::events::object::AnnouncementEvent>().await?;
+    ax.register_event::<atspi::events::object::StateChangedEvent>().await?;
+    let mut wut = ax.receive_all_signals().await?;
+    let desktop = AccessibleProxy::builder(ax.connection())
+        .destination("org.a11y.atspi.Registry")?
+        .path("/org/a11y/atspi/accessible/root")?
+        .build()
+        .await?;
+    let wut2wut = desktop.get_attributes().await?;
+    let childs = desktop.get_children().await?;
+    println!("=== the list ===");
+    for (source, path) in childs {
+        println!("child {:?}: {:?}", source, path);
+        let god_help_us_all = AccessibleProxy::builder(ax.connection())
+            .destination(source)?
+            .path(path)?
+            .build()
+            .await?;
+        println!("its role: {:?}", god_help_us_all.get_role().await?);
+        println!("its name: {:?}", god_help_us_all.name().await?);
+    }
+    println!("{:#?}", wut2wut);
+    println!("{:#?}", desktop.get_role().await?);
+    println!("we b waitin");
+    while let Some(event) = wut.next().await {
+        println!("{:#?}", event);
+    }
+    todo!()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -772,6 +809,7 @@ fn main() -> anyhow::Result<()> {
         CliCommand::Llava { llava_path, clip_path, images, prompt } => {
             llava::llava_test(llava_path, clip_path, &images, &prompt)?
         }
+        CliCommand::Atk => atk_test()?,
     }
     Ok(())
 }
