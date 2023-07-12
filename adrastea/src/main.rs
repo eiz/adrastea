@@ -743,38 +743,38 @@ enum CliCommand {
     Atk,
 }
 
+#[async_recursion::async_recursion]
+async fn print_ax_tree(
+    ax: &AccessibilityConnection, root: &AccessibleProxy<'_>, indent: usize,
+) -> anyhow::Result<()> {
+    if indent == 0 {
+        println!("Root");
+    } else {
+        println!("{}{} {:?}", " ".repeat(indent), root.get_role().await?, root.name().await?);
+    }
+    let children = root.get_children().await?;
+    for (source, path) in children {
+        let child = AccessibleProxy::builder(ax.connection())
+            .destination(source)?
+            .path(path)?
+            .build()
+            .await?;
+        print_ax_tree(ax, &child, indent + 2).await?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn atk_test() -> anyhow::Result<()> {
     atspi::connection::set_session_accessibility(true).await?;
     let ax = AccessibilityConnection::open().await?;
-    ax.register_event::<atspi::events::object::AnnouncementEvent>().await?;
-    ax.register_event::<atspi::events::object::StateChangedEvent>().await?;
-    let mut wut = ax.receive_all_signals().await?;
     let desktop = AccessibleProxy::builder(ax.connection())
         .destination("org.a11y.atspi.Registry")?
         .path("/org/a11y/atspi/accessible/root")?
         .build()
         .await?;
-    let wut2wut = desktop.get_attributes().await?;
-    let childs = desktop.get_children().await?;
-    println!("=== the list ===");
-    for (source, path) in childs {
-        println!("child {:?}: {:?}", source, path);
-        let god_help_us_all = AccessibleProxy::builder(ax.connection())
-            .destination(source)?
-            .path(path)?
-            .build()
-            .await?;
-        println!("its role: {:?}", god_help_us_all.get_role().await?);
-        println!("its name: {:?}", god_help_us_all.name().await?);
-    }
-    println!("{:#?}", wut2wut);
-    println!("{:#?}", desktop.get_role().await?);
-    println!("we b waitin");
-    while let Some(event) = wut.next().await {
-        println!("{:#?}", event);
-    }
-    todo!()
+    print_ax_tree(&ax, &desktop, 0).await?;
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {

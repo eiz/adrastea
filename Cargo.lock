@@ -25,6 +25,7 @@ dependencies = [
  "allocator-api2",
  "anyhow",
  "ash",
+ "async-recursion",
  "atspi",
  "bstr",
  "byteorder",
