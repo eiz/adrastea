@@ -39,7 +39,6 @@ use llama::MetaLlamaModelLoader;
 use sentencepiece::SentencePieceProcessor;
 use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
-use tokio_stream::StreamExt;
 use wayland::{ISkiaPaint, SurfaceClient};
 
 use crate::{
@@ -61,6 +60,7 @@ pub mod clip;
 pub mod kernels;
 pub mod llama;
 pub mod llava;
+pub mod mathpix;
 pub mod mel;
 pub mod pickle;
 pub mod rt_alloc;
