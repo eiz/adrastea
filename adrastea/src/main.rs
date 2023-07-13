@@ -29,7 +29,10 @@ use std::{
 };
 
 use anyhow::bail;
-use atspi::{connection::AccessibilityConnection, proxy::accessible::AccessibleProxy};
+use atspi::{
+    connection::AccessibilityConnection,
+    proxy::{accessible::AccessibleProxy, cache::CacheProxy},
+};
 use clap::{Parser, Subcommand};
 use half::f16;
 use llama::MetaLlamaModelLoader;
@@ -745,21 +748,34 @@ enum CliCommand {
 
 #[async_recursion::async_recursion]
 async fn print_ax_tree(
-    ax: &AccessibilityConnection, root: &AccessibleProxy<'_>, indent: usize,
+    ax: &AccessibilityConnection, root: &AccessibleProxy<'_>, level: usize,
 ) -> anyhow::Result<()> {
-    if indent == 0 {
-        println!("Root");
+    let role = root.get_role().await?;
+    if level == 0 {
+        println!("{}", role);
     } else {
-        println!("{}{} {:?}", " ".repeat(indent), root.get_role().await?, root.name().await?);
+        println!("{}{} {:?}", " ".repeat(level * 2), root.get_role().await?, root.name().await?);
     }
-    let children = root.get_children().await?;
-    for (source, path) in children {
-        let child = AccessibleProxy::builder(ax.connection())
-            .destination(source)?
-            .path(path)?
+    if role == atspi::Role::Application {
+        let cache = CacheProxy::builder(ax.connection())
+            .destination(root.destination())?
+            .path("/org/a11y/atspi/cache")?
             .build()
             .await?;
-        print_ax_tree(ax, &child, indent + 2).await?;
+        let items = cache.get_items().await?;
+        for item in items {
+            println!("{}{:?}", " ".repeat((level + 1) * 2), item);
+        }
+    } else {
+        let children = root.get_children().await?;
+        for (source, path) in children {
+            let child = AccessibleProxy::builder(ax.connection())
+                .destination(source)?
+                .path(path)?
+                .build()
+                .await?;
+            print_ax_tree(ax, &child, level + 1).await?;
+        }
     }
     Ok(())
 }
