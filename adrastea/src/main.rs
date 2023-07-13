@@ -22,8 +22,11 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use mathpix::{ImageToTextOptions, MathPixClient};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -744,6 +747,7 @@ enum CliCommand {
         prompt: String,
     },
     Atk,
+    Mpix,
 }
 
 #[async_recursion::async_recursion]
@@ -793,6 +797,31 @@ async fn atk_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::main]
+async fn mpix_test() -> anyhow::Result<()> {
+    let config = MpixConfig::load_from_file("/home/eiz/.mathpix")?;
+    let mut img_bytes = vec![];
+    std::io::stdin().read_to_end(&mut img_bytes)?;
+    let client = MathPixClient::new(&config.app_id, &config.app_key);
+    let options = ImageToTextOptions::default();
+    let response = client.image_to_text(img_bytes, options).await?;
+    println!("response {:#?}", response);
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MpixConfig {
+    app_id: String,
+    app_key: String,
+}
+
+impl MpixConfig {
+    pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
+        let file = File::open(path)?;
+        Ok(serde_yaml::from_reader(file)?)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
     match opt.command {
@@ -826,6 +855,7 @@ fn main() -> anyhow::Result<()> {
             llava::llava_test(llava_path, clip_path, &images, &prompt)?
         }
         CliCommand::Atk => atk_test()?,
+        CliCommand::Mpix => mpix_test()?,
     }
     Ok(())
 }

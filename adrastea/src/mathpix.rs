@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 
 pub struct MathPixClient {
@@ -8,41 +9,67 @@ pub struct MathPixClient {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct DataOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_svg: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_table_html: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_latex: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_tsv: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_asciimath: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_mathml: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ImageToTextOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub formats: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_detected_alphabets: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_options: Option<DataOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alphabets_allowed: Option<DetectedAlphabet>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub region: Option<Rectangle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_blue_hsv_filter: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence_threshold: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_line_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_word_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_smiles: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_geometry_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_rotate_confidence_threshold: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rm_spaces: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rm_fonts: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub idiomatic_eqn_arrays: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub idiomatic_braces: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub numbers_default_to_math: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub math_inline_delimiters: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_spell_check: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_tables_fallback: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct ImageToTextResponse {
-    pub request_id: String,
+    pub request_id: Option<String>,
     pub text: Option<String>,
     pub latex_styled: Option<String>,
     pub confidence: Option<f32>,
@@ -58,8 +85,8 @@ pub struct ImageToTextResponse {
     pub geometry_data: Option<Vec<GeometryData>>,
     pub auto_rotate_degrees: Option<i32>,
     pub error: Option<String>,
-    pub error_info: BTreeMap<String, String>,
-    pub version: String,
+    pub error_info: Option<BTreeMap<String, serde_json::Value>>,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -158,13 +185,14 @@ impl MathPixClient {
         let url = "https://api.mathpix.com/v3/text";
         let client = reqwest::Client::new();
         let json = serde_json::to_string(&options)?;
+        let form = Form::new()
+            .text("options_json", json)
+            .part("file", Part::bytes(png_bytes).mime_str("image/png")?.file_name("image.png"));
         let response = client
             .post(url)
             .header("app_id", &self.app_id)
             .header("app_key", &self.app_key)
-            .header("Content-Type", "image/png")
-            .query(&[("options_json", json)])
-            .body(png_bytes)
+            .multipart(form)
             .send()
             .await?;
         let response = response.text().await?;
