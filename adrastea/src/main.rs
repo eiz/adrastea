@@ -760,7 +760,7 @@ async fn print_ax_tree(
     } else {
         println!("{}{} {:?}", " ".repeat(level * 2), root.get_role().await?, root.name().await?);
     }
-    if role == atspi::Role::Application {
+    if role == atspi::Role::Application && false {
         let cache = CacheProxy::builder(ax.connection())
             .destination(root.destination())?
             .path("/org/a11y/atspi/cache")?
@@ -822,6 +822,10 @@ impl MpixConfig {
     }
 }
 
+fn wserver_test() -> anyhow::Result<()> {
+    todo!()
+}
+
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
     match opt.command {
@@ -856,6 +860,7 @@ fn main() -> anyhow::Result<()> {
         }
         CliCommand::Atk => atk_test()?,
         CliCommand::Mpix => mpix_test()?,
+        CliCommand::Wserver => wserver_test()?,
     }
     Ok(())
 }
