@@ -748,6 +748,7 @@ enum CliCommand {
     },
     Atk,
     Mpix,
+    Wserver,
 }
 
 #[async_recursion::async_recursion]

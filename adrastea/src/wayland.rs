@@ -23,14 +23,18 @@ use core::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
-use std::os::{
-    fd::{FromRawFd, OwnedFd},
-    raw::c_void,
+use std::{
+    os::{
+        fd::{FromRawFd, OwnedFd},
+        raw::c_void,
+    },
+    path::Path,
 };
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
+use tokio::net::UnixStream;
 use wayland_client::{
     protocol::{
         wl_buffer, wl_callback, wl_compositor,
@@ -713,4 +717,62 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for SurfaceClient {
             _ => {}
         }
     }
+}
+
+pub enum WaylandDataType {
+    Int,
+    Uint,
+    Fixed,
+    String,
+    ObjectId,
+    NewObjectId,
+    Array,
+    Fd,
+}
+
+pub struct WaylandDescription {
+    pub summary: String,
+    pub text: String,
+}
+
+pub struct WaylandArg {
+    pub name: String,
+    pub data_type: WaylandDataType,
+    pub summary: String,
+}
+
+pub struct WaylandRequest {
+    pub name: String,
+    pub description: WaylandDescription,
+    pub args: Vec<WaylandArg>,
+}
+
+pub struct WaylandEvent {
+    pub name: String,
+    pub description: WaylandDescription,
+    pub args: Vec<WaylandArg>,
+}
+
+pub struct WaylandEnumEntry {
+    pub name: String,
+    pub value: u32,
+}
+
+pub struct WaylandEnum {
+    pub entries: Vec<WaylandEnumEntry>,
+}
+
+pub struct WaylandInterface {
+    pub version: u32,
+    pub name: String,
+    pub description: WaylandDescription,
+    pub requests: Vec<WaylandRequest>,
+    pub events: Vec<WaylandEvent>,
+    pub enums: Vec<WaylandEnum>,
+}
+
+pub struct WaylandProtocol {
+    pub name: String,
+    pub copyright: String,
+    pub interfaces: Vec<WaylandInterface>,
 }
