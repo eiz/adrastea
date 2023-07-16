@@ -24,6 +24,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use std::{
+    fs::File,
+    io::BufReader,
     os::{
         fd::{FromRawFd, OwnedFd},
         raw::c_void,
@@ -33,6 +35,7 @@ use std::{
 
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
+use serde::Deserialize;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
 use tokio::net::UnixStream;
 use wayland_client::{
@@ -719,60 +722,110 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for SurfaceClient {
     }
 }
 
+#[derive(Debug, Deserialize)]
 pub enum WaylandDataType {
+    #[serde(rename = "int")]
     Int,
+    #[serde(rename = "uint")]
     Uint,
+    #[serde(rename = "fixed")]
     Fixed,
+    #[serde(rename = "string")]
     String,
-    ObjectId,
-    NewObjectId,
+    #[serde(rename = "object")]
+    Object,
+    #[serde(rename = "new_id")]
+    NewId,
+    #[serde(rename = "array")]
     Array,
+    #[serde(rename = "fd")]
     Fd,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandDescription {
-    pub summary: String,
-    pub text: String,
+    #[serde(rename = "@summary")]
+    pub summary: Option<String>,
+    #[serde(rename = "$text")]
+    pub text: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandArg {
+    #[serde(rename = "@name")]
     pub name: String,
+    #[serde(rename = "@type")]
     pub data_type: WaylandDataType,
-    pub summary: String,
+    #[serde(rename = "@summary")]
+    pub summary: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandRequest {
+    #[serde(rename = "@name")]
     pub name: String,
-    pub description: WaylandDescription,
-    pub args: Vec<WaylandArg>,
+    pub description: Option<WaylandDescription>,
+    #[serde(rename = "arg")]
+    pub args: Option<Vec<WaylandArg>>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandEvent {
+    #[serde(rename = "@name")]
     pub name: String,
-    pub description: WaylandDescription,
-    pub args: Vec<WaylandArg>,
+    pub description: Option<WaylandDescription>,
+    #[serde(rename = "arg")]
+    pub args: Option<Vec<WaylandArg>>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandEnumEntry {
+    #[serde(rename = "@name")]
     pub name: String,
-    pub value: u32,
+    #[serde(rename = "@value")]
+    pub value: String,
+    #[serde(rename = "@summary")]
+    pub summary: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct WaylandEnum {
+    #[serde(rename = "entry")]
     pub entries: Vec<WaylandEnumEntry>,
 }
 
-pub struct WaylandInterface {
-    pub version: u32,
-    pub name: String,
-    pub description: WaylandDescription,
-    pub requests: Vec<WaylandRequest>,
-    pub events: Vec<WaylandEvent>,
-    pub enums: Vec<WaylandEnum>,
+#[derive(Debug, Deserialize)]
+pub enum WaylandInterfaceItem {
+    #[serde(rename = "request")]
+    Request(WaylandRequest),
+    #[serde(rename = "event")]
+    Event(WaylandEvent),
+    #[serde(rename = "enum")]
+    Enum(WaylandEnum),
 }
 
-pub struct WaylandProtocol {
+#[derive(Debug, Deserialize)]
+pub struct WaylandInterface {
+    #[serde(rename = "@version")]
+    pub version: u32,
+    #[serde(rename = "@name")]
     pub name: String,
-    pub copyright: String,
+    pub description: Option<WaylandDescription>,
+    #[serde(rename = "$value")]
+    pub items: Option<Vec<WaylandInterfaceItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WaylandProtocol {
+    #[serde(rename = "@name")]
+    pub name: String,
+    pub copyright: Option<String>,
+    #[serde(rename = "interface")]
     pub interfaces: Vec<WaylandInterface>,
+}
+
+impl WaylandProtocol {
+    pub fn load_path<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        Ok(quick_xml::de::from_reader(BufReader::new(File::open(path)?))?)
+    }
 }

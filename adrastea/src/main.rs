@@ -824,6 +824,9 @@ impl MpixConfig {
 }
 
 fn wserver_test() -> anyhow::Result<()> {
+    let shittles =
+        wayland::WaylandProtocol::load_path("/home/eiz/code/wayland/protocol/wayland.xml")?;
+    println!("{:#?}", shittles);
     todo!()
 }
 

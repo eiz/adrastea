@@ -1749,6 +1749,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81b9228215d82c7b61490fec1de287136b5de6f5700f6e58ea9ad61a7964ca51"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
