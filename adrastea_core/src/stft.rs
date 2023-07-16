@@ -32,15 +32,7 @@ impl RealStft {
         let frame = vec![Complex32::new(0.0, 0.0); n_fft];
         let fft = vec![Complex32::new(0.0, 0.0); n_fft];
         let scratch = vec![Complex32::new(0.0, 0.0); plan.get_outofplace_scratch_len()];
-        Self {
-            n_fft,
-            hop_length,
-            window_fn,
-            plan,
-            frame,
-            fft,
-            scratch,
-        }
+        Self { n_fft, hop_length, window_fn, plan, frame, fft, scratch }
     }
 
     pub fn num_frames(&self, input_size: usize) -> usize {

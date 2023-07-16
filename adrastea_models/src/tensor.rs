@@ -18,10 +18,9 @@ use core::{
     marker::PhantomData,
 };
 
+use adrastea_core::util::ElidingRangeIterator;
 use simt::{ComputeApi, GpuBuffer, ScopedGpu};
 use smallvec::SmallVec;
-
-use crate::util::ElidingRangeIterator;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TensorLayout {
@@ -584,6 +583,18 @@ impl<'a, T: Display + Default + Debug + Copy> Debug for TensorViewMut<'a, T> {
 #[cfg(test)]
 mod test {
     use crate::tensor::{Tensor, TensorLayout};
+
+    #[test]
+    fn print_tensor() {
+        let tensor = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], TensorLayout::row_major(&[2, 2]));
+        println!("{:?}", tensor);
+        let tensor = Tensor::from_vec(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            TensorLayout::row_major(&[3, 3]),
+        );
+        println!("standard\n{:?}\n", tensor);
+        println!("transpose\n{:?}", tensor.as_view().permute(&[1, 0]));
+    }
 
     #[test]
     fn shape_cast() {

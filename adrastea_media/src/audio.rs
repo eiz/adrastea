@@ -22,6 +22,10 @@ use core::{
     time::Duration,
 };
 
+use adrastea_core::{
+    rt_alloc::RtObjectHeap,
+    util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWriter},
+};
 use alloc::{rc::Rc, sync::Arc};
 use allocator_api2::boxed::Box;
 use anyhow::bail;
@@ -35,11 +39,6 @@ use pipewire::{
     spa::{spa_interface_call_method, Direction},
     stream::{ListenerBuilderT, Stream, StreamFlags},
     Context, IsSource, MainLoop,
-};
-
-use crate::{
-    rt_alloc::RtObjectHeap,
-    util::{AtomicRing, AtomicRingReader, AtomicRingWaiter, AtomicRingWriter},
 };
 
 // TODO: The current version of pipewire-rs, while a good effort, still has a number

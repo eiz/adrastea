@@ -15,9 +15,8 @@
 
 use core::ffi::CStr;
 
+use adrastea_core::util;
 use ash::{vk, Entry};
-
-use crate::util;
 
 const THEM_SHADERS: &[u8] = include_bytes!("../../shaders/square.comp.spv");
 

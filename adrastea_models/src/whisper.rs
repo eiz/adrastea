@@ -16,6 +16,7 @@
 use alloc::sync::Arc;
 use core::fmt::{self, Debug, Formatter};
 
+use adrastea_core::mel;
 use half::f16;
 use rustfft::num_complex::Complex32;
 use serde::Deserialize;
@@ -26,7 +27,6 @@ use crate::{
         BinaryOp, CommonKernels, Conv1dActivation, MatmulLoad, MatmulMask, MatmulOptions,
         MatmulStore,
     },
-    mel,
     pickle::{self, load_tensor, PickledModel},
     tensor::{Tensor, TensorLayout, TensorView, TensorViewMut},
 };

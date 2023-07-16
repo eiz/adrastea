@@ -1,5 +1,11 @@
 [workspace]
-members = ["adrastea", "adrastea_kernels"]
+members = [
+    "adrastea",
+    "adrastea_core",
+    "adrastea_kernels",
+    "adrastea_media",
+    "adrastea_models",
+]
 resolver = "2"
 
 [patch.crates-io]

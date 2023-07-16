@@ -15,15 +15,13 @@
 
 use std::{collections::HashSet, os::raw::c_void};
 
+use adrastea_core::util::ceil_div;
 use half::f16;
 use parking_lot::Mutex;
 use simt::{GpuModule, Kernel, LaunchParams};
 use simt_core::KernelParam;
 
-use crate::{
-    tensor::{TensorLayout, TensorView, TensorViewMut},
-    util::ceil_div,
-};
+use crate::tensor::{TensorLayout, TensorView, TensorViewMut};
 
 // TODO new kernel system
 

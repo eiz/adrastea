@@ -240,3 +240,17 @@ impl<T: Send> Clone for AtomicRingWaiter<T> {
         Self(self.0.clone())
     }
 }
+
+#[cfg(test)]
+pub mod test {
+    use crate::util::ElidingRangeIterator;
+
+    #[test]
+    fn test_elided_range() {
+        let mut indices = vec![];
+        for (_skip, i) in ElidingRangeIterator::new(10, 6, 3) {
+            indices.push(i);
+        }
+        assert_eq!(indices, vec![0, 1, 2, 7, 8, 9]);
+    }
+}

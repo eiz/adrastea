@@ -33,6 +33,10 @@ use std::{
     path::Path,
 };
 
+use adrastea_core::{
+    rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
+    util::IUnknown,
+};
 use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use serde::Deserialize;
@@ -51,11 +55,6 @@ use wayland_protocols::{
     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
-
-use crate::{
-    rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
-    util::IUnknown,
-};
 
 #[derive(Debug)]
 struct WaylandArenaHandleInner {
@@ -843,5 +842,23 @@ pub struct WaylandProtocol {
 impl WaylandProtocol {
     pub fn load_path<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         Ok(quick_xml::de::from_reader(BufReader::new(File::open(path)?))?)
+    }
+}
+
+enum LocalHandle {
+    RequestHandler(Box<dyn IUnknown>),
+    EventHandler(Box<dyn IUnknown>),
+    Empty,
+}
+
+pub struct WaylandConnection {
+    stream: UnixStream,
+    local_handle_table: Vec<LocalHandle>,
+    local_free_list: Vec<usize>,
+}
+
+impl WaylandConnection {
+    pub fn new(stream: UnixStream) -> Self {
+        Self { stream, local_handle_table: vec![], local_free_list: vec![] }
     }
 }

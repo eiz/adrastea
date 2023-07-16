@@ -10,7 +10,10 @@ license = "AGPL-3.0-only"
 hip = ["adrastea_kernels/hip"]
 
 [dependencies]
+adrastea_core = { path = "../adrastea_core" }
 adrastea_kernels = { path = "../adrastea_kernels" }
+adrastea_media = { path = "../adrastea_media" }
+adrastea_models = { path = "../adrastea_models" }
 
 allocator-api2 = "0.2.14"
 anyhow = "1.0.71"
@@ -23,14 +26,14 @@ cstr = "0.2.11"
 half = "2"
 libc = "0.2.146"
 libspa-sys = "0.6.0"
-matrixmultiply = { version = "0.3.7", features = ["threading"] }
+
 memmap2 = "0.6.1"
 num-traits = "0.2.15"
 parking_lot = "0.12.1"
 pipewire = "0.6.0"
 pipewire-sys = "0.6.0"
 regex = "1.8.4"
-rustfft = "6.1.0"
+
 sentencepiece = "0.11.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -62,7 +65,7 @@ async-recursion = "1.0.4"
 reqwest = { version = "0.11.18", features = ["multipart"] }
 serde_yaml = "0.9.22"
 dirs = "5.0.1"
-quick-xml = { version = "0.29.0", features = ["serialize"] }
+nix = "0.26.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = "0.48.0"

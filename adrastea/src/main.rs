@@ -14,6 +14,23 @@
  */
 
 #![feature(provide_any, iter_advance_by)]
+use adrastea_core::util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
+use adrastea_media::{
+    audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
+    vulkan,
+    wayland::{self, ISkiaPaint, SurfaceClient},
+};
+use adrastea_models::{
+    clip,
+    kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
+    llama::{LlamaContext, LlamaModel, LlamaParams, MetaLlamaModelLoader},
+    llava,
+    pickle::{ModelState, PickledModel},
+    tensor::Tensor,
+    whisper::{
+        WhisperContext, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
+    },
+};
 use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     any::Provider,
@@ -38,41 +55,13 @@ use atspi::{
 };
 use clap::{Parser, Subcommand};
 use half::f16;
-use llama::MetaLlamaModelLoader;
 use sentencepiece::SentencePieceProcessor;
 use simt::{Gpu, GpuModule, Kernel, LaunchParams, PhysicalGpu};
 use skia_safe::{paint::Style, Canvas, Color, Font, FontStyle, Paint, Typeface};
-use wayland::{ISkiaPaint, SurfaceClient};
-
-use crate::{
-    audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
-    kernels::{CommonKernels, GpuKernels, MatmulOptions, MatmulTracer},
-    llama::{LlamaContext, LlamaModel, LlamaParams},
-    pickle::{ModelState, PickledModel},
-    tensor::Tensor,
-    util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown},
-    whisper::{
-        WhisperContext, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
-    },
-};
 
 extern crate alloc;
 
-pub mod audio;
-pub mod clip;
-pub mod kernels;
-pub mod llama;
-pub mod llava;
 pub mod mathpix;
-pub mod mel;
-pub mod pickle;
-pub mod rt_alloc;
-pub mod stft;
-pub mod tensor;
-pub mod util;
-pub mod vulkan;
-pub mod wayland;
-pub mod whisper;
 
 fn wav2float_mono(data: &wav::BitDepth) -> Vec<f32> {
     match data {
@@ -867,33 +856,4 @@ fn main() -> anyhow::Result<()> {
         CliCommand::Wserver => wserver_test()?,
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        tensor::{Tensor, TensorLayout},
-        util::ElidingRangeIterator,
-    };
-
-    #[test]
-    fn test_print_tensor() {
-        let tensor = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], TensorLayout::row_major(&[2, 2]));
-        println!("{:?}", tensor);
-        let tensor = Tensor::from_vec(
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
-            TensorLayout::row_major(&[3, 3]),
-        );
-        println!("standard\n{:?}\n", tensor);
-        println!("transpose\n{:?}", tensor.as_view().permute(&[1, 0]));
-    }
-
-    #[test]
-    fn test_elided_range() {
-        let mut indices = vec![];
-        for (_skip, i) in ElidingRangeIterator::new(10, 6, 3) {
-            indices.push(i);
-        }
-        assert_eq!(indices, vec![0, 1, 2, 7, 8, 9]);
-    }
 }
