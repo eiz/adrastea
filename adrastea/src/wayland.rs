@@ -758,21 +758,25 @@ pub struct WaylandArg {
     pub data_type: WaylandDataType,
     #[serde(rename = "@summary")]
     pub summary: Option<String>,
+    #[serde(rename = "@interface")]
+    pub interface: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WaylandRequest {
-    #[serde(rename = "@name")]
-    pub name: String,
-    pub description: Option<WaylandDescription>,
-    #[serde(rename = "arg")]
-    pub args: Option<Vec<WaylandArg>>,
+pub enum WaylandMessageType {
+    #[serde(rename = "destructor")]
+    Destructor,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WaylandEvent {
+pub struct WaylandMessage {
     #[serde(rename = "@name")]
     pub name: String,
+    #[serde(rename = "@type")]
+    pub r#type: Option<WaylandMessageType>,
+    #[serde(rename = "@since")]
+    pub since: Option<u32>,
+    #[serde(rename = "description")]
     pub description: Option<WaylandDescription>,
     #[serde(rename = "arg")]
     pub args: Option<Vec<WaylandArg>>,
@@ -797,9 +801,9 @@ pub struct WaylandEnum {
 #[derive(Debug, Deserialize)]
 pub enum WaylandInterfaceItem {
     #[serde(rename = "request")]
-    Request(WaylandRequest),
+    Request(WaylandMessage),
     #[serde(rename = "event")]
-    Event(WaylandEvent),
+    Event(WaylandMessage),
     #[serde(rename = "enum")]
     Enum(WaylandEnum),
 }
