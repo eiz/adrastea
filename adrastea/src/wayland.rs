@@ -760,6 +760,10 @@ pub struct WaylandArg {
     pub summary: Option<String>,
     #[serde(rename = "@interface")]
     pub interface: Option<String>,
+    #[serde(rename = "@allow-null")]
+    pub allow_null: Option<bool>,
+    #[serde(rename = "@enum")]
+    pub r#enum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -794,6 +798,14 @@ pub struct WaylandEnumEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct WaylandEnum {
+    #[serde(rename = "@name")]
+    pub name: String,
+    #[serde(rename = "@since")]
+    pub since: Option<u32>,
+    #[serde(rename = "@bitfield")]
+    pub bitfield: Option<bool>,
+    #[serde(rename = "description")]
+    pub description: Option<WaylandDescription>,
     #[serde(rename = "entry")]
     pub entries: Vec<WaylandEnumEntry>,
 }
