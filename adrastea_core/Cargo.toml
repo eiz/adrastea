@@ -15,3 +15,7 @@ num-traits = "0.2.15"
 parking_lot = "0.12.1"
 rustfft = "6.1.0"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+anyhow = "1"
+tempdir = "0.3.7"

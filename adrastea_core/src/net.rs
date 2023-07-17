@@ -18,7 +18,7 @@ use std::{
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage};
+use nix::sys::socket::{ControlMessage, MsgFlags};
 use tokio::{
     io::unix::AsyncFd,
     net::{UnixListener, UnixStream},
@@ -62,7 +62,7 @@ impl UnixScmStream {
         let result = loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| {
-                Ok(nix::sys::socket::recvmsg::<SockaddrStorage>(
+                Ok(nix::sys::socket::recvmsg::<()>(
                     inner.as_raw_fd(),
                     &mut [IoSliceMut::new(buf)],
                     Some(cmsg_buf),
@@ -113,5 +113,53 @@ impl UnixScmStream {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom, Write},
+    };
+
+    use super::*;
+    use tempdir::TempDir;
+
+    #[tokio::test]
+    async fn send_file_and_data() -> anyhow::Result<()> {
+        let dir = TempDir::new("adrastea-test")?;
+        let sockpath = dir.path().join("socket");
+        let listener = UnixScmListener::new(UnixListener::bind(&sockpath)?);
+        async fn listener_task(mut listener: UnixScmListener) -> anyhow::Result<()> {
+            let mut stream = listener.accept().await?;
+            let mut buf = [0u8; 1024];
+            let mut cmsg_buf = UnixScmStream::alloc_cmsg_buf();
+            let (bytes, fds) = stream.recv(&mut buf, &mut cmsg_buf).await?;
+            assert_eq!(bytes, 4);
+            assert_eq!(fds.len(), 1);
+            let mut file = File::from(fds.into_iter().next().unwrap());
+            file.write(&buf[0..bytes])?;
+            Ok(())
+        }
+        let jh = tokio::spawn(async move {
+            listener_task(listener).await.unwrap();
+        });
+        let mut client = UnixScmStream::new(UnixStream::connect(&sockpath).await?)?;
+        let buf = [0x42u8; 4];
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.path().join("testfile"))?;
+        client.send(&[IoSlice::new(&buf)], &[file.as_raw_fd()]).await?;
+        jh.await?;
+        let mut out_buf = [0u8; 4];
+        file.seek(SeekFrom::Start(0))?;
+        let nread = file.read(&mut out_buf)?;
+        assert_eq!(nread, 4);
+        assert_eq!(buf, out_buf);
+        Ok(())
     }
 }
