@@ -17,6 +17,7 @@
 extern crate alloc;
 
 pub mod mel;
+pub mod net;
 pub mod rt_alloc;
 pub mod stft;
 pub mod util;

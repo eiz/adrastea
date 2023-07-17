@@ -10,6 +10,8 @@ license = "AGPL-3.0-only"
 allocator-api2 = "0.2.14"
 libc = "0.2.146"
 matrixmultiply = { version = "0.3.7", features = ["threading"] }
+nix = "0.26.2"
 num-traits = "0.2.15"
 parking_lot = "0.12.1"
 rustfft = "6.1.0"
+tokio = { version = "1", features = ["full"] }

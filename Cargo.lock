@@ -80,9 +80,11 @@ dependencies = [
  "allocator-api2",
  "libc",
  "matrixmultiply",
+ "nix",
  "num-traits",
  "parking_lot",
  "rustfft",
+ "tokio",
 ]
 
 [[package]]
