@@ -14,11 +14,11 @@
  */
 
 use std::{
-    io::IoSliceMut,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    io::{IoSlice, IoSliceMut},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
-use nix::sys::socket::{MsgFlags, SockaddrStorage};
+use nix::sys::socket::{ControlMessage, MsgFlags, SockaddrStorage};
 use tokio::{
     io::unix::AsyncFd,
     net::{UnixListener, UnixStream},
@@ -52,17 +52,20 @@ impl UnixScmStream {
         Ok(Self { inner: AsyncFd::new(stream.into_std()?.into())? })
     }
 
-    pub async fn recvmsg(
-        &mut self, buf: &mut [u8],
+    pub fn alloc_cmsg_buf() -> Vec<u8> {
+        nix::cmsg_space!([RawFd; 253])
+    }
+
+    pub async fn recv(
+        &mut self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>,
     ) -> Result<(usize, Vec<OwnedFd>), std::io::Error> {
-        let mut cmsg_space = nix::cmsg_space!([u8; 1024]);
         let result = loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| {
                 Ok(nix::sys::socket::recvmsg::<SockaddrStorage>(
                     inner.as_raw_fd(),
                     &mut [IoSliceMut::new(buf)],
-                    Some(&mut cmsg_space),
+                    Some(cmsg_buf),
                     MsgFlags::MSG_CMSG_CLOEXEC,
                 )?)
             }) {
@@ -81,5 +84,34 @@ impl UnixScmStream {
             }
         }
         Ok((result.bytes, fds))
+    }
+
+    pub async fn send(
+        &mut self, buf: &[IoSlice<'_>], fds: &[RawFd],
+    ) -> Result<usize, std::io::Error> {
+        if fds.len() > 253 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Too many file descriptors",
+            ));
+        }
+        Ok(loop {
+            let mut guard = self.inner.writable().await?;
+            match guard.try_io(|inner| {
+                let scm_rights = &[ControlMessage::ScmRights(fds)];
+                Ok(nix::sys::socket::sendmsg::<()>(
+                    inner.as_raw_fd(),
+                    buf,
+                    if fds.len() > 0 { scm_rights } else { &[] },
+                    MsgFlags::empty(),
+                    None,
+                )?)
+            }) {
+                Ok(result) => break result?,
+                Err(_would_block) => {
+                    continue;
+                }
+            }
+        })
     }
 }
