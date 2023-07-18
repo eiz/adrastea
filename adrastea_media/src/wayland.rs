@@ -38,7 +38,11 @@ use adrastea_core::{
     rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
     util::IUnknown,
 };
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
+use anyhow::bail;
 use memmap2::MmapMut;
 use serde::Deserialize;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
@@ -845,6 +849,80 @@ impl WaylandProtocol {
     }
 }
 
+struct MessageParseData {
+    since: u32,
+    num_fds: usize,
+    new_id_offsets: Vec<usize>,
+    message: WaylandMessage,
+}
+
+struct InterfaceParseData {
+    version: u32,
+    requests: Vec<MessageParseData>,
+    events: Vec<MessageParseData>,
+}
+
+struct InterfaceParseTable {
+    interfaces: Vec<InterfaceParseData>,
+    interface_lookup: BTreeMap<String, InterfaceId>,
+}
+
+fn add_message(collection: &mut Vec<MessageParseData>, msg: WaylandMessage) -> anyhow::Result<()> {
+    todo!()
+}
+
+pub struct WaylandProtocolMapBuilder(InterfaceParseTable);
+
+impl WaylandProtocolMapBuilder {
+    pub fn new() -> Self {
+        Self(InterfaceParseTable { interfaces: vec![], interface_lookup: BTreeMap::new() })
+    }
+
+    pub fn dir<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && entry.file_name().to_string_lossy().ends_with(".xml")
+            {
+                self.file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
+        let protocol = WaylandProtocol::load_path(path)?;
+        for interface in protocol.interfaces {
+            if self.0.interface_lookup.contains_key(&interface.name) {
+                bail!("duplicate interface {:?}", interface);
+            }
+            let mut requests = vec![];
+            let mut events = vec![];
+            if let (Some(items), name) = (interface.items, interface.name) {
+                for item in items {
+                    match item {
+                        WaylandInterfaceItem::Request(m) => add_message(&mut requests, m)?,
+                        WaylandInterfaceItem::Event(m) => add_message(&mut events, m)?,
+                        _ => (),
+                    }
+                }
+                self.0.interface_lookup.insert(name, InterfaceId(self.0.interfaces.len() as u16));
+                self.0.interfaces.push(InterfaceParseData {
+                    version: interface.version,
+                    requests,
+                    events,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn build(self) -> WaylandProtocolMap {
+        WaylandProtocolMap(Arc::new(self.0))
+    }
+}
+
+pub struct WaylandProtocolMap(Arc<InterfaceParseTable>);
+
 struct InterfaceId(u16);
 
 enum LocalHandle {
@@ -857,20 +935,10 @@ pub struct WaylandConnection {
     stream: UnixScmStream,
     local_handle_table: Vec<LocalHandle>,
     local_free_list: Vec<usize>,
-}
-
-impl WaylandConnection {
-    pub fn new(stream: UnixScmStream) -> Self {
-        Self { stream, local_handle_table: vec![], local_free_list: vec![] }
-    }
-
-    pub async fn read() -> anyhow::Result<()> {
-        todo!()
-    }
-}
-
-async fn wayland_connection_main() -> anyhow::Result<()> {
-    todo!()
+    rx_buf_max: usize,
+    rx_buf_fd_max: usize,
+    rx_buf: Vec<u8>,
+    rx_fd_buf: Vec<OwnedFd>,
 }
 
 // time for mack's shitty wayland proxy "I don't want to have to codegen every single protocol" edition
@@ -938,4 +1006,28 @@ async fn wayland_connection_main() -> anyhow::Result<()> {
 // i think with these codez we need a 64k max buffer size since that's the largest
 // possible single message
 //
-// can we get VecDeque chunks to work with vectored io
+// can we get VecDeque chunks to work with vectored io? (yes, just get the slices)
+// yeah I think the trick to doing this correctly is to use the rotate_left primitive
+// so you just copy once when reading out of the buffer, and then adjust the position
+// with rotate_left so you don't have to push in more zeroes like you'd have to if
+// you actually removed from the front of the deque.
+//
+// it feels like this is going to be mildly tricky lol
+
+impl WaylandConnection {
+    pub fn new(stream: UnixScmStream) -> Self {
+        Self {
+            stream,
+            local_handle_table: vec![],
+            local_free_list: vec![],
+            rx_buf_max: 65536,
+            rx_buf_fd_max: 1024,
+            rx_buf: vec![],
+            rx_fd_buf: vec![],
+        }
+    }
+
+    pub async fn read() -> anyhow::Result<()> {
+        todo!()
+    }
+}
