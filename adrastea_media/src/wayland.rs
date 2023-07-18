@@ -34,6 +34,7 @@ use std::{
 };
 
 use adrastea_core::{
+    net::UnixScmStream,
     rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
     util::IUnknown,
 };
@@ -41,7 +42,6 @@ use alloc::{collections::BTreeMap, sync::Arc};
 use memmap2::MmapMut;
 use serde::Deserialize;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
-use tokio::net::UnixStream;
 use wayland_client::{
     protocol::{
         wl_buffer, wl_callback, wl_compositor,
@@ -845,20 +845,97 @@ impl WaylandProtocol {
     }
 }
 
+struct InterfaceId(u16);
+
 enum LocalHandle {
-    RequestHandler(Box<dyn IUnknown>),
-    EventHandler(Box<dyn IUnknown>),
+    RequestHandler(InterfaceId),
+    EventHandler(InterfaceId),
     Empty,
 }
 
 pub struct WaylandConnection {
-    stream: UnixStream,
+    stream: UnixScmStream,
     local_handle_table: Vec<LocalHandle>,
     local_free_list: Vec<usize>,
 }
 
 impl WaylandConnection {
-    pub fn new(stream: UnixStream) -> Self {
+    pub fn new(stream: UnixScmStream) -> Self {
         Self { stream, local_handle_table: vec![], local_free_list: vec![] }
     }
+
+    pub async fn read() -> anyhow::Result<()> {
+        todo!()
+    }
 }
+
+async fn wayland_connection_main() -> anyhow::Result<()> {
+    todo!()
+}
+
+// time for mack's shitty wayland proxy "I don't want to have to codegen every single protocol" edition
+// aaaaa my brain is fuck
+// so we gots a client case and a server case and we want 'em to be de same case
+// so we need
+// - way to set objects in the handle table
+// - thing which reads socket and buffers, processes complete messages,
+//   and responds to an exit signal
+// an alt approach would be that the local handle table does NOT have any form
+// of 'message handling' in it. it simply records what _interface_ is needed
+// to parse messages with that object ID in the header.
+//
+// hm.
+// i like it.
+//
+// ok so we parse all the waylandprotocols into a lookup table and we store table
+// indices in the object table. when we get a message, we lookup the request/event
+// on the appropriate object and figure out how to update the object table and
+// how many fds to read from the queue for that message.
+//
+// my brain still doesn't fully understand whether we need a local table or also
+// a remote table. let's work through the cases.
+//
+// as a client, we send messages starting from 1 (display) and subsequently using
+// IDs that we allocate via new_id params to wl_display::get_registry,
+// wl_registry::bind, da.
+//
+// as a server, uh, we never allocate ids right? we do give global objects an id
+// that the client can use to bind them.
+//
+// i think that means the id tables should be identical between the client and
+// server side of a connection. its strictly determined by:
+// - the initial state (1=wl_display)
+// - new_id params sent in requests
+// - destructor events and requests
+//
+// ok so like a few things need to be going on here rite
+// we want to buffered read off the socket. but with the fd crap.
+// theres some degen stuff that might be possible with like sending a ton of fds
+// and then never sending messages to consume them or sending lots of messages
+// but never sending the fds those messages need to parse. my first thought was
+// to use some async bounded queue type thing buuut
+//
+// idk. i am worried about deadlocks. the other thing to do would be to just try
+// to fill the buffer as full as possible until reaching EAGAIN whenever it's empty
+// but the problem with that is I'm not sure how to express it in the tokio style
+// of doing IO. I think the easiest way would be to just add a flag to the send/recv
+// fns so they can bail out on the EAGAIN instead of going into the readiness wait.
+//
+// if we had that, the buffer get procedure would just be like
+// - top of loop: try retrieve from buffer, early exit
+// - if them bytes/fds ain't be enough bytes/fds, either
+//   - num bytes/fds is bigger than buffer max size (womp womp), fail
+//   - proceed with buffer fill
+// - issue a single read of (max size - current fill), ditto for fd buf (max 253 per read), with blocking=true
+// - fill them bufs
+// - if a truncated cmsg is detected, fail.
+// - for as long as there's additional buffer space issue another read in the same procedure, but with blocking=false.
+//   - if the receive fails with EAGAIN/EWOULDBLOCK, finish.
+// - goto top of loop
+//
+// this should deal with the "barrier" behavior of cmsg
+//
+// i think with these codez we need a 64k max buffer size since that's the largest
+// possible single message
+//
+// can we get VecDeque chunks to work with vectored io

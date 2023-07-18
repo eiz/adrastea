@@ -35,7 +35,7 @@ impl UnixScmListener {
 
     pub async fn accept(&mut self) -> Result<UnixScmStream, std::io::Error> {
         let (stream, _) = self.socket.accept().await?;
-        Ok(UnixScmStream::new(stream)?)
+        Ok(UnixScmStream::new(stream))
     }
 
     pub fn into_inner(self) -> UnixListener {
@@ -48,12 +48,16 @@ pub struct UnixScmStream {
 }
 
 impl UnixScmStream {
-    pub fn new(stream: UnixStream) -> Result<Self, std::io::Error> {
-        Ok(Self { inner: AsyncFd::new(stream.into_std()?.into())? })
+    pub fn new(stream: UnixStream) -> Self {
+        Self { inner: AsyncFd::new(stream.into_std().unwrap().into()).unwrap() }
     }
 
     pub fn alloc_cmsg_buf() -> Vec<u8> {
         nix::cmsg_space!([RawFd; 253])
+    }
+
+    pub fn into_unix_stream(self) -> UnixStream {
+        UnixStream::from_std(std::os::unix::net::UnixStream::from(self.inner.into_inner())).unwrap()
     }
 
     pub async fn recv(
@@ -145,7 +149,7 @@ mod test {
         let jh = tokio::spawn(async move {
             listener_task(listener).await.unwrap();
         });
-        let mut client = UnixScmStream::new(UnixStream::connect(&sockpath).await?)?;
+        let mut client = UnixScmStream::new(UnixStream::connect(&sockpath).await?);
         let buf = [0x42u8; 4];
         let mut file = File::options()
             .read(true)
