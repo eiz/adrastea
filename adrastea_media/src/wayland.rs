@@ -21,6 +21,7 @@ use core::{
     cell::RefCell,
     ffi::CStr,
     marker::PhantomData,
+    ops::Range,
     sync::atomic::{AtomicU64, Ordering},
 };
 use std::{
@@ -36,13 +37,14 @@ use std::{
 use adrastea_core::{
     net::UnixScmStream,
     rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
-    util::IUnknown,
+    util::{round_up, IUnknown},
 };
 use alloc::{
     collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 use anyhow::bail;
+use byteorder::{ByteOrder, NativeEndian};
 use memmap2::MmapMut;
 use serde::Deserialize;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
@@ -950,10 +952,11 @@ impl WaylandProtocolMapBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct WaylandProtocolMap(Arc<WaylandProtocolMapInner>);
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-struct InterfaceId(u16);
+pub struct InterfaceId(u16);
 
 enum LocalHandle {
     RequestHandler(InterfaceId),
@@ -963,6 +966,7 @@ enum LocalHandle {
 
 pub struct WaylandConnection {
     stream: UnixScmStream,
+    protocol_map: WaylandProtocolMap,
     local_handle_table: Vec<LocalHandle>,
     local_free_list: Vec<usize>,
     cmsg_buf: Vec<u8>,
@@ -1046,25 +1050,118 @@ pub struct WaylandConnection {
 //
 // it feels like this is going to be mildly tricky lol
 
-pub struct MessageArgs<'a> {
+pub struct IncomingMessage<'a> {
+    sender: u32,
+    opcode: u16,
+    message_spec: &'a ResolvedMessage,
     data: &'a [u8],
     fds: &'a mut Vec<Option<OwnedFd>>,
 }
 
-impl<'a> MessageArgs<'a> {
-    //
+impl<'a> IncomingMessage<'a> {
+    pub fn sender(&self) -> u32 {
+        self.sender
+    }
+
+    pub fn opcode(&self) -> u16 {
+        self.opcode
+    }
+
+    pub fn args<'b>(&'b mut self) -> IncomingMessageArgs<'b, 'a> {
+        IncomingMessageArgs { message: self, buf_pos: 0, fd_pos: 0, n: 0 }
+    }
 }
 
-impl<'a> Iterator for MessageArgs<'a> {
-    type Item = anyhow::Result<()>;
+pub enum IncomingMessageValue<'a> {
+    Int(i32),
+    Uint32(u32),
+    Fixed, // TODO
+    String(&'a str),
+    Object(Option<u32>),
+    NewId(InterfaceId, u32),
+    Array(&'a [u8]),
+    Fd(&'a mut Option<OwnedFd>),
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+pub struct IncomingMessageArg {
+    data_type: WaylandDataType,
+    interface: Option<InterfaceId>,
+    data_range: Range<usize>,
+    fd_index: Option<usize>,
+}
+
+pub struct IncomingMessageArgs<'b, 'a: 'b> {
+    message: &'b mut IncomingMessage<'a>,
+    buf_pos: usize,
+    fd_pos: usize,
+    n: usize,
+}
+
+impl<'b, 'a> IncomingMessageArgs<'b, 'a> {
+    pub fn data(&self, arg: &IncomingMessageArg) -> &[u8] {
+        &self.message.data[arg.data_range.clone()]
+    }
+
+    pub fn take_fd(&mut self, arg: &IncomingMessageArg) -> OwnedFd {
+        let fd = self.message.fds[arg.fd_index.unwrap()].take().unwrap();
+        fd
+    }
+
+    fn advance(&mut self) -> Option<IncomingMessageArg> {
+        let arg_spec = match self.message.message_spec.args.get(self.n) {
+            Some(arg) => arg,
+            None => return None,
+        };
+        let length = match arg_spec.data_type {
+            WaylandDataType::Int => 4,
+            WaylandDataType::Uint => 4,
+            WaylandDataType::Fixed => 4,
+            WaylandDataType::String => {
+                4 + round_up(
+                    NativeEndian::read_u32(&self.message.data[self.buf_pos..self.buf_pos + 4])
+                        as usize,
+                    4,
+                )
+            }
+            WaylandDataType::Object => 4,
+            WaylandDataType::NewId => {
+                if let Some(_interface) = arg_spec.interface.as_ref() {
+                    4
+                } else {
+                    panic!("dynamic new_id not yet implemented");
+                }
+            }
+            WaylandDataType::Array => {
+                4 + round_up(
+                    NativeEndian::read_u32(&self.message.data[self.buf_pos..self.buf_pos + 4])
+                        as usize,
+                    4,
+                )
+            }
+            WaylandDataType::Fd => 4,
+        };
+        let has_fd = arg_spec.data_type == WaylandDataType::Fd;
+        let data_range = self.buf_pos..self.buf_pos + length;
+        let fd_index = if has_fd {
+            let fd_pos = self.fd_pos;
+            self.fd_pos += 1;
+            Some(fd_pos)
+        } else {
+            None
+        };
+        self.buf_pos += length;
+        self.n += 1;
+        Some(IncomingMessageArg {
+            data_type: arg_spec.data_type,
+            interface: None,
+            data_range,
+            fd_index,
+        })
     }
 }
 
 impl WaylandConnection {
-    pub fn new(stream: UnixScmStream) -> Self {
+    pub fn new(protocol_map: WaylandProtocolMap, stream: UnixScmStream) -> Self {
         Self {
             stream,
             cmsg_buf: UnixScmStream::alloc_cmsg_buf(),
@@ -1075,24 +1172,58 @@ impl WaylandConnection {
             rx_buf_fill: 0,
             rx_buf: vec![0; 65536],
             rx_fd_buf: vec![],
+            protocol_map,
         }
     }
 
-    pub fn message_sender(&self) -> anyhow::Result<u32> {
-        todo!()
-    }
-
-    pub fn message_opcode(&self) -> anyhow::Result<u16> {
-        todo!()
-    }
-
-    pub fn message_args<'a>(&'a mut self) -> anyhow::Result<MessageArgs<'a>> {
-        todo!()
+    pub fn message<'a>(&'a mut self) -> anyhow::Result<IncomingMessage<'a>> {
+        if self.rx_buf_fill < 8 {
+            bail!("no current message");
+        }
+        let sender = NativeEndian::read_u32(&self.rx_buf[0..4]);
+        let opcode = NativeEndian::read_u16(&self.rx_buf[4..6]);
+        let length = NativeEndian::read_u16(&self.rx_buf[6..8]) as usize;
+        if self.rx_buf_fill < length {
+            bail!("no current message");
+        }
+        let resolved_message = match self.local_handle_table.get(sender as usize) {
+            Some(LocalHandle::RequestHandler(interface_id)) => {
+                let interface = &self.protocol_map.0.interfaces[interface_id.0 as usize];
+                let message = &interface.requests[opcode as usize];
+                message
+            }
+            Some(LocalHandle::EventHandler(interface_id)) => {
+                let interface = &self.protocol_map.0.interfaces[interface_id.0 as usize];
+                let message = &interface.events[opcode as usize];
+                message
+            }
+            _ => bail!("invalid message sender"),
+        };
+        Ok(IncomingMessage {
+            sender,
+            opcode,
+            data: &self.rx_buf[8..length],
+            fds: &mut self.rx_fd_buf,
+            message_spec: resolved_message,
+        })
     }
 
     pub async fn advance(&mut self) -> anyhow::Result<()> {
         self.fill_buffer(8, 0).await?;
-        todo!()
+        let mut msg = self.message()?;
+        let mut consumed_fds = 0;
+        let consumed_bytes = msg.data.len() + 8;
+        let mut args = msg.args();
+
+        while let Some(arg) = args.advance() {
+            if arg.fd_index.is_some() {
+                args.take_fd(&arg);
+                consumed_fds += 1;
+            }
+        }
+
+        self.consume_buffer(consumed_bytes, consumed_fds)?;
+        Ok(())
     }
 
     async fn fill_buffer(&mut self, bytes_needed: usize, fds_needed: usize) -> io::Result<()> {
