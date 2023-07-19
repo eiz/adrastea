@@ -725,7 +725,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for SurfaceClient {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum WaylandDataType {
     #[serde(rename = "int")]
     Int,
@@ -849,33 +849,46 @@ impl WaylandProtocol {
     }
 }
 
-struct MessageParseData {
+struct ResolvedArg {
+    data_type: WaylandDataType,
+    interface: Option<InterfaceId>,
+    allow_null: bool,
+}
+
+struct ResolvedMessage {
     since: u32,
-    num_fds: usize,
-    new_id_offsets: Vec<usize>,
+    args: Vec<ResolvedArg>,
     message: WaylandMessage,
 }
 
-struct InterfaceParseData {
+struct ResolvedInterface {
     version: u32,
-    requests: Vec<MessageParseData>,
-    events: Vec<MessageParseData>,
+    requests: Vec<ResolvedMessage>,
+    events: Vec<ResolvedMessage>,
 }
 
-struct InterfaceParseTable {
-    interfaces: Vec<InterfaceParseData>,
+struct WaylandProtocolMapInner {
+    interfaces: Vec<ResolvedInterface>,
     interface_lookup: BTreeMap<String, InterfaceId>,
 }
 
-fn add_message(collection: &mut Vec<MessageParseData>, msg: WaylandMessage) -> anyhow::Result<()> {
-    todo!()
+fn add_message(collection: &mut Vec<ResolvedMessage>, msg: WaylandMessage) {
+    let mut args = vec![];
+    for arg in msg.args.as_ref().unwrap_or(&vec![]) {
+        args.push(ResolvedArg {
+            data_type: arg.data_type,
+            interface: None,
+            allow_null: arg.allow_null.unwrap_or(false),
+        });
+    }
+    collection.push(ResolvedMessage { since: msg.since.unwrap_or(0), args, message: msg });
 }
 
-pub struct WaylandProtocolMapBuilder(InterfaceParseTable);
+pub struct WaylandProtocolMapBuilder(WaylandProtocolMapInner);
 
 impl WaylandProtocolMapBuilder {
     pub fn new() -> Self {
-        Self(InterfaceParseTable { interfaces: vec![], interface_lookup: BTreeMap::new() })
+        Self(WaylandProtocolMapInner { interfaces: vec![], interface_lookup: BTreeMap::new() })
     }
 
     pub fn dir<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
@@ -900,13 +913,13 @@ impl WaylandProtocolMapBuilder {
             if let (Some(items), name) = (interface.items, interface.name) {
                 for item in items {
                     match item {
-                        WaylandInterfaceItem::Request(m) => add_message(&mut requests, m)?,
-                        WaylandInterfaceItem::Event(m) => add_message(&mut events, m)?,
+                        WaylandInterfaceItem::Request(m) => add_message(&mut requests, m),
+                        WaylandInterfaceItem::Event(m) => add_message(&mut events, m),
                         _ => (),
                     }
                 }
                 self.0.interface_lookup.insert(name, InterfaceId(self.0.interfaces.len() as u16));
-                self.0.interfaces.push(InterfaceParseData {
+                self.0.interfaces.push(ResolvedInterface {
                     version: interface.version,
                     requests,
                     events,
@@ -916,13 +929,30 @@ impl WaylandProtocolMapBuilder {
         Ok(())
     }
 
-    pub fn build(self) -> WaylandProtocolMap {
-        WaylandProtocolMap(Arc::new(self.0))
+    pub fn build(mut self) -> anyhow::Result<WaylandProtocolMap> {
+        let WaylandProtocolMapInner { ref interface_lookup, ref mut interfaces } = self.0;
+        for iface in interfaces {
+            for msg in iface.requests.iter_mut().chain(iface.events.iter_mut()) {
+                let empty_vec = vec![];
+                let unresolved_args = msg.message.args.as_ref().unwrap_or(&empty_vec);
+                for (arg, unresolved_arg) in msg.args.iter_mut().zip(unresolved_args) {
+                    if let Some(interface_name) = unresolved_arg.interface.as_ref() {
+                        if let Some(interface_id) = interface_lookup.get(interface_name) {
+                            arg.interface = Some(*interface_id);
+                        } else {
+                            bail!("unknown interface {:?}", interface_name);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(WaylandProtocolMap(Arc::new(self.0)))
     }
 }
 
-pub struct WaylandProtocolMap(Arc<InterfaceParseTable>);
+pub struct WaylandProtocolMap(Arc<WaylandProtocolMapInner>);
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 struct InterfaceId(u16);
 
 enum LocalHandle {
