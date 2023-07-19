@@ -61,8 +61,9 @@ impl UnixScmStream {
     }
 
     pub async fn recv(
-        &mut self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>,
-    ) -> Result<(usize, Vec<OwnedFd>), std::io::Error> {
+        &mut self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>, fd_out: &mut Vec<Option<OwnedFd>>,
+        should_block: bool,
+    ) -> Result<usize, std::io::Error> {
         let result = loop {
             let mut guard = self.inner.readable().await?;
             match guard.try_io(|inner| {
@@ -75,19 +76,24 @@ impl UnixScmStream {
             }) {
                 Ok(result) => break result?,
                 Err(_would_block) => {
+                    if !should_block {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "Would block",
+                        ));
+                    }
                     continue;
                 }
             }
         };
-        let mut fds = Vec::new();
         for cmsg in result.cmsgs() {
             if let nix::sys::socket::ControlMessageOwned::ScmRights(received_fds) = cmsg {
                 for raw_fd in received_fds {
-                    fds.push(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+                    fd_out.push(unsafe { Some(OwnedFd::from_raw_fd(raw_fd)) })
                 }
             }
         }
-        Ok((result.bytes, fds))
+        Ok(result.bytes)
     }
 
     pub async fn send(
@@ -139,11 +145,12 @@ mod test {
             let mut stream = listener.accept().await?;
             let mut buf = [0u8; 1024];
             let mut cmsg_buf = UnixScmStream::alloc_cmsg_buf();
-            let (bytes, fds) = stream.recv(&mut buf, &mut cmsg_buf).await?;
-            assert_eq!(bytes, 4);
+            let mut fds = vec![];
+            let nread = stream.recv(&mut buf, &mut cmsg_buf, &mut fds, true).await?;
+            assert_eq!(nread, 4);
             assert_eq!(fds.len(), 1);
-            let mut file = File::from(fds.into_iter().next().unwrap());
-            file.write(&buf[0..bytes])?;
+            let mut file = File::from(fds.into_iter().next().unwrap().unwrap());
+            file.write(&buf[0..nread])?;
             Ok(())
         }
         let jh = tokio::spawn(async move {

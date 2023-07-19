@@ -11,6 +11,7 @@ adrastea_core = { path = "../adrastea_core" }
 allocator-api2 = "0.2.14"
 anyhow = "1"
 ash = { version = "0.37.2", features = ["loaded"] }
+byteorder = "1.4.3"
 cstr = "0.2.11"
 libc = "0.2.146"
 libspa-sys = "0.6.0"

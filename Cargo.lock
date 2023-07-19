@@ -79,6 +79,7 @@ dependencies = [
  "allocator-api2",
  "anyhow",
  "ash",
+ "byteorder",
  "cstr",
  "libc",
  "libspa-sys",

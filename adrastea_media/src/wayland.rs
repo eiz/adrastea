@@ -25,7 +25,7 @@ use core::{
 };
 use std::{
     fs::File,
-    io::BufReader,
+    io::{self, BufReader},
     os::{
         fd::{FromRawFd, OwnedFd},
         raw::c_void,
@@ -965,10 +965,12 @@ pub struct WaylandConnection {
     stream: UnixScmStream,
     local_handle_table: Vec<LocalHandle>,
     local_free_list: Vec<usize>,
+    cmsg_buf: Vec<u8>,
     rx_buf_max: usize,
     rx_buf_fd_max: usize,
     rx_buf: Vec<u8>,
-    rx_fd_buf: Vec<OwnedFd>,
+    rx_buf_fill: usize,
+    rx_fd_buf: Vec<Option<OwnedFd>>,
 }
 
 // time for mack's shitty wayland proxy "I don't want to have to codegen every single protocol" edition
@@ -1044,20 +1046,102 @@ pub struct WaylandConnection {
 //
 // it feels like this is going to be mildly tricky lol
 
+pub struct MessageArgs<'a> {
+    data: &'a [u8],
+    fds: &'a mut Vec<Option<OwnedFd>>,
+}
+
+impl<'a> MessageArgs<'a> {
+    //
+}
+
+impl<'a> Iterator for MessageArgs<'a> {
+    type Item = anyhow::Result<()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        todo!()
+    }
+}
+
 impl WaylandConnection {
     pub fn new(stream: UnixScmStream) -> Self {
         Self {
             stream,
+            cmsg_buf: UnixScmStream::alloc_cmsg_buf(),
             local_handle_table: vec![],
             local_free_list: vec![],
             rx_buf_max: 65536,
             rx_buf_fd_max: 1024,
-            rx_buf: vec![],
+            rx_buf_fill: 0,
+            rx_buf: vec![0; 65536],
             rx_fd_buf: vec![],
         }
     }
 
-    pub async fn read() -> anyhow::Result<()> {
+    pub fn message_sender(&self) -> anyhow::Result<u32> {
         todo!()
+    }
+
+    pub fn message_opcode(&self) -> anyhow::Result<u16> {
+        todo!()
+    }
+
+    pub fn message_args<'a>(&'a mut self) -> anyhow::Result<MessageArgs<'a>> {
+        todo!()
+    }
+
+    pub async fn advance(&mut self) -> anyhow::Result<()> {
+        self.fill_buffer(8, 0).await?;
+        todo!()
+    }
+
+    async fn fill_buffer(&mut self, bytes_needed: usize, fds_needed: usize) -> io::Result<()> {
+        loop {
+            if self.rx_buf_fill >= bytes_needed && self.rx_fd_buf.len() >= fds_needed {
+                return Ok(());
+            }
+            if bytes_needed > self.rx_buf_max || fds_needed > self.rx_buf_fd_max {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            let mut blocking = true;
+            loop {
+                let buf = &mut self.rx_buf[self.rx_buf_fill..];
+                // TODO need an IoSliceMut version of this so we can do the deque thing
+                let result =
+                    self.stream.recv(buf, &mut self.cmsg_buf, &mut self.rx_fd_buf, blocking).await;
+                match result {
+                    Ok(nread) => {
+                        if nread == 0 {
+                            return Err(io::ErrorKind::UnexpectedEof.into());
+                        }
+                        self.rx_buf_fill += nread;
+                        if self.rx_fd_buf.len() > self.rx_buf_fd_max {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "fd receive buffer overflow",
+                            ));
+                        }
+                        blocking = false;
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::WouldBlock && !blocking {
+                            break;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn consume_buffer(&mut self, bytes_used: usize, fds_used: usize) -> io::Result<()> {
+        if bytes_used > self.rx_buf_fill || fds_used > self.rx_fd_buf.len() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        self.rx_fd_buf.drain(..fds_used);
+        self.rx_buf.rotate_left(bytes_used);
+        self.rx_buf_fill -= bytes_used;
+        Ok(())
     }
 }
