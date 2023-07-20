@@ -1208,21 +1208,27 @@ impl WaylandConnection {
         })
     }
 
-    pub async fn advance(&mut self) -> anyhow::Result<()> {
-        self.fill_buffer(8, 0).await?;
+    fn message_size(&mut self) -> anyhow::Result<(usize, usize)> {
         let mut msg = self.message()?;
         let mut consumed_fds = 0;
         let consumed_bytes = msg.data.len() + 8;
         let mut args = msg.args();
-
         while let Some(arg) = args.advance() {
             if arg.fd_index.is_some() {
-                args.take_fd(&arg);
                 consumed_fds += 1;
             }
         }
+        Ok((consumed_bytes, consumed_fds))
+    }
 
-        self.consume_buffer(consumed_bytes, consumed_fds)?;
+    pub async fn advance(&mut self) -> anyhow::Result<()> {
+        if self.rx_buf_fill > 0 {
+            let (bytes, fds) = self.message_size()?;
+            self.consume_buffer(bytes, fds)?;
+        }
+        self.fill_buffer(8, 0).await?;
+        let msg_len = NativeEndian::read_u16(&self.rx_buf[6..8]) as usize;
+        self.fill_buffer(msg_len, 0).await?;
         Ok(())
     }
 
