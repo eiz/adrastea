@@ -966,9 +966,6 @@ pub struct MessageReader<'a> {
     message_spec: &'a ResolvedMessage,
     data: &'a [u8],
     fds: &'a mut Vec<Option<OwnedFd>>,
-    // TODO this is a dumb hack so we can access this within the scope of message()'s borrow
-    // of the connection object
-    handle_table: &'a Mutex<BTreeMap<u32, InterfaceId>>,
 }
 
 impl<'a> MessageReader<'a> {
@@ -1151,7 +1148,6 @@ impl WaylandReceiver {
             data: &self.rx_buf[8..length],
             fds: &mut self.rx_fd_buf,
             message_spec: resolved_message,
-            handle_table: &self.inner.handle_table,
         })
     }
 
@@ -1216,6 +1212,7 @@ impl WaylandReceiver {
     }
 
     fn consume_message(&mut self) -> anyhow::Result<()> {
+        let inner = self.inner.clone(); // TODO this clone is annoying to get rid of =/
         let mut msg = self.message()?;
         let mut consumed_fds = 0;
         let consumed_bytes = msg.data.len() + 8;
@@ -1229,7 +1226,7 @@ impl WaylandReceiver {
                     MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
                     _ => unreachable!(),
                 };
-                args.message.handle_table.lock().insert(object_id, interface_id);
+                inner.handle_table.lock().insert(object_id, interface_id);
             }
         }
         if consumed_bytes > self.rx_buf_fill || consumed_fds > self.rx_fd_buf.len() {
@@ -1326,7 +1323,7 @@ mod test {
                 .file("/home/eiz/code/wayland/protocol/wayland.xml")?
                 .build()?;
             let stream = listener.accept().await?;
-            let (mut rx, tx) =
+            let (mut rx, _tx) =
                 WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Client);
             rx.advance().await?;
             let msg = rx.message()?;
