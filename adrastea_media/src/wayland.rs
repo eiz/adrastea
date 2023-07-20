@@ -28,7 +28,7 @@ use std::{
     fs::File,
     io::{self, BufReader},
     os::{
-        fd::{FromRawFd, OwnedFd},
+        fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
         raw::c_void,
     },
     path::Path,
@@ -984,7 +984,7 @@ impl<'a> MessageReader<'a> {
 
 pub enum MessageReaderValue<'a> {
     Int(i32),
-    Uint32(u32),
+    Uint(u32),
     Fixed, // TODO
     String(&'a str),
     Object(Option<u32>),
@@ -1239,13 +1239,95 @@ impl WaylandReceiver {
     }
 }
 
+pub struct MessageBuilder<'a> {
+    conn: &'a WaylandConnection,
+    resolved_message: &'a ResolvedMessage,
+    data: &'a mut Vec<u8>,
+    fds: &'a mut Vec<RawFd>,
+}
+
+impl<'a> MessageBuilder<'a> {
+    pub fn int(&mut self, value: i32) -> &mut Self {
+        self.data.extend_from_slice(&value.to_ne_bytes());
+        self
+    }
+
+    pub fn uint(&mut self, value: u32) -> &mut Self {
+        self.data.extend_from_slice(&value.to_ne_bytes());
+        self
+    }
+
+    pub fn string(&mut self, value: &str) -> &mut Self {
+        self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+        self.data.extend_from_slice(value.as_bytes());
+        self.data.push(0);
+        self.data.resize(round_up(self.data.len(), 4), 0);
+        self
+    }
+
+    pub fn object(&mut self, value: Option<u32>) -> &mut Self {
+        self.data.extend_from_slice(&value.unwrap_or(0).to_ne_bytes());
+        self
+    }
+
+    pub fn new_id(&mut self, interface: Option<InterfaceId>, object_id: u32) -> &mut Self {
+        self.data.extend_from_slice(&object_id.to_ne_bytes());
+        self
+    }
+
+    pub fn array(&mut self, value: &[u8]) -> &mut Self {
+        self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+        self.data.extend_from_slice(value);
+        self.data.resize(round_up(self.data.len(), 4), 0);
+        self
+    }
+
+    pub fn fd(&mut self, fd: RawFd) -> &mut Self {
+        self.data.extend_from_slice(&fd.to_ne_bytes());
+        self.fds.push(fd);
+        self
+    }
+
+    pub async fn send(&self) -> anyhow::Result<()> {
+        todo!()
+    }
+}
+
 pub struct WaylandSender {
     inner: Arc<WaylandConnection>,
+    builder_data: Vec<u8>,
+    builder_fds: Vec<RawFd>,
 }
 
 impl WaylandSender {
     fn new(inner: Arc<WaylandConnection>) -> Self {
-        Self { inner }
+        Self { inner, builder_data: vec![], builder_fds: vec![] }
+    }
+
+    pub fn message_builder(
+        &mut self, sender_id: u32, opcode: u16,
+    ) -> anyhow::Result<MessageBuilder> {
+        self.builder_data.clear();
+        self.builder_fds.clear();
+        self.builder_data.extend_from_slice(&sender_id.to_ne_bytes());
+        self.builder_data.extend_from_slice(&opcode.to_ne_bytes());
+        self.builder_data.extend_from_slice(&[0; 2]);
+        let interface_id = *(self.inner.handle_table.lock().get(&sender_id))
+            .ok_or_else(|| anyhow::anyhow!("invalid sender id"))?;
+        let interface = (self.inner.protocol_map.0.interfaces.get(interface_id.0 as usize))
+            .ok_or_else(|| anyhow::anyhow!("invalid interface id"))?;
+        let message_list = match self.inner.connection_role {
+            WaylandConnectionRole::Server => &interface.requests,
+            WaylandConnectionRole::Client => &interface.events,
+        };
+        let resolved_message =
+            message_list.get(opcode as usize).ok_or_else(|| anyhow::anyhow!("invalid opcode"))?;
+        Ok(MessageBuilder {
+            resolved_message,
+            conn: &*self.inner,
+            data: &mut self.builder_data,
+            fds: &mut self.builder_fds,
+        })
     }
 }
 
