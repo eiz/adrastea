@@ -893,18 +893,19 @@ impl WaylandProtocolMapBuilder {
         Self(WaylandProtocolMapInner { interfaces: vec![], interface_lookup: BTreeMap::new() })
     }
 
-    pub fn dir<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
+    pub fn dir<P: AsRef<Path>>(self, path: P) -> anyhow::Result<Self> {
+        let mut me = self;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             if entry.file_type()?.is_file() && entry.file_name().to_string_lossy().ends_with(".xml")
             {
-                self.file(entry.path())?;
+                me = me.file(entry.path())?;
             }
         }
-        Ok(())
+        Ok(me)
     }
 
-    pub fn file<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
+    pub fn file<P: AsRef<Path>>(mut self, path: P) -> anyhow::Result<Self> {
         let protocol = WaylandProtocol::load_path(path)?;
         for interface in protocol.interfaces {
             if self.0.interface_lookup.contains_key(&interface.name) {
@@ -928,7 +929,7 @@ impl WaylandProtocolMapBuilder {
                 });
             }
         }
-        Ok(())
+        Ok(self)
     }
 
     pub fn build(mut self) -> anyhow::Result<WaylandProtocolMap> {
@@ -1162,10 +1163,14 @@ impl<'b, 'a> IncomingMessageArgs<'b, 'a> {
 
 impl WaylandConnection {
     pub fn new(protocol_map: WaylandProtocolMap, stream: UnixScmStream) -> Self {
+        let display_interface = protocol_map.0.interface_lookup.get("wl_display").unwrap();
         Self {
             stream,
             cmsg_buf: UnixScmStream::alloc_cmsg_buf(),
-            local_handle_table: vec![],
+            local_handle_table: vec![
+                LocalHandle::Empty,
+                LocalHandle::RequestHandler(*display_interface),
+            ],
             local_free_list: vec![],
             rx_buf_max: 65536,
             rx_buf_fd_max: 1024,
@@ -1208,23 +1213,9 @@ impl WaylandConnection {
         })
     }
 
-    fn message_size(&mut self) -> anyhow::Result<(usize, usize)> {
-        let mut msg = self.message()?;
-        let mut consumed_fds = 0;
-        let consumed_bytes = msg.data.len() + 8;
-        let mut args = msg.args();
-        while let Some(arg) = args.advance() {
-            if arg.fd_index.is_some() {
-                consumed_fds += 1;
-            }
-        }
-        Ok((consumed_bytes, consumed_fds))
-    }
-
     pub async fn advance(&mut self) -> anyhow::Result<()> {
         if self.rx_buf_fill > 0 {
-            let (bytes, fds) = self.message_size()?;
-            self.consume_buffer(bytes, fds)?;
+            self.consume_message()?;
         }
         self.fill_buffer(8, 0).await?;
         let msg_len = NativeEndian::read_u16(&self.rx_buf[6..8]) as usize;
@@ -1248,7 +1239,14 @@ impl WaylandConnection {
                     self.stream.recv(buf, &mut self.cmsg_buf, &mut self.rx_fd_buf, blocking).await;
                 match result {
                     Ok(nread) => {
+                        println!("nread = {nread} bytes_needed = {bytes_needed}");
                         if nread == 0 {
+                            // we may reach the end of the stream after reading
+                            // enough data but before the buffer fill loop
+                            // naturally exits.
+                            if !blocking {
+                                break;
+                            }
                             return Err(io::ErrorKind::UnexpectedEof.into());
                         }
                         self.rx_buf_fill += nread;
@@ -1272,13 +1270,107 @@ impl WaylandConnection {
         }
     }
 
-    fn consume_buffer(&mut self, bytes_used: usize, fds_used: usize) -> io::Result<()> {
-        if bytes_used > self.rx_buf_fill || fds_used > self.rx_fd_buf.len() {
-            return Err(std::io::ErrorKind::InvalidInput.into());
+    fn consume_message(&mut self) -> anyhow::Result<()> {
+        let mut msg = self.message()?;
+        let mut consumed_fds = 0;
+        let consumed_bytes = msg.data.len() + 8;
+        let mut args = msg.args();
+        while let Some(arg) = args.advance() {
+            if arg.fd_index.is_some() {
+                consumed_fds += 1;
+            }
         }
-        self.rx_fd_buf.drain(..fds_used);
-        self.rx_buf.rotate_left(bytes_used);
-        self.rx_buf_fill -= bytes_used;
+        if consumed_bytes > self.rx_buf_fill || consumed_fds > self.rx_fd_buf.len() {
+            panic!("message is larger than itself...?");
+        }
+        self.rx_fd_buf.drain(..consumed_fds);
+        self.rx_buf.rotate_left(consumed_bytes);
+        self.rx_buf_fill -= consumed_bytes;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use adrastea_core::net::UnixScmListener;
+    use tempdir::TempDir;
+    use tokio::net::UnixListener;
+    use wayland_client::protocol::{wl_callback::WlCallback, wl_registry::WlRegistry};
+
+    use super::*;
+
+    #[test]
+    pub fn load_all_protocols() -> anyhow::Result<()> {
+        let proto_map = WaylandProtocolMapBuilder::new()
+            .file("/home/eiz/code/wayland/protocol/wayland.xml")?
+            .dir("/home/eiz/code/wayland-protocols/stable/xdg-shell")?
+            .build()?;
+        assert_eq!(proto_map.0.interfaces.len(), 27);
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn wayland_client_connect() -> anyhow::Result<()> {
+        struct TestState;
+        impl Dispatch<WlRegistry, ()> for TestState {
+            fn event(
+                _state: &mut Self, _proxy: &WlRegistry,
+                event: <WlRegistry as wayland_client::Proxy>::Event, _data: &(),
+                _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+            ) {
+                println!("wl_registry {:?}", event);
+            }
+        }
+        impl Dispatch<WlCallback, ()> for TestState {
+            fn event(
+                _state: &mut Self, _proxy: &WlCallback,
+                event: <WlCallback as wayland_client::Proxy>::Event, _data: &(),
+                _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+            ) {
+                println!("wl_callback {:?}", event);
+            }
+        }
+
+        let test_dir = TempDir::new("wayland_client_connect")?;
+        let sockpath = test_dir.path().join("wayland.sock");
+        let listener = UnixScmListener::new(UnixListener::bind(&sockpath)?);
+        async fn listener_task(mut listener: UnixScmListener) -> anyhow::Result<()> {
+            let proto_map = WaylandProtocolMapBuilder::new()
+                .file("/home/eiz/code/wayland/protocol/wayland.xml")?
+                .build()?;
+            let conn = listener.accept().await?;
+            let mut conn = WaylandConnection::new(proto_map, conn);
+            conn.advance().await?;
+            let msg = conn.message()?;
+            assert_eq!(msg.sender(), 1);
+            assert_eq!(msg.opcode(), 1);
+            println!("received get_registry");
+            conn.advance().await?;
+            let msg = conn.message()?;
+            assert_eq!(msg.sender(), 1);
+            assert_eq!(msg.opcode(), 0);
+            println!("received sync");
+            Ok(())
+        }
+        let jh = tokio::spawn(async move {
+            listener_task(listener).await.unwrap();
+        });
+        tokio::task::spawn_blocking({
+            let sockpath = sockpath.to_path_buf();
+            move || {
+                use std::os::unix::net::UnixStream;
+                let sock = UnixStream::connect(&sockpath).unwrap();
+                let conn = Connection::from_socket(sock).unwrap();
+                let display = conn.display();
+                let event_queue: EventQueue<TestState> = conn.new_event_queue();
+                let handle = event_queue.handle();
+                let _registry = display.get_registry(&handle, ());
+                display.sync(&handle, ());
+                event_queue.flush().unwrap();
+            }
+        })
+        .await?;
+        jh.await?;
         Ok(())
     }
 }

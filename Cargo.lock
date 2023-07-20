@@ -90,6 +90,7 @@ dependencies = [
  "quick-xml 0.29.0",
  "serde",
  "skia-safe",
+ "tempdir",
  "tokio",
  "tokio-stream",
  "wayland-client",
