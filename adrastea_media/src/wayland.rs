@@ -39,13 +39,11 @@ use adrastea_core::{
     rt_alloc::{ArenaAllocator, ArenaHandle, RtObjectHeap},
     util::{round_up, IUnknown},
 };
-use alloc::{
-    collections::{BTreeMap, VecDeque},
-    sync::Arc,
-};
+use alloc::{collections::BTreeMap, sync::Arc};
 use anyhow::bail;
 use byteorder::{ByteOrder, NativeEndian};
 use memmap2::MmapMut;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use skia_safe::{AlphaType, Canvas, ColorType, ISize, ImageInfo, Surface};
 use wayland_client::{
@@ -949,6 +947,9 @@ impl WaylandProtocolMapBuilder {
                 }
             }
         }
+        if !interface_lookup.contains_key("wl_display") {
+            bail!("protocol map must include wl_display");
+        }
         Ok(WaylandProtocolMap(Arc::new(self.0)))
     }
 }
@@ -959,34 +960,18 @@ pub struct WaylandProtocolMap(Arc<WaylandProtocolMapInner>);
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct InterfaceId(u16);
 
-enum LocalHandle {
-    RequestHandler(InterfaceId),
-    EventHandler(InterfaceId),
-    Empty,
-}
-
-pub struct WaylandConnection {
-    stream: UnixScmStream,
-    protocol_map: WaylandProtocolMap,
-    local_handle_table: Vec<LocalHandle>,
-    local_free_list: Vec<usize>,
-    cmsg_buf: Vec<u8>,
-    rx_buf_max: usize,
-    rx_buf_fd_max: usize,
-    rx_buf: Vec<u8>,
-    rx_buf_fill: usize,
-    rx_fd_buf: Vec<Option<OwnedFd>>,
-}
-
-pub struct IncomingMessage<'a> {
+pub struct MessageReader<'a> {
     sender: u32,
     opcode: u16,
     message_spec: &'a ResolvedMessage,
     data: &'a [u8],
     fds: &'a mut Vec<Option<OwnedFd>>,
+    // TODO this is a dumb hack so we can access this within the scope of message()'s borrow
+    // of the connection object
+    handle_table: &'a Mutex<BTreeMap<u32, InterfaceId>>,
 }
 
-impl<'a> IncomingMessage<'a> {
+impl<'a> MessageReader<'a> {
     pub fn sender(&self) -> u32 {
         self.sender
     }
@@ -995,12 +980,12 @@ impl<'a> IncomingMessage<'a> {
         self.opcode
     }
 
-    pub fn args<'b>(&'b mut self) -> IncomingMessageArgs<'b, 'a> {
-        IncomingMessageArgs { message: self, buf_pos: 0, fd_pos: 0, n: 0 }
+    pub fn args<'b>(&'b mut self) -> MessageReaderArgs<'b, 'a> {
+        MessageReaderArgs { message: self, buf_pos: 0, fd_pos: 0, n: 0 }
     }
 }
 
-pub enum IncomingMessageValue<'a> {
+pub enum MessageReaderValue<'a> {
     Int(i32),
     Uint32(u32),
     Fixed, // TODO
@@ -1011,31 +996,51 @@ pub enum IncomingMessageValue<'a> {
     Fd(&'a mut Option<OwnedFd>),
 }
 
-pub struct IncomingMessageArg {
+pub struct MessageReaderArg {
     data_type: WaylandDataType,
     interface: Option<InterfaceId>,
     data_range: Range<usize>,
     fd_index: Option<usize>,
 }
 
-pub struct IncomingMessageArgs<'b, 'a: 'b> {
-    message: &'b mut IncomingMessage<'a>,
+pub struct MessageReaderArgs<'b, 'a: 'b> {
+    message: &'b mut MessageReader<'a>,
     buf_pos: usize,
     fd_pos: usize,
     n: usize,
 }
 
-impl<'b, 'a> IncomingMessageArgs<'b, 'a> {
-    pub fn data(&self, arg: &IncomingMessageArg) -> &[u8] {
+impl<'b, 'a> MessageReaderArgs<'b, 'a> {
+    pub fn data(&self, arg: &MessageReaderArg) -> &[u8] {
         &self.message.data[arg.data_range.clone()]
     }
 
-    pub fn take_fd(&mut self, arg: &IncomingMessageArg) -> OwnedFd {
+    pub fn value(&self, arg: &MessageReaderArg) -> MessageReaderValue<'a> {
+        let data = self.data(arg);
+        match arg.data_type {
+            WaylandDataType::Int => todo!(),
+            WaylandDataType::Uint => todo!(),
+            WaylandDataType::Fixed => todo!(),
+            WaylandDataType::String => todo!(),
+            WaylandDataType::Object => todo!(),
+            WaylandDataType::NewId => {
+                if let Some(interface_id) = arg.interface {
+                    MessageReaderValue::NewId(interface_id, NativeEndian::read_u32(data))
+                } else {
+                    panic!("dynamic new_id not yet implemented");
+                }
+            }
+            WaylandDataType::Array => todo!(),
+            WaylandDataType::Fd => todo!(),
+        }
+    }
+
+    pub fn take_fd(&mut self, arg: &MessageReaderArg) -> OwnedFd {
         let fd = self.message.fds[arg.fd_index.unwrap()].take().unwrap();
         fd
     }
 
-    fn advance(&mut self) -> Option<IncomingMessageArg> {
+    fn advance(&mut self) -> Option<MessageReaderArg> {
         let arg_spec = match self.message.message_spec.args.get(self.n) {
             Some(arg) => arg,
             None => return None,
@@ -1068,6 +1073,10 @@ impl<'b, 'a> IncomingMessageArgs<'b, 'a> {
             }
             WaylandDataType::Fd => 4,
         };
+        let interface = match arg_spec.data_type {
+            WaylandDataType::NewId => arg_spec.interface,
+            _ => None,
+        };
         let has_fd = arg_spec.data_type == WaylandDataType::Fd;
         let data_range = self.buf_pos..self.buf_pos + length;
         let fd_index = if has_fd {
@@ -1079,36 +1088,40 @@ impl<'b, 'a> IncomingMessageArgs<'b, 'a> {
         };
         self.buf_pos += length;
         self.n += 1;
-        Some(IncomingMessageArg {
-            data_type: arg_spec.data_type,
-            interface: None,
-            data_range,
-            fd_index,
-        })
+        Some(MessageReaderArg { data_type: arg_spec.data_type, interface, data_range, fd_index })
     }
 }
 
-impl WaylandConnection {
-    pub fn new(protocol_map: WaylandProtocolMap, stream: UnixScmStream) -> Self {
-        let display_interface = protocol_map.0.interface_lookup.get("wl_display").unwrap();
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum WaylandConnectionRole {
+    Client,
+    Server,
+}
+
+pub struct WaylandReceiver {
+    inner: Arc<WaylandConnection>,
+    cmsg_buf: Vec<u8>,
+    rx_buf_max: usize,
+    rx_buf_fd_max: usize,
+    rx_buf: Vec<u8>,
+    rx_buf_fill: usize,
+    rx_fd_buf: Vec<Option<OwnedFd>>,
+}
+
+impl WaylandReceiver {
+    fn new(inner: Arc<WaylandConnection>) -> Self {
         Self {
-            stream,
+            inner,
             cmsg_buf: UnixScmStream::alloc_cmsg_buf(),
-            local_handle_table: vec![
-                LocalHandle::Empty,
-                LocalHandle::RequestHandler(*display_interface),
-            ],
-            local_free_list: vec![],
             rx_buf_max: 65536,
             rx_buf_fd_max: 1024,
             rx_buf_fill: 0,
             rx_buf: vec![0; 65536],
             rx_fd_buf: vec![],
-            protocol_map,
         }
     }
 
-    pub fn message<'a>(&'a mut self) -> anyhow::Result<IncomingMessage<'a>> {
+    pub fn message<'a>(&'a mut self) -> anyhow::Result<MessageReader<'a>> {
         if self.rx_buf_fill < 8 {
             bail!("no current message");
         }
@@ -1118,25 +1131,27 @@ impl WaylandConnection {
         if self.rx_buf_fill < length {
             bail!("no current message");
         }
-        let resolved_message = match self.local_handle_table.get(sender as usize) {
-            Some(LocalHandle::RequestHandler(interface_id)) => {
-                let interface = &self.protocol_map.0.interfaces[interface_id.0 as usize];
-                let message = &interface.requests[opcode as usize];
-                message
-            }
-            Some(LocalHandle::EventHandler(interface_id)) => {
-                let interface = &self.protocol_map.0.interfaces[interface_id.0 as usize];
-                let message = &interface.events[opcode as usize];
-                message
-            }
-            _ => bail!("invalid message sender"),
-        };
-        Ok(IncomingMessage {
+        let resolved_message =
+            match (self.inner.connection_role, self.inner.handle_table.lock().get(&sender)) {
+                (WaylandConnectionRole::Server, Some(interface_id)) => {
+                    let interface = &self.inner.protocol_map.0.interfaces[interface_id.0 as usize];
+                    let message = &interface.requests[opcode as usize];
+                    message
+                }
+                (WaylandConnectionRole::Client, Some(interface_id)) => {
+                    let interface = &self.inner.protocol_map.0.interfaces[interface_id.0 as usize];
+                    let message = &interface.events[opcode as usize];
+                    message
+                }
+                _ => bail!("invalid message sender"),
+            };
+        Ok(MessageReader {
             sender,
             opcode,
             data: &self.rx_buf[8..length],
             fds: &mut self.rx_fd_buf,
             message_spec: resolved_message,
+            handle_table: &self.inner.handle_table,
         })
     }
 
@@ -1162,8 +1177,11 @@ impl WaylandConnection {
             loop {
                 let buf = &mut self.rx_buf[self.rx_buf_fill..];
                 // TODO need an IoSliceMut version of this so we can do the deque thing
-                let result =
-                    self.stream.recv(buf, &mut self.cmsg_buf, &mut self.rx_fd_buf, blocking).await;
+                let result = self
+                    .inner
+                    .stream
+                    .recv(buf, &mut self.cmsg_buf, &mut self.rx_fd_buf, blocking)
+                    .await;
                 match result {
                     Ok(nread) => {
                         println!("nread = {nread} bytes_needed = {bytes_needed}");
@@ -1206,6 +1224,13 @@ impl WaylandConnection {
             if arg.fd_index.is_some() {
                 consumed_fds += 1;
             }
+            if arg.data_type == WaylandDataType::NewId {
+                let (interface_id, object_id) = match args.value(&arg) {
+                    MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
+                    _ => unreachable!(),
+                };
+                args.message.handle_table.lock().insert(object_id, interface_id);
+            }
         }
         if consumed_bytes > self.rx_buf_fill || consumed_fds > self.rx_fd_buf.len() {
             panic!("message is larger than itself...?");
@@ -1214,6 +1239,41 @@ impl WaylandConnection {
         self.rx_buf.rotate_left(consumed_bytes);
         self.rx_buf_fill -= consumed_bytes;
         Ok(())
+    }
+}
+
+pub struct WaylandSender {
+    inner: Arc<WaylandConnection>,
+}
+
+impl WaylandSender {
+    fn new(inner: Arc<WaylandConnection>) -> Self {
+        Self { inner }
+    }
+}
+
+pub struct WaylandConnection {
+    stream: UnixScmStream,
+    connection_role: WaylandConnectionRole,
+    protocol_map: WaylandProtocolMap,
+    handle_table: Mutex<BTreeMap<u32, InterfaceId>>,
+}
+
+impl WaylandConnection {
+    pub fn new(
+        protocol_map: WaylandProtocolMap, stream: UnixScmStream,
+        connection_role: WaylandConnectionRole,
+    ) -> (WaylandReceiver, WaylandSender) {
+        let display_interface = protocol_map.0.interface_lookup.get("wl_display").unwrap();
+        let mut handle_table = BTreeMap::new();
+        handle_table.insert(1, *display_interface);
+        let conn = Arc::new(Self {
+            stream,
+            connection_role,
+            handle_table: Mutex::new(handle_table),
+            protocol_map,
+        });
+        (WaylandReceiver::new(conn.clone()), WaylandSender::new(conn))
     }
 }
 
@@ -1265,15 +1325,16 @@ mod test {
             let proto_map = WaylandProtocolMapBuilder::new()
                 .file("/home/eiz/code/wayland/protocol/wayland.xml")?
                 .build()?;
-            let conn = listener.accept().await?;
-            let mut conn = WaylandConnection::new(proto_map, conn);
-            conn.advance().await?;
-            let msg = conn.message()?;
+            let stream = listener.accept().await?;
+            let (mut rx, tx) =
+                WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Client);
+            rx.advance().await?;
+            let msg = rx.message()?;
             assert_eq!(msg.sender(), 1);
             assert_eq!(msg.opcode(), 1);
             println!("received get_registry");
-            conn.advance().await?;
-            let msg = conn.message()?;
+            rx.advance().await?;
+            let msg = rx.message()?;
             assert_eq!(msg.sender(), 1);
             assert_eq!(msg.opcode(), 0);
             println!("received sync");

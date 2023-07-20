@@ -61,7 +61,7 @@ impl UnixScmStream {
     }
 
     pub async fn recv(
-        &mut self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>, fd_out: &mut Vec<Option<OwnedFd>>,
+        &self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>, fd_out: &mut Vec<Option<OwnedFd>>,
         should_block: bool,
     ) -> Result<usize, std::io::Error> {
         let result = loop {
@@ -96,9 +96,7 @@ impl UnixScmStream {
         Ok(result.bytes)
     }
 
-    pub async fn send(
-        &mut self, buf: &[IoSlice<'_>], fds: &[RawFd],
-    ) -> Result<usize, std::io::Error> {
+    pub async fn send(&self, buf: &[IoSlice<'_>], fds: &[RawFd]) -> Result<usize, std::io::Error> {
         if fds.len() > 253 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
