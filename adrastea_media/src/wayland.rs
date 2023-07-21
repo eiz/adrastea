@@ -961,10 +961,13 @@ impl WaylandProtocolMapBuilder {
 pub struct WaylandProtocolMap(Arc<WaylandProtocolMapInner>);
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub struct InterfaceId(u16);
+pub struct InterfaceId(pub u16);
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
+pub struct ObjectId(pub u32);
 
 pub struct MessageReader<'a> {
-    sender: u32,
+    sender: ObjectId,
     opcode: u16,
     protocol_map: &'a WaylandProtocolMap,
     message_spec: &'a ResolvedMessage,
@@ -973,7 +976,7 @@ pub struct MessageReader<'a> {
 }
 
 impl<'a> MessageReader<'a> {
-    pub fn sender(&self) -> u32 {
+    pub fn sender(&self) -> ObjectId {
         self.sender
     }
 
@@ -993,7 +996,7 @@ pub enum MessageReaderValue<'a> {
     Fixed, // TODO
     String(&'a str),
     Object(Option<u32>),
-    NewId(InterfaceId, u32),
+    NewId(InterfaceId, ObjectId),
     Array(&'a [u8]),
     Fd(usize),
 }
@@ -1038,7 +1041,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
             }
             WaylandDataType::NewId => {
                 if let Some(interface_id) = arg.interface {
-                    MessageReaderValue::NewId(interface_id, NativeEndian::read_u32(data))
+                    MessageReaderValue::NewId(interface_id, ObjectId(NativeEndian::read_u32(data)))
                 } else {
                     let len = NativeEndian::read_u32(data) as usize;
                     let str_data = &data[4..4 + len - 1];
@@ -1054,7 +1057,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
                         .interface_lookup
                         .get(interface_name)
                         .ok_or_else(|| anyhow::anyhow!("unknown interface {:?}", interface_name))?;
-                    MessageReaderValue::NewId(*interface_id, object_id)
+                    MessageReaderValue::NewId(*interface_id, ObjectId(object_id))
                 }
             }
             WaylandDataType::Array => {
@@ -1149,7 +1152,7 @@ impl WaylandReceiver {
         if self.rx_buf_fill < 8 {
             bail!("no current message");
         }
-        let sender = NativeEndian::read_u32(&self.rx_buf[0..4]);
+        let sender = ObjectId(NativeEndian::read_u32(&self.rx_buf[0..4]));
         let opcode = NativeEndian::read_u16(&self.rx_buf[4..6]);
         let length = NativeEndian::read_u16(&self.rx_buf[6..8]) as usize;
         if self.rx_buf_fill < length {
@@ -1269,7 +1272,7 @@ impl WaylandReceiver {
 pub struct MessageBuilder<'a> {
     conn: &'a WaylandConnection,
     resolved_message: &'a ResolvedMessage,
-    sender_id: u32,
+    sender_id: ObjectId,
     opcode: u16,
     data: &'a mut Vec<u8>,
     fds: &'a mut Vec<RawFd>,
@@ -1361,11 +1364,11 @@ impl WaylandSender {
     }
 
     pub fn message_builder(
-        &mut self, sender_id: u32, opcode: u16,
+        &mut self, sender_id: ObjectId, opcode: u16,
     ) -> anyhow::Result<MessageBuilder> {
         self.builder_data.clear();
         self.builder_fds.clear();
-        self.builder_data.extend_from_slice(&sender_id.to_ne_bytes());
+        self.builder_data.extend_from_slice(&sender_id.0.to_ne_bytes());
         self.builder_data.extend_from_slice(&opcode.to_ne_bytes());
         self.builder_data.extend_from_slice(&[0; 2]);
         let interface_id = *(self.inner.handle_table.lock().get(&sender_id))
@@ -1393,7 +1396,7 @@ pub struct WaylandConnection {
     stream: UnixScmStream,
     connection_role: WaylandConnectionRole,
     protocol_map: WaylandProtocolMap,
-    handle_table: Mutex<BTreeMap<u32, InterfaceId>>,
+    handle_table: Mutex<BTreeMap<ObjectId, InterfaceId>>,
 }
 
 impl WaylandConnection {
@@ -1403,7 +1406,7 @@ impl WaylandConnection {
     ) -> (WaylandReceiver, WaylandSender) {
         let display_interface = protocol_map.0.interface_lookup.get("wl_display").unwrap();
         let mut handle_table = BTreeMap::new();
-        handle_table.insert(1, *display_interface);
+        handle_table.insert(ObjectId(1), *display_interface);
         let conn = Arc::new(Self {
             stream,
             connection_role,
@@ -1469,7 +1472,7 @@ mod test {
                 WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Server);
             rx.advance().await?;
             let mut msg = rx.message()?;
-            assert_eq!(msg.sender(), 1);
+            assert_eq!(msg.sender(), ObjectId(1));
             assert_eq!(msg.opcode(), 1);
             let mut args = msg.args();
             let arg = args.advance().unwrap();
@@ -1479,7 +1482,7 @@ mod test {
             };
             rx.advance().await?;
             let msg = rx.message()?;
-            assert_eq!(msg.sender(), 1);
+            assert_eq!(msg.sender(), ObjectId(1));
             assert_eq!(msg.opcode(), 0);
             tx.message_builder(registry_id, 0)?
                 .uint(1)
