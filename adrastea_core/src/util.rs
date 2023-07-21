@@ -23,9 +23,8 @@ use core::{
 };
 
 use alloc::{alloc::dealloc, sync::Arc};
-use num_traits::One;
+use num_traits::{Num, One};
 use parking_lot::{Condvar, Mutex};
-use rustfft::num_traits::Num;
 
 pub trait IUnknown: Provider + Debug {}
 

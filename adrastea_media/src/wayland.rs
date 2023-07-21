@@ -966,6 +966,7 @@ pub struct InterfaceId(u16);
 pub struct MessageReader<'a> {
     sender: u32,
     opcode: u16,
+    protocol_map: &'a WaylandProtocolMap,
     message_spec: &'a ResolvedMessage,
     data: &'a [u8],
     fds: &'a mut Vec<Option<OwnedFd>>,
@@ -981,7 +982,7 @@ impl<'a> MessageReader<'a> {
     }
 
     pub fn args<'b>(&'b mut self) -> MessageReaderArgs<'b, 'a> {
-        MessageReaderArgs { message: self, buf_pos: 0, fd_pos: 0, n: 0 }
+        MessageReaderArgs { reader: self, buf_pos: 0, fd_pos: 0, n: 0 }
     }
 }
 
@@ -1005,19 +1006,23 @@ pub struct MessageReaderArg {
 }
 
 pub struct MessageReaderArgs<'b, 'a: 'b> {
-    message: &'b mut MessageReader<'a>,
+    reader: &'b mut MessageReader<'a>,
     buf_pos: usize,
     fd_pos: usize,
     n: usize,
 }
 
+fn string_field_len(data: &[u8], buf_pos: usize) -> usize {
+    4 + round_up(NativeEndian::read_u32(&data[buf_pos..buf_pos + 4]) as usize, 4)
+}
+
 impl<'b, 'a> MessageReaderArgs<'b, 'a> {
     pub fn data(&self, arg: &MessageReaderArg) -> &[u8] {
-        &self.message.data[arg.data_range.clone()]
+        &self.reader.data[arg.data_range.clone()]
     }
 
     pub fn value(&self, arg: &MessageReaderArg) -> anyhow::Result<MessageReaderValue<'b>> {
-        let data: &'b [u8] = &self.message.data[arg.data_range.clone()];
+        let data: &'b [u8] = &self.reader.data[arg.data_range.clone()];
         Ok(match arg.data_type {
             WaylandDataType::Int => MessageReaderValue::Int(NativeEndian::read_i32(data)),
             WaylandDataType::Uint => MessageReaderValue::Uint(NativeEndian::read_u32(data)),
@@ -1035,7 +1040,21 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
                 if let Some(interface_id) = arg.interface {
                     MessageReaderValue::NewId(interface_id, NativeEndian::read_u32(data))
                 } else {
-                    panic!("dynamic new_id not yet implemented");
+                    let len = NativeEndian::read_u32(data) as usize;
+                    let str_data = &data[4..4 + len - 1];
+                    let len = round_up(len, 4);
+                    let interface_name = std::str::from_utf8(str_data)?;
+                    // TODO: do something with the version here
+                    let _version = NativeEndian::read_u32(&data[4 + len..4 + len + 4]);
+                    let object_id = NativeEndian::read_u32(&data[4 + len + 4..4 + len + 8]);
+                    let interface_id = self
+                        .reader
+                        .protocol_map
+                        .0
+                        .interface_lookup
+                        .get(interface_name)
+                        .ok_or_else(|| anyhow::anyhow!("unknown interface {:?}", interface_name))?;
+                    MessageReaderValue::NewId(*interface_id, object_id)
                 }
             }
             WaylandDataType::Array => {
@@ -1047,12 +1066,12 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
     }
 
     pub fn take_fd(&mut self, arg: &MessageReaderArg) -> OwnedFd {
-        let fd = self.message.fds[arg.fd_index.unwrap()].take().unwrap();
+        let fd = self.reader.fds[arg.fd_index.unwrap()].take().unwrap();
         fd
     }
 
     fn advance(&mut self) -> Option<MessageReaderArg> {
-        let arg_spec = match self.message.message_spec.args.get(self.n) {
+        let arg_spec = match self.reader.message_spec.args.get(self.n) {
             Some(arg) => arg,
             None => return None,
         };
@@ -1060,24 +1079,18 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
             WaylandDataType::Int => 4,
             WaylandDataType::Uint => 4,
             WaylandDataType::Fixed => 4,
-            WaylandDataType::String => {
-                4 + round_up(
-                    NativeEndian::read_u32(&self.message.data[self.buf_pos..self.buf_pos + 4])
-                        as usize,
-                    4,
-                )
-            }
+            WaylandDataType::String => string_field_len(&self.reader.data, self.buf_pos),
             WaylandDataType::Object => 4,
             WaylandDataType::NewId => {
                 if let Some(_interface) = arg_spec.interface.as_ref() {
                     4
                 } else {
-                    panic!("dynamic new_id not yet implemented");
+                    string_field_len(&self.reader.data, self.buf_pos) + 4 + 4
                 }
             }
             WaylandDataType::Array => {
                 4 + round_up(
-                    NativeEndian::read_u32(&self.message.data[self.buf_pos..self.buf_pos + 4])
+                    NativeEndian::read_u32(&self.reader.data[self.buf_pos..self.buf_pos + 4])
                         as usize,
                     4,
                 )
@@ -1162,6 +1175,7 @@ impl WaylandReceiver {
             data: &self.rx_buf[8..length],
             fds: &mut self.rx_fd_buf,
             message_spec: resolved_message,
+            protocol_map: &self.inner.protocol_map,
         })
     }
 
@@ -1318,6 +1332,7 @@ impl<'a> MessageBuilder<'a> {
             data: &self.data,
             fds: &mut dummy_fds,
             message_spec: self.resolved_message,
+            protocol_map: &self.conn.protocol_map,
         };
         let mut args = reader.args();
         while let Some(arg) = args.advance() {
