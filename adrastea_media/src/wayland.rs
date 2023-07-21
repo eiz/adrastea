@@ -26,7 +26,7 @@ use core::{
 };
 use std::{
     fs::File,
-    io::{self, BufReader},
+    io::{self, BufReader, IoSlice},
     os::{
         fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
         raw::c_void,
@@ -849,18 +849,21 @@ impl WaylandProtocol {
     }
 }
 
+#[derive(Debug)]
 struct ResolvedArg {
     data_type: WaylandDataType,
     interface: Option<InterfaceId>,
     allow_null: bool,
 }
 
+#[derive(Debug)]
 struct ResolvedMessage {
     since: u32,
     args: Vec<ResolvedArg>,
     message: WaylandMessage,
 }
 
+#[derive(Debug)]
 struct ResolvedInterface {
     version: u32,
     requests: Vec<ResolvedMessage>,
@@ -982,6 +985,7 @@ impl<'a> MessageReader<'a> {
     }
 }
 
+#[derive(Debug)]
 pub enum MessageReaderValue<'a> {
     Int(i32),
     Uint(u32),
@@ -990,7 +994,7 @@ pub enum MessageReaderValue<'a> {
     Object(Option<u32>),
     NewId(InterfaceId, u32),
     Array(&'a [u8]),
-    Fd(&'a mut Option<OwnedFd>),
+    Fd(usize),
 }
 
 pub struct MessageReaderArg {
@@ -1012,14 +1016,21 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
         &self.message.data[arg.data_range.clone()]
     }
 
-    pub fn value(&self, arg: &MessageReaderArg) -> MessageReaderValue<'a> {
-        let data = self.data(arg);
-        match arg.data_type {
-            WaylandDataType::Int => todo!(),
-            WaylandDataType::Uint => todo!(),
+    pub fn value(&self, arg: &MessageReaderArg) -> anyhow::Result<MessageReaderValue<'b>> {
+        let data: &'b [u8] = &self.message.data[arg.data_range.clone()];
+        Ok(match arg.data_type {
+            WaylandDataType::Int => MessageReaderValue::Int(NativeEndian::read_i32(data)),
+            WaylandDataType::Uint => MessageReaderValue::Uint(NativeEndian::read_u32(data)),
             WaylandDataType::Fixed => todo!(),
-            WaylandDataType::String => todo!(),
-            WaylandDataType::Object => todo!(),
+            WaylandDataType::String => {
+                let len = NativeEndian::read_u32(data) as usize;
+                let str_data = &data[4..4 + len - 1];
+                MessageReaderValue::String(std::str::from_utf8(str_data)?)
+            }
+            WaylandDataType::Object => {
+                let object_id = NativeEndian::read_u32(data);
+                MessageReaderValue::Object(if object_id == 0 { None } else { Some(object_id) })
+            }
             WaylandDataType::NewId => {
                 if let Some(interface_id) = arg.interface {
                     MessageReaderValue::NewId(interface_id, NativeEndian::read_u32(data))
@@ -1027,9 +1038,12 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
                     panic!("dynamic new_id not yet implemented");
                 }
             }
-            WaylandDataType::Array => todo!(),
-            WaylandDataType::Fd => todo!(),
-        }
+            WaylandDataType::Array => {
+                let len = NativeEndian::read_u32(data) as usize;
+                MessageReaderValue::Array(&data[4..4 + len])
+            }
+            WaylandDataType::Fd => MessageReaderValue::Fd(arg.fd_index.unwrap()),
+        })
     }
 
     pub fn take_fd(&mut self, arg: &MessageReaderArg) -> OwnedFd {
@@ -1068,7 +1082,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
                     4,
                 )
             }
-            WaylandDataType::Fd => 4,
+            WaylandDataType::Fd => 0,
         };
         let interface = match arg_spec.data_type {
             WaylandDataType::NewId => arg_spec.interface,
@@ -1180,7 +1194,6 @@ impl WaylandReceiver {
                     .await;
                 match result {
                     Ok(nread) => {
-                        println!("nread = {nread} bytes_needed = {bytes_needed}");
                         if nread == 0 {
                             // we may reach the end of the stream after reading
                             // enough data but before the buffer fill loop
@@ -1222,7 +1235,7 @@ impl WaylandReceiver {
                 consumed_fds += 1;
             }
             if arg.data_type == WaylandDataType::NewId {
-                let (interface_id, object_id) = match args.value(&arg) {
+                let (interface_id, object_id) = match args.value(&arg)? {
                     MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
                     _ => unreachable!(),
                 };
@@ -1242,54 +1255,82 @@ impl WaylandReceiver {
 pub struct MessageBuilder<'a> {
     conn: &'a WaylandConnection,
     resolved_message: &'a ResolvedMessage,
+    sender_id: u32,
+    opcode: u16,
     data: &'a mut Vec<u8>,
     fds: &'a mut Vec<RawFd>,
 }
 
+// TODO: this should type check against the message schema on the fly
 impl<'a> MessageBuilder<'a> {
-    pub fn int(&mut self, value: i32) -> &mut Self {
+    pub fn int(self, value: i32) -> Self {
         self.data.extend_from_slice(&value.to_ne_bytes());
         self
     }
 
-    pub fn uint(&mut self, value: u32) -> &mut Self {
+    pub fn uint(self, value: u32) -> Self {
         self.data.extend_from_slice(&value.to_ne_bytes());
         self
     }
 
-    pub fn string(&mut self, value: &str) -> &mut Self {
-        self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
+    pub fn string(self, value: &str) -> Self {
+        self.data.extend_from_slice(&(value.len() as u32 + 1).to_ne_bytes());
         self.data.extend_from_slice(value.as_bytes());
         self.data.push(0);
         self.data.resize(round_up(self.data.len(), 4), 0);
         self
     }
 
-    pub fn object(&mut self, value: Option<u32>) -> &mut Self {
+    pub fn object(self, value: Option<u32>) -> Self {
         self.data.extend_from_slice(&value.unwrap_or(0).to_ne_bytes());
         self
     }
 
-    pub fn new_id(&mut self, interface: Option<InterfaceId>, object_id: u32) -> &mut Self {
+    pub fn new_id(self, interface: Option<InterfaceId>, object_id: u32) -> Self {
+        // TODO handle dynamic new_id
         self.data.extend_from_slice(&object_id.to_ne_bytes());
         self
     }
 
-    pub fn array(&mut self, value: &[u8]) -> &mut Self {
+    pub fn array(self, value: &[u8]) -> Self {
         self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
         self.data.extend_from_slice(value);
         self.data.resize(round_up(self.data.len(), 4), 0);
         self
     }
 
-    pub fn fd(&mut self, fd: RawFd) -> &mut Self {
+    pub fn fd(self, fd: RawFd) -> Self {
         self.data.extend_from_slice(&fd.to_ne_bytes());
         self.fds.push(fd);
         self
     }
 
-    pub async fn send(&self) -> anyhow::Result<()> {
-        todo!()
+    pub async fn send(self) -> anyhow::Result<()> {
+        if self.data.len() > 65535 {
+            bail!("message too large");
+        }
+        let len = self.data.len() as u16;
+        NativeEndian::write_u16(&mut self.data[6..8], len);
+        let mut dummy_fds = vec![];
+        let mut reader = MessageReader {
+            sender: self.sender_id,
+            opcode: self.opcode,
+            data: &self.data,
+            fds: &mut dummy_fds,
+            message_spec: self.resolved_message,
+        };
+        let mut args = reader.args();
+        while let Some(arg) = args.advance() {
+            if arg.data_type == WaylandDataType::NewId {
+                let (interface_id, object_id) = match args.value(&arg)? {
+                    MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
+                    _ => unreachable!(),
+                };
+                self.conn.handle_table.lock().insert(object_id, interface_id);
+            }
+        }
+        self.conn.stream.send(&[IoSlice::new(&self.data)], &self.fds).await?;
+        Ok(())
     }
 }
 
@@ -1317,13 +1358,15 @@ impl WaylandSender {
         let interface = (self.inner.protocol_map.0.interfaces.get(interface_id.0 as usize))
             .ok_or_else(|| anyhow::anyhow!("invalid interface id"))?;
         let message_list = match self.inner.connection_role {
-            WaylandConnectionRole::Server => &interface.requests,
-            WaylandConnectionRole::Client => &interface.events,
+            WaylandConnectionRole::Server => &interface.events,
+            WaylandConnectionRole::Client => &interface.requests,
         };
         let resolved_message =
             message_list.get(opcode as usize).ok_or_else(|| anyhow::anyhow!("invalid opcode"))?;
         Ok(MessageBuilder {
             resolved_message,
+            sender_id,
+            opcode,
             conn: &*self.inner,
             data: &mut self.builder_data,
             fds: &mut self.builder_fds,
@@ -1358,6 +1401,8 @@ impl WaylandConnection {
 
 #[cfg(test)]
 mod test {
+    use core::time::Duration;
+
     use adrastea_core::net::UnixScmListener;
     use tempdir::TempDir;
     use tokio::net::UnixListener;
@@ -1397,7 +1442,7 @@ mod test {
             }
         }
 
-        let test_dir = TempDir::new("wayland_client_connect")?;
+        let test_dir = TempDir::new("test.wayland_client_connect")?;
         let sockpath = test_dir.path().join("wayland.sock");
         let listener = UnixScmListener::new(UnixListener::bind(&sockpath)?);
         async fn listener_task(mut listener: UnixScmListener) -> anyhow::Result<()> {
@@ -1405,18 +1450,29 @@ mod test {
                 .file("/home/eiz/code/wayland/protocol/wayland.xml")?
                 .build()?;
             let stream = listener.accept().await?;
-            let (mut rx, _tx) =
-                WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Client);
+            let (mut rx, mut tx) =
+                WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Server);
             rx.advance().await?;
-            let msg = rx.message()?;
+            let mut msg = rx.message()?;
             assert_eq!(msg.sender(), 1);
             assert_eq!(msg.opcode(), 1);
-            println!("received get_registry");
+            let mut args = msg.args();
+            let arg = args.advance().unwrap();
+            let registry_id = match args.value(&arg) {
+                Ok(MessageReaderValue::NewId(_interface_id, object_id)) => object_id,
+                x => panic!("bad message format {x:?}"),
+            };
             rx.advance().await?;
             let msg = rx.message()?;
             assert_eq!(msg.sender(), 1);
             assert_eq!(msg.opcode(), 0);
-            println!("received sync");
+            tx.message_builder(registry_id, 0)?
+                .uint(1)
+                .string("my_cool_interface")
+                .uint(1)
+                .send()
+                .await?;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
             Ok(())
         }
         let jh = tokio::spawn(async move {
@@ -1429,11 +1485,11 @@ mod test {
                 let sock = UnixStream::connect(&sockpath).unwrap();
                 let conn = Connection::from_socket(sock).unwrap();
                 let display = conn.display();
-                let event_queue: EventQueue<TestState> = conn.new_event_queue();
+                let mut event_queue: EventQueue<TestState> = conn.new_event_queue();
                 let handle = event_queue.handle();
                 let _registry = display.get_registry(&handle, ());
                 display.sync(&handle, ());
-                event_queue.flush().unwrap();
+                event_queue.blocking_dispatch(&mut TestState).unwrap();
             }
         })
         .await?;

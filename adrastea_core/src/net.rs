@@ -60,6 +60,9 @@ impl UnixScmStream {
         UnixStream::from_std(std::os::unix::net::UnixStream::from(self.inner.into_inner())).unwrap()
     }
 
+    // TODO: these should take &mut self and there's likely logic bugs if you do
+    // concurrent IO on the same side of the same stream here. We'll need some
+    // method of splitting the streams to handle it properly
     pub async fn recv(
         &self, buf: &mut [u8], cmsg_buf: &mut Vec<u8>, fd_out: &mut Vec<Option<OwnedFd>>,
         should_block: bool,
