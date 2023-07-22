@@ -28,7 +28,7 @@ use std::{
     fs::File,
     io::{self, BufReader, IoSlice},
     os::{
-        fd::{BorrowedFd, FromRawFd, OwnedFd, RawFd},
+        fd::{FromRawFd, OwnedFd, RawFd},
         raw::c_void,
     },
     path::Path,
@@ -865,6 +865,7 @@ struct ResolvedMessage {
 
 #[derive(Debug)]
 struct ResolvedInterface {
+    name: String,
     version: u32,
     requests: Vec<ResolvedMessage>,
     events: Vec<ResolvedMessage>,
@@ -922,8 +923,11 @@ impl WaylandProtocolMapBuilder {
                         _ => (),
                     }
                 }
-                self.0.interface_lookup.insert(name, InterfaceId(self.0.interfaces.len() as u16));
+                self.0
+                    .interface_lookup
+                    .insert(name.clone(), InterfaceId(self.0.interfaces.len() as u16));
                 self.0.interfaces.push(ResolvedInterface {
+                    name,
                     version: interface.version,
                     requests,
                     events,
@@ -966,6 +970,9 @@ pub struct InterfaceId(pub u16);
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
 pub struct ObjectId(pub u32);
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
+pub struct InterfaceVersion(pub u32);
+
 pub struct MessageReader<'a> {
     sender: ObjectId,
     opcode: u16,
@@ -996,7 +1003,7 @@ pub enum MessageReaderValue<'a> {
     Fixed, // TODO
     String(&'a str),
     Object(Option<u32>),
-    NewId(InterfaceId, ObjectId),
+    NewId(InterfaceId, ObjectId, InterfaceVersion),
     Array(&'a [u8]),
     Fd(usize),
 }
@@ -1041,23 +1048,29 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
             }
             WaylandDataType::NewId => {
                 if let Some(interface_id) = arg.interface {
-                    MessageReaderValue::NewId(interface_id, ObjectId(NativeEndian::read_u32(data)))
+                    let version =
+                        self.reader.protocol_map.0.interfaces[interface_id.0 as usize].version;
+                    MessageReaderValue::NewId(
+                        interface_id,
+                        ObjectId(NativeEndian::read_u32(data)),
+                        InterfaceVersion(version),
+                    )
                 } else {
                     let len = NativeEndian::read_u32(data) as usize;
                     let str_data = &data[4..4 + len - 1];
                     let len = round_up(len, 4);
                     let interface_name = std::str::from_utf8(str_data)?;
                     // TODO: do something with the version here
-                    let _version = NativeEndian::read_u32(&data[4 + len..4 + len + 4]);
+                    let version = NativeEndian::read_u32(&data[4 + len..4 + len + 4]);
                     let object_id = NativeEndian::read_u32(&data[4 + len + 4..4 + len + 8]);
-                    let interface_id = self
-                        .reader
-                        .protocol_map
-                        .0
-                        .interface_lookup
+                    let interface_id = (self.reader.protocol_map.0.interface_lookup)
                         .get(interface_name)
                         .ok_or_else(|| anyhow::anyhow!("unknown interface {:?}", interface_name))?;
-                    MessageReaderValue::NewId(*interface_id, ObjectId(object_id))
+                    MessageReaderValue::NewId(
+                        *interface_id,
+                        ObjectId(object_id),
+                        InterfaceVersion(version),
+                    )
                 }
             }
             WaylandDataType::Array => {
@@ -1189,6 +1202,21 @@ impl WaylandReceiver {
         self.fill_buffer(8, 0).await?;
         let msg_len = NativeEndian::read_u16(&self.rx_buf[6..8]) as usize;
         self.fill_buffer(msg_len, 0).await?;
+        let inner = self.inner.clone(); // TODO this clone is annoying to get rid of =/
+        let mut msg = self.message()?;
+        let mut args = msg.args();
+        while let Some(arg) = args.advance() {
+            if arg.data_type == WaylandDataType::NewId {
+                let (interface_id, object_id) = match args.value(&arg)? {
+                    // TODO we might need to handle versioning here eventually
+                    MessageReaderValue::NewId(interface_id, object_id, _) => {
+                        (interface_id, object_id)
+                    }
+                    _ => unreachable!(),
+                };
+                inner.handle_table.lock().insert(object_id, interface_id);
+            }
+        }
         Ok(())
     }
 
@@ -1242,7 +1270,6 @@ impl WaylandReceiver {
     }
 
     fn consume_message(&mut self) -> anyhow::Result<()> {
-        let inner = self.inner.clone(); // TODO this clone is annoying to get rid of =/
         let mut msg = self.message()?;
         let mut consumed_fds = 0;
         let consumed_bytes = msg.data.len() + 8;
@@ -1250,13 +1277,6 @@ impl WaylandReceiver {
         while let Some(arg) = args.advance() {
             if arg.fd_index.is_some() {
                 consumed_fds += 1;
-            }
-            if arg.data_type == WaylandDataType::NewId {
-                let (interface_id, object_id) = match args.value(&arg)? {
-                    MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
-                    _ => unreachable!(),
-                };
-                inner.handle_table.lock().insert(object_id, interface_id);
             }
         }
         if consumed_bytes > self.rx_buf_fill || consumed_fds > self.rx_fd_buf.len() {
@@ -1276,49 +1296,70 @@ pub struct MessageBuilder<'a> {
     opcode: u16,
     data: &'a mut Vec<u8>,
     fds: &'a mut Vec<RawFd>,
+    n: usize,
 }
 
 // TODO: this should type check against the message schema on the fly
 impl<'a> MessageBuilder<'a> {
-    pub fn int(self, value: i32) -> Self {
+    pub fn int(mut self, value: i32) -> Self {
         self.data.extend_from_slice(&value.to_ne_bytes());
+        self.n += 1;
         self
     }
 
-    pub fn uint(self, value: u32) -> Self {
+    pub fn uint(mut self, value: u32) -> Self {
         self.data.extend_from_slice(&value.to_ne_bytes());
+        self.n += 1;
         self
     }
 
-    pub fn string(self, value: &str) -> Self {
+    fn write_string(&mut self, value: &str) {
         self.data.extend_from_slice(&(value.len() as u32 + 1).to_ne_bytes());
         self.data.extend_from_slice(value.as_bytes());
         self.data.push(0);
         self.data.resize(round_up(self.data.len(), 4), 0);
+    }
+
+    pub fn string(mut self, value: &str) -> Self {
+        self.write_string(value);
+        self.n += 1;
         self
     }
 
-    pub fn object(self, value: Option<u32>) -> Self {
+    pub fn object(mut self, value: Option<u32>) -> Self {
         self.data.extend_from_slice(&value.unwrap_or(0).to_ne_bytes());
+        self.n += 1;
         self
     }
 
-    pub fn new_id(self, interface: Option<InterfaceId>, object_id: u32) -> Self {
+    pub fn new_id(
+        mut self, interface: InterfaceId, object_id: ObjectId, version: InterfaceVersion,
+    ) -> Self {
         // TODO handle dynamic new_id
-        self.data.extend_from_slice(&object_id.to_ne_bytes());
+        if self.resolved_message.args[self.n].interface.is_some() {
+            self.data.extend_from_slice(&object_id.0.to_ne_bytes());
+        } else {
+            let resolved = &self.conn.protocol_map.0.interfaces[interface.0 as usize];
+            self.write_string(&resolved.name);
+            self.data.extend_from_slice(&version.0.to_ne_bytes());
+            self.data.extend_from_slice(&object_id.0.to_ne_bytes());
+        }
+        self.n += 1;
         self
     }
 
-    pub fn array(self, value: &[u8]) -> Self {
+    pub fn array(mut self, value: &[u8]) -> Self {
         self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
         self.data.extend_from_slice(value);
         self.data.resize(round_up(self.data.len(), 4), 0);
+        self.n += 1;
         self
     }
 
-    pub fn fd(self, fd: RawFd) -> Self {
+    pub fn fd(mut self, fd: RawFd) -> Self {
         self.data.extend_from_slice(&fd.to_ne_bytes());
         self.fds.push(fd);
+        self.n += 1;
         self
     }
 
@@ -1341,7 +1382,10 @@ impl<'a> MessageBuilder<'a> {
         while let Some(arg) = args.advance() {
             if arg.data_type == WaylandDataType::NewId {
                 let (interface_id, object_id) = match args.value(&arg)? {
-                    MessageReaderValue::NewId(interface_id, object_id) => (interface_id, object_id),
+                    // TODO versioning
+                    MessageReaderValue::NewId(interface_id, object_id, _) => {
+                        (interface_id, object_id)
+                    }
                     _ => unreachable!(),
                 };
                 self.conn.handle_table.lock().insert(object_id, interface_id);
@@ -1388,6 +1432,7 @@ impl WaylandSender {
             conn: &*self.inner,
             data: &mut self.builder_data,
             fds: &mut self.builder_fds,
+            n: 0,
         })
     }
 }
@@ -1424,7 +1469,9 @@ mod test {
     use adrastea_core::net::UnixScmListener;
     use tempdir::TempDir;
     use tokio::net::UnixListener;
-    use wayland_client::protocol::{wl_callback::WlCallback, wl_registry::WlRegistry};
+    use wayland_client::protocol::{
+        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_registry::WlRegistry,
+    };
 
     use super::*;
 
@@ -1440,23 +1487,41 @@ mod test {
 
     #[tokio::test]
     pub async fn wayland_client_connect() -> anyhow::Result<()> {
-        struct TestState;
+        struct TestState {
+            wl_compositor: Option<WlCompositor>,
+            sync_count: u32,
+        }
         impl Dispatch<WlRegistry, ()> for TestState {
             fn event(
-                _state: &mut Self, _proxy: &WlRegistry,
+                state: &mut Self, proxy: &WlRegistry,
                 event: <WlRegistry as wayland_client::Proxy>::Event, _data: &(),
-                _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+                _conn: &Connection, qhandle: &wayland_client::QueueHandle<Self>,
             ) {
                 println!("wl_registry {:?}", event);
+                if let wl_registry::Event::Global { name, interface, version } = event {
+                    if interface == "wl_compositor" {
+                        state.wl_compositor = Some(proxy.bind(name, version, qhandle, ()));
+                    }
+                }
             }
         }
         impl Dispatch<WlCallback, ()> for TestState {
             fn event(
-                _state: &mut Self, _proxy: &WlCallback,
+                state: &mut Self, _proxy: &WlCallback,
                 event: <WlCallback as wayland_client::Proxy>::Event, _data: &(),
                 _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
             ) {
+                state.sync_count += 1;
                 println!("wl_callback {:?}", event);
+            }
+        }
+        impl Dispatch<WlCompositor, ()> for TestState {
+            fn event(
+                _state: &mut Self, _proxy: &WlCompositor,
+                event: <WlCompositor as wayland_client::Proxy>::Event, _data: &(),
+                _conn: &Connection, _qhandle: &wayland_client::QueueHandle<Self>,
+            ) {
+                println!("wl_compositor {:?}", event);
             }
         }
 
@@ -1469,27 +1534,73 @@ mod test {
                 .build()?;
             let stream = listener.accept().await?;
             let (mut rx, mut tx) =
-                WaylandConnection::new(proto_map, stream, WaylandConnectionRole::Server);
+                WaylandConnection::new(proto_map.clone(), stream, WaylandConnectionRole::Server);
             rx.advance().await?;
+            // get_registry
             let mut msg = rx.message()?;
             assert_eq!(msg.sender(), ObjectId(1));
             assert_eq!(msg.opcode(), 1);
             let mut args = msg.args();
             let arg = args.advance().unwrap();
             let registry_id = match args.value(&arg) {
-                Ok(MessageReaderValue::NewId(_interface_id, object_id)) => object_id,
+                Ok(MessageReaderValue::NewId(_interface_id, object_id, _)) => object_id,
                 x => panic!("bad message format {x:?}"),
             };
-            rx.advance().await?;
-            let msg = rx.message()?;
-            assert_eq!(msg.sender(), ObjectId(1));
-            assert_eq!(msg.opcode(), 0);
             tx.message_builder(registry_id, 0)?
                 .uint(1)
-                .string("my_cool_interface")
-                .uint(1)
+                .string("wl_compositor")
+                .uint(6)
                 .send()
                 .await?;
+            // first sync
+            rx.advance().await?;
+            let mut msg = rx.message()?;
+            assert_eq!(msg.sender(), ObjectId(1));
+            assert_eq!(msg.opcode(), 0);
+            let mut args = msg.args();
+            let arg = args.advance().unwrap();
+            let callback_id = match args.value(&arg) {
+                Ok(MessageReaderValue::NewId(_interface_id, object_id, _)) => object_id,
+                x => panic!("bad message format {x:?}"),
+            };
+            tx.message_builder(callback_id, 0)?.uint(0).send().await?;
+            // bind wl_compositor
+            rx.advance().await?;
+            let mut msg = rx.message()?;
+            assert_eq!(msg.sender(), registry_id);
+            assert_eq!(msg.opcode(), 0);
+            let mut args = msg.args();
+            let arg = args.advance().unwrap();
+            let compositor_name = match args.value(&arg) {
+                Ok(MessageReaderValue::Uint(x)) => x,
+                x => panic!("bad message format {x:?}"),
+            };
+            let arg = args.advance().unwrap();
+            let (compositor_interface_id, compositor_id, compositor_version) =
+                match args.value(&arg) {
+                    Ok(MessageReaderValue::NewId(interface_id, object_id, version)) => {
+                        (interface_id, object_id, version)
+                    }
+                    x => panic!("bad message format {x:?}"),
+                };
+            let expected_compositor_id = proto_map.0.interface_lookup.get("wl_compositor").unwrap();
+            assert_eq!(compositor_name, 1);
+            assert_eq!(compositor_interface_id, *expected_compositor_id);
+            assert_eq!(compositor_version, InterfaceVersion(6));
+            assert_eq!(compositor_id, ObjectId(4));
+            // second sync
+            rx.advance().await?;
+            let mut msg = rx.message()?;
+            assert_eq!(msg.sender(), ObjectId(1));
+            assert_eq!(msg.opcode(), 0);
+            let mut args = msg.args();
+            let arg = args.advance().unwrap();
+            let callback_id = match args.value(&arg) {
+                Ok(MessageReaderValue::NewId(_interface_id, object_id, _)) => object_id,
+                x => panic!("bad message format {x:?}"),
+            };
+            tx.message_builder(callback_id, 0)?.uint(0).send().await?;
+
             tokio::time::sleep(Duration::from_millis(1000)).await;
             Ok(())
         }
@@ -1506,8 +1617,15 @@ mod test {
                 let mut event_queue: EventQueue<TestState> = conn.new_event_queue();
                 let handle = event_queue.handle();
                 let _registry = display.get_registry(&handle, ());
+                let mut state = TestState { wl_compositor: None, sync_count: 0 };
                 display.sync(&handle, ());
-                event_queue.blocking_dispatch(&mut TestState).unwrap();
+                while state.sync_count == 0 {
+                    event_queue.blocking_dispatch(&mut state).unwrap();
+                }
+                display.sync(&handle, ());
+                while state.sync_count == 1 {
+                    event_queue.blocking_dispatch(&mut state).unwrap();
+                }
             }
         })
         .await?;
