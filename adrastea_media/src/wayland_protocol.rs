@@ -23,13 +23,16 @@ use std::{
     path::Path,
 };
 
-use adrastea_core::{net::UnixScmStream, util::round_up};
+use adrastea_core::{
+    net::{UnixScmListener, UnixScmStream},
+    util::round_up,
+};
 use alloc::{collections::BTreeMap, sync::Arc};
 use anyhow::bail;
 use byteorder::{ByteOrder, NativeEndian};
-
 use parking_lot::Mutex;
 use serde::Deserialize;
+use tokio::net::UnixListener;
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum WaylandDataType {
@@ -306,7 +309,7 @@ impl<'a> MessageReader<'a> {
 pub enum MessageReaderValue<'a> {
     Int(i32),
     Uint(u32),
-    Fixed, // TODO
+    Fixed(i32), // Q8
     String(&'a str),
     Object(Option<u32>),
     NewId(InterfaceId, ObjectId, InterfaceVersion),
@@ -342,7 +345,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
         Ok(match arg.data_type {
             WaylandDataType::Int => MessageReaderValue::Int(NativeEndian::read_i32(data)),
             WaylandDataType::Uint => MessageReaderValue::Uint(NativeEndian::read_u32(data)),
-            WaylandDataType::Fixed => todo!(),
+            WaylandDataType::Fixed => MessageReaderValue::Fixed(NativeEndian::read_i32(data)),
             WaylandDataType::String => {
                 let len = NativeEndian::read_u32(data) as usize;
                 let str_data = &data[4..4 + len - 1];
@@ -620,6 +623,13 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
+    pub fn fixed(mut self, value: i32) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Fixed);
+        self.data.extend_from_slice(&value.to_ne_bytes());
+        self.n += 1;
+        self
+    }
+
     fn write_string(&mut self, value: &str) {
         self.data.extend_from_slice(&(value.len() as u32 + 1).to_ne_bytes());
         self.data.extend_from_slice(value.as_bytes());
@@ -769,6 +779,24 @@ impl WaylandConnection {
             protocol_map,
         });
         (WaylandReceiver::new(conn.clone()), WaylandSender::new(conn))
+    }
+}
+
+struct WaylandProxy {
+    protocol_map: WaylandProtocolMap,
+    listener: UnixScmListener,
+}
+
+impl WaylandProxy {
+    pub fn bind<P: AsRef<Path>>(protocol_map: WaylandProtocolMap, path: P) -> anyhow::Result<Self> {
+        let listener = UnixScmListener::new(UnixListener::bind(path)?);
+        Ok(Self { protocol_map, listener })
+    }
+
+    pub async fn listen(&mut self) -> anyhow::Result<()> {
+        loop {
+            todo!()
+        }
     }
 }
 
