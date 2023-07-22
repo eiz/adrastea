@@ -605,15 +605,16 @@ pub struct MessageBuilder<'a> {
     n: usize,
 }
 
-// TODO: this should type check against the message schema on the fly
 impl<'a> MessageBuilder<'a> {
     pub fn int(mut self, value: i32) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Int);
         self.data.extend_from_slice(&value.to_ne_bytes());
         self.n += 1;
         self
     }
 
     pub fn uint(mut self, value: u32) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Uint);
         self.data.extend_from_slice(&value.to_ne_bytes());
         self.n += 1;
         self
@@ -627,13 +628,15 @@ impl<'a> MessageBuilder<'a> {
     }
 
     pub fn string(mut self, value: &str) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::String);
         self.write_string(value);
         self.n += 1;
         self
     }
 
-    pub fn object(mut self, value: Option<u32>) -> Self {
-        self.data.extend_from_slice(&value.unwrap_or(0).to_ne_bytes());
+    pub fn object(mut self, value: Option<ObjectId>) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Object);
+        self.data.extend_from_slice(&value.unwrap_or(ObjectId(0)).0.to_ne_bytes());
         self.n += 1;
         self
     }
@@ -641,7 +644,7 @@ impl<'a> MessageBuilder<'a> {
     pub fn new_id(
         mut self, interface: InterfaceId, object_id: ObjectId, version: InterfaceVersion,
     ) -> Self {
-        // TODO handle dynamic new_id
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::NewId);
         if self.resolved_message.args[self.n].interface.is_some() {
             self.data.extend_from_slice(&object_id.0.to_ne_bytes());
         } else {
@@ -655,6 +658,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     pub fn array(mut self, value: &[u8]) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Array);
         self.data.extend_from_slice(&(value.len() as u32).to_ne_bytes());
         self.data.extend_from_slice(value);
         self.data.resize(round_up(self.data.len(), 4), 0);
@@ -663,7 +667,7 @@ impl<'a> MessageBuilder<'a> {
     }
 
     pub fn fd(mut self, fd: RawFd) -> Self {
-        self.data.extend_from_slice(&fd.to_ne_bytes());
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Fd);
         self.fds.push(fd);
         self.n += 1;
         self
