@@ -19,6 +19,7 @@ use adrastea_media::{
     audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     vulkan,
     wayland::{self, ISkiaPaint, SurfaceClient},
+    wayland_protocol,
 };
 use adrastea_models::{
     clip,
@@ -813,8 +814,9 @@ impl MpixConfig {
 }
 
 fn wserver_test() -> anyhow::Result<()> {
-    let shittles =
-        wayland::WaylandProtocol::load_path("/home/eiz/code/wayland/protocol/wayland.xml")?;
+    let shittles = wayland_protocol::WaylandProtocol::load_path(
+        "/home/eiz/code/wayland/protocol/wayland.xml",
+    )?;
     println!("{:#?}", shittles);
     todo!()
 }

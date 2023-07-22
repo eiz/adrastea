@@ -19,3 +19,4 @@ extern crate alloc;
 pub mod audio;
 pub mod vulkan;
 pub mod wayland;
+pub mod wayland_protocol;
