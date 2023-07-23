@@ -845,13 +845,14 @@ impl WaylandProxy {
 async fn wayland_proxy_forward(
     mut rx: WaylandReceiver, mut tx: WaylandSender, name: &str,
 ) -> anyhow::Result<()> {
-    while rx.advance().await.is_ok() {
+    loop {
+        rx.advance().await?;
         let mut msg = rx.message()?;
         println!("{} forwarding {}", name, msg.debug_name());
         let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
         let mut args = msg.args();
         while let Some(arg) = args.advance() {
-            println!("  arg: {:?}", args.value(&arg));
+            println!("  arg: {:?}", args.value(&arg)?);
             match args.value(&arg)? {
                 MessageReaderValue::Int(value) => builder = builder.int(value),
                 MessageReaderValue::Uint(value) => builder = builder.uint(value),
@@ -869,7 +870,6 @@ async fn wayland_proxy_forward(
         }
         builder.send().await?;
     }
-    Ok(())
 }
 
 async fn wayland_proxy_main(
