@@ -286,7 +286,8 @@ pub struct MessageReader<'a> {
     sender: ObjectId,
     opcode: u16,
     protocol_map: &'a WaylandProtocolMap,
-    message_spec: &'a ResolvedMessage,
+    resolved_interface: &'a ResolvedInterface,
+    resolved_message: &'a ResolvedMessage,
     data: &'a [u8],
     fds: &'a mut Vec<Option<OwnedFd>>,
 }
@@ -298,6 +299,16 @@ impl<'a> MessageReader<'a> {
 
     pub fn opcode(&self) -> u16 {
         self.opcode
+    }
+
+    pub fn debug_name(&self) -> String {
+        format!(
+            "{}({}).{}({})",
+            self.resolved_interface.name,
+            self.sender.0,
+            self.resolved_message.message.name,
+            self.opcode,
+        )
     }
 
     pub fn args<'b>(&'b mut self) -> MessageReaderArgs<'b, 'a> {
@@ -400,7 +411,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
     }
 
     fn advance(&mut self) -> Option<MessageReaderArg> {
-        let arg_spec = match self.reader.message_spec.args.get(self.n) {
+        let arg_spec = match self.reader.resolved_message.args.get(self.n) {
             Some(arg) => arg,
             None => return None,
         };
@@ -484,17 +495,17 @@ impl WaylandReceiver {
         if self.rx_buf_fill < length {
             bail!("no current message");
         }
-        let resolved_message =
+        let (resolved_interface, resolved_message) =
             match (self.inner.connection_role, self.inner.handle_table.lock().get(&sender)) {
                 (WaylandConnectionRole::Server, Some(interface_id)) => {
                     let interface = &self.inner.protocol_map.0.interfaces[interface_id.0 as usize];
                     let message = &interface.requests[opcode as usize];
-                    message
+                    (interface, message)
                 }
                 (WaylandConnectionRole::Client, Some(interface_id)) => {
                     let interface = &self.inner.protocol_map.0.interfaces[interface_id.0 as usize];
                     let message = &interface.events[opcode as usize];
-                    message
+                    (interface, message)
                 }
                 _ => bail!("invalid message sender"),
             };
@@ -503,7 +514,8 @@ impl WaylandReceiver {
             opcode,
             data: &self.rx_buf[8..length],
             fds: &mut self.rx_fd_buf,
-            message_spec: resolved_message,
+            resolved_interface,
+            resolved_message,
             protocol_map: &self.inner.protocol_map,
         })
     }
@@ -604,6 +616,7 @@ impl WaylandReceiver {
 
 pub struct MessageBuilder<'a> {
     conn: &'a WaylandConnection,
+    resolved_interface: &'a ResolvedInterface,
     resolved_message: &'a ResolvedMessage,
     sender_id: ObjectId,
     opcode: u16,
@@ -664,6 +677,7 @@ impl<'a> MessageBuilder<'a> {
             self.data.extend_from_slice(&object_id.0.to_ne_bytes());
         } else {
             let resolved = &self.conn.protocol_map.0.interfaces[interface.0 as usize];
+            println!("  new_id {} {} {}", resolved.name, version.0, object_id.0);
             self.write_string(&resolved.name);
             self.data.extend_from_slice(&version.0.to_ne_bytes());
             self.data.extend_from_slice(&object_id.0.to_ne_bytes());
@@ -706,9 +720,10 @@ impl<'a> MessageBuilder<'a> {
         let mut reader = MessageReader {
             sender: self.sender_id,
             opcode: self.opcode,
-            data: &self.data,
+            data: &self.data[8..],
             fds: &mut dummy_fds,
-            message_spec: self.resolved_message,
+            resolved_interface: self.resolved_interface,
+            resolved_message: self.resolved_message,
             protocol_map: &self.conn.protocol_map,
         };
         let mut args = reader.args();
@@ -751,15 +766,17 @@ impl WaylandSender {
         self.builder_data.extend_from_slice(&[0; 2]);
         let interface_id = *(self.inner.handle_table.lock().get(&sender_id))
             .ok_or_else(|| anyhow::anyhow!("invalid sender id"))?;
-        let interface = (self.inner.protocol_map.0.interfaces.get(interface_id.0 as usize))
-            .ok_or_else(|| anyhow::anyhow!("invalid interface id"))?;
+        let resolved_interface =
+            (self.inner.protocol_map.0.interfaces.get(interface_id.0 as usize))
+                .ok_or_else(|| anyhow::anyhow!("invalid interface id"))?;
         let message_list = match self.inner.connection_role {
-            WaylandConnectionRole::Server => &interface.events,
-            WaylandConnectionRole::Client => &interface.requests,
+            WaylandConnectionRole::Server => &resolved_interface.events,
+            WaylandConnectionRole::Client => &resolved_interface.requests,
         };
         let resolved_message =
             message_list.get(opcode as usize).ok_or_else(|| anyhow::anyhow!("invalid opcode"))?;
         Ok(MessageBuilder {
+            resolved_interface,
             resolved_message,
             sender_id,
             opcode,
@@ -797,7 +814,7 @@ impl WaylandConnection {
     }
 }
 
-struct WaylandProxy {
+pub struct WaylandProxy {
     protocol_map: WaylandProtocolMap,
     server_path: PathBuf,
     listener: UnixScmListener,
@@ -826,13 +843,15 @@ impl WaylandProxy {
 }
 
 async fn wayland_proxy_forward(
-    mut rx: WaylandReceiver, mut tx: WaylandSender,
+    mut rx: WaylandReceiver, mut tx: WaylandSender, name: &str,
 ) -> anyhow::Result<()> {
     while rx.advance().await.is_ok() {
         let mut msg = rx.message()?;
+        println!("{} forwarding {}", name, msg.debug_name());
         let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
         let mut args = msg.args();
         while let Some(arg) = args.advance() {
+            println!("  arg: {:?}", args.value(&arg));
             match args.value(&arg)? {
                 MessageReaderValue::Int(value) => builder = builder.int(value),
                 MessageReaderValue::Uint(value) => builder = builder.uint(value),
@@ -848,6 +867,7 @@ async fn wayland_proxy_forward(
                 }
             }
         }
+        builder.send().await?;
     }
     Ok(())
 }
@@ -860,12 +880,19 @@ async fn wayland_proxy_main(
     let client_stream = UnixScmStream::connect(server_path).await?;
     let (client_rx, client_tx) =
         WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
-    let server_jh = tokio::spawn(async move { wayland_proxy_forward(server_rx, client_tx).await });
-    let client_jh = tokio::spawn(async move { wayland_proxy_forward(client_rx, server_tx).await });
-    let (server_res, client_res) = tokio::join!(server_jh, client_jh);
-    server_res??;
-    client_res??;
-    todo!()
+    // TODO deal with annoying tokio error wrapping stuff (flatten out results) for non-panicking try_join
+    let server_jh = tokio::spawn(async move {
+        if let Err(e) = wayland_proxy_forward(server_rx, client_tx, "client->server").await {
+            eprintln!("wayland proxy connection exited with error: {:?}", e);
+        }
+    });
+    let client_jh = tokio::spawn(async move {
+        if let Err(e) = wayland_proxy_forward(client_rx, server_tx, "server->client").await {
+            eprintln!("wayland proxy connection exited with error: {:?}", e);
+        }
+    });
+    tokio::try_join!(server_jh, client_jh)?;
+    Ok(())
 }
 
 #[cfg(test)]

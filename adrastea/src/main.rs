@@ -18,8 +18,8 @@ use adrastea_core::util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnkno
 use adrastea_media::{
     audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     vulkan,
-    wayland::{self, ISkiaPaint, SurfaceClient},
-    wayland_protocol,
+    wayland::{ISkiaPaint, SurfaceClient},
+    wayland_protocol::{WaylandProtocolMapBuilder, WaylandProxy},
 };
 use adrastea_models::{
     clip,
@@ -738,7 +738,12 @@ enum CliCommand {
     },
     Atk,
     Mpix,
-    Wserver,
+    Wserver {
+        #[arg(value_name = "LISTEN")]
+        listen_path: PathBuf,
+        #[arg(value_name = "SERVER")]
+        server_path: PathBuf,
+    },
 }
 
 #[async_recursion::async_recursion]
@@ -813,12 +818,15 @@ impl MpixConfig {
     }
 }
 
-fn wserver_test() -> anyhow::Result<()> {
-    let shittles = wayland_protocol::WaylandProtocol::load_path(
-        "/home/eiz/code/wayland/protocol/wayland.xml",
-    )?;
-    println!("{:#?}", shittles);
-    todo!()
+#[tokio::main]
+async fn wserver_test(listen_path: &Path, server_path: &Path) -> anyhow::Result<()> {
+    let proto_map = WaylandProtocolMapBuilder::new()
+        .file("/home/eiz/code/wayland/protocol/wayland.xml")?
+        .dir("/home/eiz/code/wayland-protocols/stable/xdg-shell")?
+        .build()?;
+    let proxy = WaylandProxy::bind(proto_map, listen_path, server_path)?;
+    proxy.listen().await?;
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -855,7 +863,9 @@ fn main() -> anyhow::Result<()> {
         }
         CliCommand::Atk => atk_test()?,
         CliCommand::Mpix => mpix_test()?,
-        CliCommand::Wserver => wserver_test()?,
+        CliCommand::Wserver { listen_path, server_path } => {
+            wserver_test(&listen_path, &server_path)?
+        }
     }
     Ok(())
 }
