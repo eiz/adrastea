@@ -19,8 +19,8 @@ use core::ops::Range;
 use std::{
     fs::File,
     io::{self, BufReader, IoSlice},
-    os::fd::{OwnedFd, RawFd},
-    path::Path,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+    path::{Path, PathBuf},
 };
 
 use adrastea_core::{
@@ -32,7 +32,7 @@ use anyhow::bail;
 use byteorder::{ByteOrder, NativeEndian};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use tokio::net::UnixListener;
+use tokio::{net::UnixListener, task::JoinHandle};
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum WaylandDataType {
@@ -311,7 +311,7 @@ pub enum MessageReaderValue<'a> {
     Uint(u32),
     Fixed(i32), // Q8
     String(&'a str),
-    Object(Option<u32>),
+    Object(Option<ObjectId>),
     NewId(InterfaceId, ObjectId, InterfaceVersion),
     Array(&'a [u8]),
     Fd(usize),
@@ -353,7 +353,11 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
             }
             WaylandDataType::Object => {
                 let object_id = NativeEndian::read_u32(data);
-                MessageReaderValue::Object(if object_id == 0 { None } else { Some(object_id) })
+                MessageReaderValue::Object(if object_id == 0 {
+                    None
+                } else {
+                    Some(ObjectId(object_id))
+                })
             }
             WaylandDataType::NewId => {
                 if let Some(interface_id) = arg.interface {
@@ -605,6 +609,7 @@ pub struct MessageBuilder<'a> {
     opcode: u16,
     data: &'a mut Vec<u8>,
     fds: &'a mut Vec<RawFd>,
+    owned_fds: Vec<OwnedFd>,
     n: usize,
 }
 
@@ -683,6 +688,14 @@ impl<'a> MessageBuilder<'a> {
         self
     }
 
+    pub fn fd_owned(mut self, fd: OwnedFd) -> Self {
+        assert_eq!(self.resolved_message.args[self.n].data_type, WaylandDataType::Fd);
+        self.fds.push(fd.as_raw_fd());
+        self.owned_fds.push(fd);
+        self.n += 1;
+        self
+    }
+
     pub async fn send(self) -> anyhow::Result<()> {
         if self.data.len() > 65535 {
             bail!("message too large");
@@ -711,6 +724,7 @@ impl<'a> MessageBuilder<'a> {
                 self.conn.handle_table.lock().insert(object_id, interface_id);
             }
         }
+        // TODO buffer sends for non-fd-transmitting messages
         self.conn.stream.send(&[IoSlice::new(&self.data)], &self.fds).await?;
         Ok(())
     }
@@ -752,6 +766,7 @@ impl WaylandSender {
             conn: &*self.inner,
             data: &mut self.builder_data,
             fds: &mut self.builder_fds,
+            owned_fds: vec![],
             n: 0,
         })
     }
@@ -784,20 +799,73 @@ impl WaylandConnection {
 
 struct WaylandProxy {
     protocol_map: WaylandProtocolMap,
+    server_path: PathBuf,
     listener: UnixScmListener,
 }
 
 impl WaylandProxy {
-    pub fn bind<P: AsRef<Path>>(protocol_map: WaylandProtocolMap, path: P) -> anyhow::Result<Self> {
+    pub fn bind(
+        protocol_map: WaylandProtocolMap, path: impl AsRef<Path>, server_path: impl Into<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let listener = UnixScmListener::new(UnixListener::bind(path)?);
-        Ok(Self { protocol_map, listener })
+        Ok(Self { protocol_map, server_path: server_path.into(), listener })
     }
 
-    pub async fn listen(&mut self) -> anyhow::Result<()> {
+    pub async fn listen(&self) -> anyhow::Result<()> {
         loop {
-            todo!()
+            let stream = self.listener.accept().await?;
+            let server_path = self.server_path.clone();
+            let protocol_map = self.protocol_map.clone();
+            tokio::spawn(async move {
+                if let Err(e) = wayland_proxy_main(protocol_map, server_path, stream).await {
+                    eprintln!("wayland proxy connection exited with error: {:?}", e);
+                }
+            });
         }
     }
+}
+
+async fn wayland_proxy_forward(
+    mut rx: WaylandReceiver, mut tx: WaylandSender,
+) -> anyhow::Result<()> {
+    while rx.advance().await.is_ok() {
+        let mut msg = rx.message()?;
+        let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
+        let mut args = msg.args();
+        while let Some(arg) = args.advance() {
+            match args.value(&arg)? {
+                MessageReaderValue::Int(value) => builder = builder.int(value),
+                MessageReaderValue::Uint(value) => builder = builder.uint(value),
+                MessageReaderValue::Fixed(value) => builder = builder.fixed(value),
+                MessageReaderValue::String(value) => builder = builder.string(value),
+                MessageReaderValue::Object(value) => builder = builder.object(value),
+                MessageReaderValue::NewId(interface_id, object_id, version) => {
+                    builder = builder.new_id(interface_id, object_id, version)
+                }
+                MessageReaderValue::Array(value) => builder = builder.array(value),
+                MessageReaderValue::Fd(_) => {
+                    builder = builder.fd_owned(args.take_fd(&arg));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wayland_proxy_main(
+    protocol_map: WaylandProtocolMap, server_path: PathBuf, stream: UnixScmStream,
+) -> anyhow::Result<()> {
+    let (server_rx, server_tx) =
+        WaylandConnection::new(protocol_map.clone(), stream, WaylandConnectionRole::Server);
+    let client_stream = UnixScmStream::connect(server_path).await?;
+    let (client_rx, client_tx) =
+        WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
+    let server_jh = tokio::spawn(async move { wayland_proxy_forward(server_rx, client_tx).await });
+    let client_jh = tokio::spawn(async move { wayland_proxy_forward(client_rx, server_tx).await });
+    let (server_res, client_res) = tokio::join!(server_jh, client_jh);
+    server_res??;
+    client_res??;
+    todo!()
 }
 
 #[cfg(test)]
@@ -871,7 +939,7 @@ mod test {
         let test_dir = TempDir::new("test.wayland_client_connect")?;
         let sockpath = test_dir.path().join("wayland.sock");
         let listener = UnixScmListener::new(UnixListener::bind(&sockpath)?);
-        async fn listener_task(mut listener: UnixScmListener) -> anyhow::Result<()> {
+        async fn listener_task(listener: UnixScmListener) -> anyhow::Result<()> {
             let proto_map = WaylandProtocolMapBuilder::new()
                 .file("/home/eiz/code/wayland/protocol/wayland.xml")?
                 .build()?;

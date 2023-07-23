@@ -16,6 +16,7 @@
 use std::{
     io::{IoSlice, IoSliceMut},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    path::Path,
 };
 
 use nix::sys::socket::{ControlMessage, MsgFlags};
@@ -33,7 +34,7 @@ impl UnixScmListener {
         Self { socket }
     }
 
-    pub async fn accept(&mut self) -> Result<UnixScmStream, std::io::Error> {
+    pub async fn accept(&self) -> Result<UnixScmStream, std::io::Error> {
         let (stream, _) = self.socket.accept().await?;
         Ok(UnixScmStream::new(stream))
     }
@@ -50,6 +51,11 @@ pub struct UnixScmStream {
 impl UnixScmStream {
     pub fn new(stream: UnixStream) -> Self {
         Self { inner: AsyncFd::new(stream.into_std().unwrap().into()).unwrap() }
+    }
+
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
+        let stream = UnixStream::connect(path).await?;
+        Ok(Self::new(stream))
     }
 
     pub fn alloc_cmsg_buf() -> Vec<u8> {
