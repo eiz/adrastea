@@ -13,8 +13,6 @@
  * with Adrastea. If not, see <https://www.gnu.org/licenses/>.
  */
 
-// TODO: implement the proxy, dmabufs
-
 use core::ops::Range;
 use std::{
     fs::File,
@@ -32,7 +30,7 @@ use anyhow::bail;
 use byteorder::{ByteOrder, NativeEndian};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use tokio::{net::UnixListener, task::JoinHandle};
+use tokio::net::UnixListener;
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum WaylandDataType {
@@ -384,7 +382,6 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
                     let str_data = &data[4..4 + len - 1];
                     let len = round_up(len, 4);
                     let interface_name = std::str::from_utf8(str_data)?;
-                    // TODO: do something with the version here
                     let version = NativeEndian::read_u32(&data[4 + len..4 + len + 4]);
                     let object_id = NativeEndian::read_u32(&data[4 + len + 4..4 + len + 8]);
                     let interface_id = (self.reader.protocol_map.0.interface_lookup)
@@ -864,6 +861,7 @@ async fn wayland_proxy_forward(
                 }
                 MessageReaderValue::Array(value) => builder = builder.array(value),
                 MessageReaderValue::Fd(_) => {
+                    // TODO we can get rid of fd_owned by having like borrow_fd on args or something
                     builder = builder.fd_owned(args.take_fd(&arg));
                 }
             }

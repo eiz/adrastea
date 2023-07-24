@@ -43,11 +43,13 @@ use core::{
 use mathpix::{ImageToTextOptions, MathPixClient};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
     time::Instant,
 };
+use walkdir::WalkDir;
 
 use anyhow::bail;
 use atspi::{
@@ -820,10 +822,20 @@ impl MpixConfig {
 
 #[tokio::main]
 async fn wserver_test(listen_path: &Path, server_path: &Path) -> anyhow::Result<()> {
-    let proto_map = WaylandProtocolMapBuilder::new()
+    let mut proto_builder = WaylandProtocolMapBuilder::new()
         .file("/home/eiz/code/wayland/protocol/wayland.xml")?
-        .dir("/home/eiz/code/wayland-protocols/stable/xdg-shell")?
-        .build()?;
+        .dir("/home/eiz/code/wayland-protocols/staging/fractional-scale")?
+        .dir("/home/eiz/code/wayland-protocols/staging/xdg-activation")?
+        .dir("/home/eiz/code/wayland-protocols/unstable/xdg-output")?
+        .dir("/home/eiz/code/wayland-protocols/unstable/primary-selection")?
+        .dir("/home/eiz/code/wayland-protocols/unstable/text-input")?;
+    for entry in WalkDir::new("/home/eiz/code/wayland-protocols/stable") {
+        let entry = entry?;
+        if entry.path().extension() == Some(OsStr::new("xml")) {
+            proto_builder = proto_builder.file(entry.path())?;
+        }
+    }
+    let proto_map = proto_builder.build()?;
     let proxy = WaylandProxy::bind(proto_map, listen_path, server_path)?;
     proxy.listen().await?;
     Ok(())
