@@ -14,12 +14,18 @@
  */
 
 #![feature(provide_any, iter_advance_by)]
-use adrastea_core::util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown};
+use adrastea_core::{
+    net::{UnixScmListener, UnixScmStream},
+    util::{AtomicRing, AtomicRingReader, AtomicRingWriter, IUnknown},
+};
 use adrastea_media::{
     audio::{AudioControlThread, NUM_CHANNELS, SAMPLE_RATE},
     vulkan,
     wayland::{ISkiaPaint, SurfaceClient},
-    wayland_protocol::{WaylandProtocolMapBuilder, WaylandProxy},
+    wayland_protocol::{
+        MessageReaderValue, WaylandConnection, WaylandConnectionRole, WaylandProtocolMap,
+        WaylandProtocolMapBuilder, WaylandReceiver, WaylandSender,
+    },
 };
 use adrastea_models::{
     clip,
@@ -32,7 +38,7 @@ use adrastea_models::{
         WhisperContext, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
     },
 };
-use alloc::{collections::VecDeque, sync::Arc};
+use alloc::{collections::VecDeque, rc::Rc, sync::Arc};
 use core::{
     any::Provider,
     cell::RefCell,
@@ -40,7 +46,9 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use deno_core::{v8, JsRuntime};
 use mathpix::{ImageToTextOptions, MathPixClient};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -49,6 +57,7 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+use tokio::{net::UnixListener, task::LocalSet};
 use walkdir::WalkDir;
 
 use anyhow::bail;
@@ -818,6 +827,118 @@ impl MpixConfig {
         let file = File::open(path)?;
         Ok(serde_yaml::from_reader(file)?)
     }
+}
+
+pub struct WaylandProxy {
+    protocol_map: WaylandProtocolMap,
+    server_path: PathBuf,
+    listener: UnixScmListener,
+}
+
+impl WaylandProxy {
+    pub fn bind(
+        protocol_map: WaylandProtocolMap, path: impl AsRef<Path>, server_path: impl Into<PathBuf>,
+    ) -> anyhow::Result<Self> {
+        let listener = UnixScmListener::new(UnixListener::bind(path)?);
+        Ok(Self { protocol_map, server_path: server_path.into(), listener })
+    }
+
+    pub async fn listen(&self) -> anyhow::Result<()> {
+        loop {
+            let stream = self.listener.accept().await?;
+            let server_path = self.server_path.clone();
+            let protocol_map = self.protocol_map.clone();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            std::thread::spawn(move || {
+                let local = LocalSet::new();
+                local.spawn_local(async move {
+                    if let Err(e) = wayland_proxy_main(protocol_map, server_path, stream).await {
+                        eprintln!("wayland proxy connection exited with error: {:?}", e);
+                    }
+                });
+                rt.block_on(local);
+            });
+        }
+    }
+}
+
+async fn wayland_proxy_forward(
+    runtime: Rc<RefCell<JsRuntime>>, global: v8::Global<v8::Value>, mut rx: WaylandReceiver,
+    mut tx: WaylandSender, name: &str,
+) -> anyhow::Result<()> {
+    loop {
+        rx.advance().await?;
+        let mut msg = rx.message()?;
+        println!("{} forwarding {}", name, msg.debug_name());
+        let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
+        let mut args = msg.args();
+        while let Some(arg) = args.advance() {
+            println!("  arg: {:?}", args.value(&arg)?);
+            match args.value(&arg)? {
+                MessageReaderValue::Int(value) => builder = builder.int(value),
+                MessageReaderValue::Uint(value) => builder = builder.uint(value),
+                MessageReaderValue::Fixed(value) => builder = builder.fixed(value),
+                MessageReaderValue::String(value) => builder = builder.string(value),
+                MessageReaderValue::Object(value) => builder = builder.object(value),
+                MessageReaderValue::NewId(interface_id, object_id, version) => {
+                    builder = builder.new_id(interface_id, object_id, version)
+                }
+                MessageReaderValue::Array(value) => builder = builder.array(value),
+                MessageReaderValue::Fd(_) => {
+                    // TODO we can get rid of fd_owned by having like borrow_fd on args or something
+                    builder = builder.fd_owned(args.take_fd(&arg));
+                }
+            }
+        }
+        builder.send().await?;
+    }
+}
+
+async fn wayland_proxy_main(
+    protocol_map: WaylandProtocolMap, server_path: PathBuf, stream: UnixScmStream,
+) -> anyhow::Result<()> {
+    let runtime = Rc::new(RefCell::new(JsRuntime::new(Default::default())));
+    let source = std::fs::read_to_string("/home/eiz/code/adrastea/proxy.js")?;
+    let global = {
+        let mut runtime = runtime.borrow_mut();
+        let global = runtime.execute_script("entry", source.into())?;
+        let scope = &mut runtime.handle_scope();
+        let local = v8::Local::new(scope, global.clone());
+        let deserialized_value = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, local);
+        println!("wut {:?}", deserialized_value);
+        global
+    };
+    println!("{:?}", global);
+    let (server_rx, server_tx) =
+        WaylandConnection::new(protocol_map.clone(), stream, WaylandConnectionRole::Server);
+    let client_stream = UnixScmStream::connect(server_path).await?;
+    let (client_rx, client_tx) =
+        WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
+    // TODO deal with annoying tokio e wrapping stuff (flatten out results) for non-panicking try_join
+    let server_jh = tokio::task::spawn_local({
+        let runtime = runtime.clone();
+        let global = global.clone();
+        async move {
+            if let Err(e) =
+                wayland_proxy_forward(runtime, global, server_rx, client_tx, "client->server").await
+            {
+                eprintln!("wayland proxy connection exited with error: {:?}", e);
+            }
+        }
+    });
+    let client_jh = tokio::task::spawn_local({
+        let runtime = runtime.clone();
+        let global = global.clone();
+        async move {
+            if let Err(e) =
+                wayland_proxy_forward(runtime, global, client_rx, server_tx, "server->client").await
+            {
+                eprintln!("wayland proxy connection exited with error: {:?}", e);
+            }
+        }
+    });
+    tokio::try_join!(server_jh, client_jh)?;
+    Ok(())
 }
 
 #[tokio::main]

@@ -407,7 +407,7 @@ impl<'b, 'a> MessageReaderArgs<'b, 'a> {
         fd
     }
 
-    fn advance(&mut self) -> Option<MessageReaderArg> {
+    pub fn advance(&mut self) -> Option<MessageReaderArg> {
         let arg_spec = match self.reader.resolved_message.args.get(self.n) {
             Some(arg) => arg,
             None => return None,
@@ -809,88 +809,6 @@ impl WaylandConnection {
         });
         (WaylandReceiver::new(conn.clone()), WaylandSender::new(conn))
     }
-}
-
-pub struct WaylandProxy {
-    protocol_map: WaylandProtocolMap,
-    server_path: PathBuf,
-    listener: UnixScmListener,
-}
-
-impl WaylandProxy {
-    pub fn bind(
-        protocol_map: WaylandProtocolMap, path: impl AsRef<Path>, server_path: impl Into<PathBuf>,
-    ) -> anyhow::Result<Self> {
-        let listener = UnixScmListener::new(UnixListener::bind(path)?);
-        Ok(Self { protocol_map, server_path: server_path.into(), listener })
-    }
-
-    pub async fn listen(&self) -> anyhow::Result<()> {
-        loop {
-            let stream = self.listener.accept().await?;
-            let server_path = self.server_path.clone();
-            let protocol_map = self.protocol_map.clone();
-            tokio::spawn(async move {
-                if let Err(e) = wayland_proxy_main(protocol_map, server_path, stream).await {
-                    eprintln!("wayland proxy connection exited with error: {:?}", e);
-                }
-            });
-        }
-    }
-}
-
-async fn wayland_proxy_forward(
-    mut rx: WaylandReceiver, mut tx: WaylandSender, name: &str,
-) -> anyhow::Result<()> {
-    loop {
-        rx.advance().await?;
-        let mut msg = rx.message()?;
-        println!("{} forwarding {}", name, msg.debug_name());
-        let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
-        let mut args = msg.args();
-        while let Some(arg) = args.advance() {
-            println!("  arg: {:?}", args.value(&arg)?);
-            match args.value(&arg)? {
-                MessageReaderValue::Int(value) => builder = builder.int(value),
-                MessageReaderValue::Uint(value) => builder = builder.uint(value),
-                MessageReaderValue::Fixed(value) => builder = builder.fixed(value),
-                MessageReaderValue::String(value) => builder = builder.string(value),
-                MessageReaderValue::Object(value) => builder = builder.object(value),
-                MessageReaderValue::NewId(interface_id, object_id, version) => {
-                    builder = builder.new_id(interface_id, object_id, version)
-                }
-                MessageReaderValue::Array(value) => builder = builder.array(value),
-                MessageReaderValue::Fd(_) => {
-                    // TODO we can get rid of fd_owned by having like borrow_fd on args or something
-                    builder = builder.fd_owned(args.take_fd(&arg));
-                }
-            }
-        }
-        builder.send().await?;
-    }
-}
-
-async fn wayland_proxy_main(
-    protocol_map: WaylandProtocolMap, server_path: PathBuf, stream: UnixScmStream,
-) -> anyhow::Result<()> {
-    let (server_rx, server_tx) =
-        WaylandConnection::new(protocol_map.clone(), stream, WaylandConnectionRole::Server);
-    let client_stream = UnixScmStream::connect(server_path).await?;
-    let (client_rx, client_tx) =
-        WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
-    // TODO deal with annoying tokio error wrapping stuff (flatten out results) for non-panicking try_join
-    let server_jh = tokio::spawn(async move {
-        if let Err(e) = wayland_proxy_forward(server_rx, client_tx, "client->server").await {
-            eprintln!("wayland proxy connection exited with error: {:?}", e);
-        }
-    });
-    let client_jh = tokio::spawn(async move {
-        if let Err(e) = wayland_proxy_forward(client_rx, server_tx, "server->client").await {
-            eprintln!("wayland proxy connection exited with error: {:?}", e);
-        }
-    });
-    tokio::try_join!(server_jh, client_jh)?;
-    Ok(())
 }
 
 #[cfg(test)]
