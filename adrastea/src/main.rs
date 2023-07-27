@@ -46,7 +46,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use deno_core::{v8, JsRuntime};
+use deno_core::{serde_v8, v8, JsRuntime, RuntimeOptions};
+//use deno_core::{v8, JsRuntime};
 use mathpix::{ImageToTextOptions, MathPixClient};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -60,7 +61,7 @@ use std::{
 use tokio::{net::UnixListener, task::LocalSet};
 use walkdir::WalkDir;
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use atspi::{
     connection::AccessibilityConnection,
     proxy::{accessible::AccessibleProxy, cache::CacheProxy},
@@ -829,13 +830,13 @@ impl MpixConfig {
     }
 }
 
-pub struct WaylandProxy {
+pub struct DenoWaylandProxy {
     protocol_map: WaylandProtocolMap,
     server_path: PathBuf,
     listener: UnixScmListener,
 }
 
-impl WaylandProxy {
+impl DenoWaylandProxy {
     pub fn bind(
         protocol_map: WaylandProtocolMap, path: impl AsRef<Path>, server_path: impl Into<PathBuf>,
     ) -> anyhow::Result<Self> {
@@ -849,10 +850,16 @@ impl WaylandProxy {
             let server_path = self.server_path.clone();
             let protocol_map = self.protocol_map.clone();
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            // ya its the new meta, a work stealing reactor that ... spawns hard
+            // threads per connection with their own single threaded reactor
+            // i blame the deno people for not implementing Isolate/Locker/Unlocker correctly
+            // presuming they wanted to "keep things simple" or w/e
+            // TODO: just make this test fully a single threaded reactor. for wayland proxying
+            // we are likely just gonna use rayon and/or the gpu to do any irl work anyway
             std::thread::spawn(move || {
                 let local = LocalSet::new();
                 local.spawn_local(async move {
-                    if let Err(e) = wayland_proxy_main(protocol_map, server_path, stream).await {
+                    if let Err(e) = deno_wp_main(protocol_map, server_path, stream).await {
                         eprintln!("wayland proxy connection exited with error: {:?}", e);
                     }
                 });
@@ -862,13 +869,23 @@ impl WaylandProxy {
     }
 }
 
-async fn wayland_proxy_forward(
+async fn deno_wp_forward(
     runtime: Rc<RefCell<JsRuntime>>, global: v8::Global<v8::Value>, mut rx: WaylandReceiver,
     mut tx: WaylandSender, name: &str,
 ) -> anyhow::Result<()> {
     loop {
         rx.advance().await?;
         let mut msg = rx.message()?;
+        let mut runtime = runtime.borrow_mut();
+        let scope = &mut runtime.handle_scope();
+        let local = v8::Local::new(scope, global.clone());
+        let obj = local.to_object(scope).ok_or_else(|| anyhow!("forwarder is not an object"))?;
+        let forward_name = v8::String::new(scope, "forward").unwrap();
+        let forward = obj
+            .get(scope, forward_name.into())
+            .ok_or_else(|| anyhow!("forwarder has no forward method"))?;
+        let forward: v8::Local<v8::Function> = forward.try_into()?;
+        forward.call(scope, obj.into(), &[]);
         println!("{} forwarding {}", name, msg.debug_name());
         let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
         let mut args = msg.args();
@@ -894,17 +911,20 @@ async fn wayland_proxy_forward(
     }
 }
 
-async fn wayland_proxy_main(
+async fn deno_wp_main(
     protocol_map: WaylandProtocolMap, server_path: PathBuf, stream: UnixScmStream,
 ) -> anyhow::Result<()> {
-    let runtime = Rc::new(RefCell::new(JsRuntime::new(Default::default())));
+    let runtime = Rc::new(RefCell::new(JsRuntime::new(RuntimeOptions {
+        extensions: vec![deno_console::deno_console::init_ops_and_esm()],
+        ..Default::default()
+    })));
     let source = std::fs::read_to_string("/home/eiz/code/adrastea/proxy.js")?;
     let global = {
         let mut runtime = runtime.borrow_mut();
         let global = runtime.execute_script("entry", source.into())?;
         let scope = &mut runtime.handle_scope();
         let local = v8::Local::new(scope, global.clone());
-        let deserialized_value = deno_core::serde_v8::from_v8::<serde_json::Value>(scope, local);
+        let deserialized_value = serde_v8::from_v8::<serde_json::Value>(scope, local);
         println!("wut {:?}", deserialized_value);
         global
     };
@@ -920,7 +940,7 @@ async fn wayland_proxy_main(
         let global = global.clone();
         async move {
             if let Err(e) =
-                wayland_proxy_forward(runtime, global, server_rx, client_tx, "client->server").await
+                deno_wp_forward(runtime, global, server_rx, client_tx, "client->server").await
             {
                 eprintln!("wayland proxy connection exited with error: {:?}", e);
             }
@@ -931,7 +951,7 @@ async fn wayland_proxy_main(
         let global = global.clone();
         async move {
             if let Err(e) =
-                wayland_proxy_forward(runtime, global, client_rx, server_tx, "server->client").await
+                deno_wp_forward(runtime, global, client_rx, server_tx, "server->client").await
             {
                 eprintln!("wayland proxy connection exited with error: {:?}", e);
             }
@@ -957,7 +977,7 @@ async fn wserver_test(listen_path: &Path, server_path: &Path) -> anyhow::Result<
         }
     }
     let proto_map = proto_builder.build()?;
-    let proxy = WaylandProxy::bind(proto_map, listen_path, server_path)?;
+    let proxy = DenoWaylandProxy::bind(proto_map, listen_path, server_path)?;
     proxy.listen().await?;
     Ok(())
 }

@@ -19,7 +19,8 @@ anyhow = "1.0.71"
 async-recursion = "1.0.4"
 atspi = { version = "0.17.0", default-features = false, features = ["tokio"] }
 clap = { version = "4.3.10", features = ["derive"] }
-deno_core = "0.196.0"
+deno_console = "0.113.0"
+deno_core = "0.197.0"
 dirs = "5.0.1"
 half = "2"
 parking_lot = "0.12.1"
