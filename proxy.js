@@ -17,12 +17,8 @@ const getCircularReplacer = () => {
   };
 };
 console.log(JSON.stringify(globalThis, getCircularReplacer()));
-(() => {
-  class WaylandProxy {
-    forward(context, message) {
-      console.log("forwarding");
-      context.send(message);
-    }
-  }
-  return new WaylandProxy();
-})();
+
+export async function forward(context, message) {
+  console.log("forwarding");
+  context.send(message);
+}
