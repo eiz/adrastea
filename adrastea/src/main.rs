@@ -848,21 +848,10 @@ impl DenoWaylandProxy {
             let stream = self.listener.accept().await?;
             let server_path = self.server_path.clone();
             let protocol_map = self.protocol_map.clone();
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            // ya its the new meta, a work stealing reactor that ... spawns hard
-            // threads per connection with their own single threaded reactor
-            // i blame the deno people for not implementing Isolate/Locker/Unlocker correctly
-            // presuming they wanted to "keep things simple" or w/e
-            // TODO: just make this test fully a single threaded reactor. for wayland proxying
-            // we are likely just gonna use rayon and/or the gpu to do any irl work anyway
-            std::thread::spawn(move || {
-                let local = LocalSet::new();
-                local.spawn_local(async move {
-                    if let Err(e) = deno_wp_main(protocol_map, server_path, stream).await {
-                        eprintln!("wayland proxy connection exited with error: {:?}", e);
-                    }
-                });
-                rt.block_on(local);
+            tokio::spawn(async move {
+                if let Err(e) = deno_wp_main(protocol_map, server_path, stream).await {
+                    eprintln!("wayland proxy connection exited with error: {:?}", e);
+                }
             });
         }
     }
@@ -908,12 +897,12 @@ async fn deno_wp_main(
     let (client_rx, client_tx) =
         WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
     // TODO deal with annoying tokio e wrapping stuff (flatten out results) for non-panicking try_join
-    let server_jh = tokio::task::spawn_local(async move {
+    let server_jh = tokio::spawn(async move {
         if let Err(e) = deno_wp_forward(server_rx, client_tx, "client->server").await {
             eprintln!("wayland proxy connection exited with error: {:?}", e);
         }
     });
-    let client_jh = tokio::task::spawn_local(async move {
+    let client_jh = tokio::spawn(async move {
         if let Err(e) = deno_wp_forward(client_rx, server_tx, "server->client").await {
             eprintln!("wayland proxy connection exited with error: {:?}", e);
         }
