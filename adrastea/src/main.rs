@@ -46,7 +46,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use deno_core::{serde_v8, v8, JsRuntime, RuntimeOptions};
 //use deno_core::{v8, JsRuntime};
 use mathpix::{ImageToTextOptions, MathPixClient};
 use parking_lot::Mutex;
@@ -870,22 +869,11 @@ impl DenoWaylandProxy {
 }
 
 async fn deno_wp_forward(
-    runtime: Rc<RefCell<JsRuntime>>, global: v8::Global<v8::Object>,
-    context: v8::Global<v8::Object>, mut rx: WaylandReceiver, mut tx: WaylandSender, name: &str,
+    mut rx: WaylandReceiver, mut tx: WaylandSender, name: &str,
 ) -> anyhow::Result<()> {
     loop {
         rx.advance().await?;
         let mut msg = rx.message()?;
-        let mut runtime = runtime.borrow_mut();
-        let scope = &mut runtime.handle_scope();
-        let obj = v8::Local::new(scope, global.clone());
-        let forward_name = v8::String::new(scope, "forward").unwrap();
-        let forward = obj
-            .get(scope, forward_name.into())
-            .ok_or_else(|| anyhow!("forwarder has no forward method"))?;
-        let forward: v8::Local<v8::Function> = forward.try_into()?;
-        let context = v8::Local::new(scope, context.clone());
-        forward.call(scope, obj.into(), &[context.into()]);
         println!("{} forwarding {}", name, msg.debug_name());
         let mut builder = tx.message_builder(msg.sender(), msg.opcode())?;
         let mut args = msg.args();
@@ -914,81 +902,20 @@ async fn deno_wp_forward(
 async fn deno_wp_main(
     protocol_map: WaylandProtocolMap, server_path: PathBuf, stream: UnixScmStream,
 ) -> anyhow::Result<()> {
-    let runtime = Rc::new(RefCell::new(JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(deno_core::FsModuleLoader)),
-        extensions: vec![deno_console::deno_console::init_ops_and_esm()],
-        ..Default::default()
-    })));
-    let main_url = deno_core::resolve_path("./proxy.js", Path::new("/home/eiz/code/adrastea"))?;
-    let global = {
-        let mut runtime = runtime.borrow_mut();
-        let mod_id = runtime.load_main_module(&main_url, None).await?;
-        let result = runtime.mod_evaluate(mod_id);
-        runtime.run_event_loop(false).await?;
-        result.await??;
-        runtime.get_module_namespace(mod_id)?
-    };
-    let context_obj: v8::Global<v8::Object> = {
-        let mut runtime = runtime.borrow_mut();
-        let handle_scope = &mut runtime.handle_scope();
-        let context_obj = v8::Object::new(handle_scope);
-        let send = v8::FunctionTemplate::builder(
-            |_scope: &mut v8::HandleScope,
-             a: v8::FunctionCallbackArguments,
-             mut rv: v8::ReturnValue| {
-                println!("{:?}", a);
-                rv.set_null();
-            },
-        )
-        .build(handle_scope);
-        let send = send.get_function(handle_scope).unwrap();
-        let send_name = v8::String::new(handle_scope, "send").unwrap();
-        context_obj.set(handle_scope, send_name.into(), send.into());
-        v8::Global::new(handle_scope, context_obj)
-    };
-    println!("{:?}", global);
     let (server_rx, server_tx) =
         WaylandConnection::new(protocol_map.clone(), stream, WaylandConnectionRole::Server);
     let client_stream = UnixScmStream::connect(server_path).await?;
     let (client_rx, client_tx) =
         WaylandConnection::new(protocol_map, client_stream, WaylandConnectionRole::Client);
     // TODO deal with annoying tokio e wrapping stuff (flatten out results) for non-panicking try_join
-    let server_jh = tokio::task::spawn_local({
-        let runtime = runtime.clone();
-        let global = global.clone();
-        let context_obj = context_obj.clone();
-        async move {
-            if let Err(e) = deno_wp_forward(
-                runtime,
-                global,
-                context_obj,
-                server_rx,
-                client_tx,
-                "client->server",
-            )
-            .await
-            {
-                eprintln!("wayland proxy connection exited with error: {:?}", e);
-            }
+    let server_jh = tokio::task::spawn_local(async move {
+        if let Err(e) = deno_wp_forward(server_rx, client_tx, "client->server").await {
+            eprintln!("wayland proxy connection exited with error: {:?}", e);
         }
     });
-    let client_jh = tokio::task::spawn_local({
-        let runtime = runtime.clone();
-        let global = global.clone();
-        let context_obj = context_obj.clone();
-        async move {
-            if let Err(e) = deno_wp_forward(
-                runtime,
-                global,
-                context_obj,
-                client_rx,
-                server_tx,
-                "server->client",
-            )
-            .await
-            {
-                eprintln!("wayland proxy connection exited with error: {:?}", e);
-            }
+    let client_jh = tokio::task::spawn_local(async move {
+        if let Err(e) = deno_wp_forward(client_rx, server_tx, "server->client").await {
+            eprintln!("wayland proxy connection exited with error: {:?}", e);
         }
     });
     tokio::try_join!(server_jh, client_jh)?;
