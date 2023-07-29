@@ -23,6 +23,8 @@ dirs = "5.0.1"
 half = "2"
 parking_lot = "0.12.1"
 reqwest = { version = "0.11.18", features = ["multipart"] }
+rlua = "0.19.7"
+rlua-async = "0.5.0"
 sentencepiece = "0.11.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

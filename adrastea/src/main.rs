@@ -38,7 +38,7 @@ use adrastea_models::{
         WhisperContext, WhisperModel, WhisperModelState, WHISPER_CHUNK_LENGTH, WHISPER_SAMPLE_RATE,
     },
 };
-use alloc::{collections::VecDeque, rc::Rc, sync::Arc};
+use alloc::{collections::VecDeque, sync::Arc};
 use core::{
     any::Provider,
     cell::RefCell,
@@ -46,9 +46,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-//use deno_core::{v8, JsRuntime};
 use mathpix::{ImageToTextOptions, MathPixClient};
-use parking_lot::Mutex;
+use rlua::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -57,10 +56,10 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use tokio::{net::UnixListener, task::LocalSet};
+use tokio::net::UnixListener;
 use walkdir::WalkDir;
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use atspi::{
     connection::AccessibilityConnection,
     proxy::{accessible::AccessibleProxy, cache::CacheProxy},
@@ -829,18 +828,25 @@ impl MpixConfig {
     }
 }
 
-pub struct DenoWaylandProxy {
+pub struct LuaWaylandProxy {
     protocol_map: WaylandProtocolMap,
     server_path: PathBuf,
     listener: UnixScmListener,
+    lua: Lua,
 }
 
-impl DenoWaylandProxy {
+impl LuaWaylandProxy {
     pub fn bind(
         protocol_map: WaylandProtocolMap, path: impl AsRef<Path>, server_path: impl Into<PathBuf>,
     ) -> anyhow::Result<Self> {
+        let lua = Lua::new();
+        lua.context(|c| -> anyhow::Result<()> {
+            let src = std::fs::read_to_string("/home/eiz/adrastea/proxy.lua")?;
+            c.load(&src).exec()?;
+            Ok(())
+        })?;
         let listener = UnixScmListener::new(UnixListener::bind(path)?);
-        Ok(Self { protocol_map, server_path: server_path.into(), listener })
+        Ok(Self { protocol_map, server_path: server_path.into(), listener, lua })
     }
 
     pub async fn listen(&self) -> anyhow::Result<()> {
@@ -911,7 +917,7 @@ async fn deno_wp_main(
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn wserver_test(listen_path: &Path, server_path: &Path) -> anyhow::Result<()> {
     let mut proto_builder = WaylandProtocolMapBuilder::new()
         .file("/home/eiz/code/wayland/protocol/wayland.xml")?
@@ -927,7 +933,7 @@ async fn wserver_test(listen_path: &Path, server_path: &Path) -> anyhow::Result<
         }
     }
     let proto_map = proto_builder.build()?;
-    let proxy = DenoWaylandProxy::bind(proto_map, listen_path, server_path)?;
+    let proxy = LuaWaylandProxy::bind(proto_map, listen_path, server_path)?;
     proxy.listen().await?;
     Ok(())
 }
